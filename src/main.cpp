@@ -2,6 +2,7 @@
 #include <string>
 
 #include "robot/Event.hpp"
+#include "robot/JsonScenarioSource.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 
@@ -55,6 +56,23 @@ int main()
     {
         robot::RobotStateMachine machine;
         apply(machine, robot::EventType::MissionCompleted, 0);
+    }
+
+    std::cout << "\nJSON scenario read (parsing only, not fed into the state machine yet):" << std::endl;
+    try
+    {
+        robot::JsonScenarioSource source(std::string(SCENARIOS_DIR) + "obstacle_test.json");
+        while (const std::optional<robot::Event> event = source.nextEvent())
+        {
+            std::cout << "  event=" << robot::toString(event->type)
+                      << " timestampMs=" << event->timestampMs
+                      << " value=" << (event->value.has_value() ? std::to_string(*event->value) : "none")
+                      << std::endl;
+        }
+    }
+    catch (const robot::ScenarioParseError& e)
+    {
+        std::cout << "  Failed to read scenario: " << e.what() << std::endl;
     }
 
     return 0;

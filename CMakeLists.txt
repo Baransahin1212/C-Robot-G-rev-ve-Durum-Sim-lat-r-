@@ -6,13 +6,49 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# --- robot_core: production FSM library, shared by the app and the tests ---
+include(FetchContent)
+
+# --- robot_domain: shared domain headers (Event, RobotState, IEventSource) ---
+# Header-only, so it is an INTERFACE target with no implementation of its
+# own. Both robot_core and robot_scenario depend on it for the shared
+# vocabulary types, without depending on each other's implementation.
+add_library(robot_domain INTERFACE)
+
+target_include_directories(robot_domain INTERFACE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# --- robot_core: production FSM implementation, shared by the app and tests ---
+# Deliberately has no JSON dependency.
 add_library(robot_core STATIC
     src/RobotStateMachine.cpp
 )
 
-target_include_directories(robot_core PUBLIC
-    ${CMAKE_SOURCE_DIR}/include
+target_link_libraries(robot_core PUBLIC robot_domain)
+
+# --- nlohmann/json, pinned to a stable tagged release (not main/master) ---
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+
+FetchContent_MakeAvailable(nlohmann_json)
+
+# --- robot_scenario: JSON scenario file -> Event objects ---
+# Depends only on robot_domain for the shared Event/IEventSource types, not
+# on robot_core's FSM implementation. nlohmann/json is an implementation
+# detail (only used inside the .cpp, never in the public header), so it is
+# linked PRIVATE and does not leak into anything that links robot_scenario.
+add_library(robot_scenario STATIC
+    src/JsonScenarioSource.cpp
+)
+
+target_link_libraries(robot_scenario
+    PUBLIC robot_domain
+    PRIVATE nlohmann_json::nlohmann_json
 )
 
 # --- RobotSimulator: the command-line application ---
@@ -20,12 +56,14 @@ add_executable(RobotSimulator
     src/main.cpp
 )
 
-target_link_libraries(RobotSimulator PRIVATE robot_core)
+target_link_libraries(RobotSimulator PRIVATE robot_core robot_scenario)
+
+target_compile_definitions(RobotSimulator PRIVATE
+    SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios/"
+)
 
 # --- Tests (GoogleTest via FetchContent, pinned to a stable tagged release) ---
 enable_testing()
-
-include(FetchContent)
 
 # MSVC default runtime is /MD; force gtest to match so link flags agree.
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
@@ -38,6 +76,8 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(googletest)
 
+include(GoogleTest)
+
 add_executable(RobotSimulatorTests
     tests/RobotStateMachineTests.cpp
 )
@@ -47,5 +87,19 @@ target_link_libraries(RobotSimulatorTests PRIVATE
     GTest::gtest_main
 )
 
-include(GoogleTest)
 gtest_discover_tests(RobotSimulatorTests)
+
+add_executable(ScenarioSourceTests
+    tests/JsonScenarioSourceTests.cpp
+)
+
+target_link_libraries(ScenarioSourceTests PRIVATE
+    robot_scenario
+    GTest::gtest_main
+)
+
+target_compile_definitions(ScenarioSourceTests PRIVATE
+    TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/"
+)
+
+gtest_discover_tests(ScenarioSourceTests)

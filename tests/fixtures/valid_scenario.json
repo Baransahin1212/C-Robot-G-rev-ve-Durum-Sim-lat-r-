@@ -1,0 +1,30 @@
+{
+  "scenario": "fixture_valid",
+  "events": [
+    {
+      "timestamp_ms": 0,
+      "type": "SCENARIO_LOADED"
+    },
+    {
+      "timestamp_ms": 100,
+      "type": "START_MISSION"
+    },
+    {
+      "timestamp_ms": 2000,
+      "type": "OBSTACLE_DETECTED"
+    },
+    {
+      "timestamp_ms": 3000,
+      "type": "BATTERY_CRITICAL",
+      "value": 8.5
+    },
+    {
+      "timestamp_ms": 4000,
+      "type": "OBSTACLE_CLEARED"
+    },
+    {
+      "timestamp_ms": 6000,
+      "type": "MISSION_COMPLETED"
+    }
+  ]
+}

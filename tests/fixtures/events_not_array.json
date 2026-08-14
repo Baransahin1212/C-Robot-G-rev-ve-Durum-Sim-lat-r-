@@ -1,0 +1,4 @@
+{
+  "scenario": "events_not_array",
+  "events": "not-an-array"
+}

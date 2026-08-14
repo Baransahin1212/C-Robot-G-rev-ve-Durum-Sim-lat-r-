@@ -1,0 +1,10 @@
+{
+  "scenario": "wrong_value_type",
+  "events": [
+    {
+      "timestamp_ms": 3000,
+      "type": "BATTERY_CRITICAL",
+      "value": "low"
+    }
+  ]
+}

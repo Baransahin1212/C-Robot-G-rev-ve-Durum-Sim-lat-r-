@@ -1,0 +1,8 @@
+{
+  "scenario": "missing_timestamp",
+  "events": [
+    {
+      "type": "SCENARIO_LOADED"
+    }
+  ]
+}

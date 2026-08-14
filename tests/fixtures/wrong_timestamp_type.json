@@ -1,0 +1,9 @@
+{
+  "scenario": "wrong_timestamp_type",
+  "events": [
+    {
+      "timestamp_ms": "zero",
+      "type": "SCENARIO_LOADED"
+    }
+  ]
+}

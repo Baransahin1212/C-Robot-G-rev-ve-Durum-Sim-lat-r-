@@ -1,0 +1,1 @@
+{ "scenario": "malformed", "events": [ { "timestamp_ms": 0, "type": "SCENARIO_LOADED" ]

@@ -1,0 +1,9 @@
+{
+  "scenario": "unknown_event_type",
+  "events": [
+    {
+      "timestamp_ms": 0,
+      "type": "NOT_A_REAL_EVENT"
+    }
+  ]
+}
