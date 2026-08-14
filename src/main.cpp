@@ -5,6 +5,7 @@
 #include "robot/JsonScenarioSource.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/Simulator.hpp"
 
 namespace
 {
@@ -58,21 +59,24 @@ int main()
         apply(machine, robot::EventType::MissionCompleted, 0);
     }
 
-    std::cout << "\nJSON scenario read (parsing only, not fed into the state machine yet):" << std::endl;
+    std::cout << "\nRunning JSON scenario through Simulator:" << std::endl;
     try
     {
         robot::JsonScenarioSource source(std::string(SCENARIOS_DIR) + "obstacle_test.json");
-        while (const std::optional<robot::Event> event = source.nextEvent())
-        {
-            std::cout << "  event=" << robot::toString(event->type)
-                      << " timestampMs=" << event->timestampMs
-                      << " value=" << (event->value.has_value() ? std::to_string(*event->value) : "none")
-                      << std::endl;
-        }
+        robot::RobotStateMachine machine;
+        robot::Simulator simulator(source, machine);
+
+        const robot::SimulationResult result = simulator.run();
+
+        std::cout << "Scenario finished" << std::endl;
+        std::cout << "Final state: " << robot::toString(result.finalState) << std::endl;
+        std::cout << "Events processed: " << result.eventsProcessed << std::endl;
+        std::cout << "Successful transitions: " << result.successfulTransitions << std::endl;
+        std::cout << "Rejected transitions: " << result.rejectedTransitions << std::endl;
     }
     catch (const robot::ScenarioParseError& e)
     {
-        std::cout << "  Failed to read scenario: " << e.what() << std::endl;
+        std::cout << "Failed to read scenario: " << e.what() << std::endl;
     }
 
     return 0;

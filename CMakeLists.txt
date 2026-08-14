@@ -18,10 +18,13 @@ target_include_directories(robot_domain INTERFACE
     ${CMAKE_SOURCE_DIR}/include
 )
 
-# --- robot_core: production FSM implementation, shared by the app and tests ---
+# --- robot_core: production FSM + orchestration, shared by the app and tests ---
+# Simulator lives here (not in robot_scenario) because it only depends on
+# domain types and RobotStateMachine - it has no knowledge of JSON at all.
 # Deliberately has no JSON dependency.
 add_library(robot_core STATIC
     src/RobotStateMachine.cpp
+    src/Simulator.cpp
 )
 
 target_link_libraries(robot_core PUBLIC robot_domain)
@@ -80,6 +83,7 @@ include(GoogleTest)
 
 add_executable(RobotSimulatorTests
     tests/RobotStateMachineTests.cpp
+    tests/SimulatorTests.cpp
 )
 
 target_link_libraries(RobotSimulatorTests PRIVATE
