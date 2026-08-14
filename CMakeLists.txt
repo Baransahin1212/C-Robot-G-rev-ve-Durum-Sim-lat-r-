@@ -74,15 +74,31 @@ add_library(robot_reporting STATIC
 
 target_link_libraries(robot_reporting PUBLIC robot_core)
 
+# --- robot_app: CLI argument parsing + application-run composition ---
+# Exists so the command-line logic (parseArguments/runSimulation/
+# runApplication) is directly unit-testable - callers pass in vectors of
+# strings and output streams instead of going through argv or a subprocess.
+# It has no compile-time path configuration of its own; the caller (main.cpp
+# for the real CLI, tests for temp directories) supplies logs/reports paths.
+add_library(robot_app STATIC
+    src/Application.cpp
+)
+
+target_link_libraries(robot_app PUBLIC
+    robot_core
+    robot_scenario
+    robot_logging
+    robot_reporting
+)
+
 # --- RobotSimulator: the command-line application ---
 add_executable(RobotSimulator
     src/main.cpp
 )
 
-target_link_libraries(RobotSimulator PRIVATE robot_core robot_scenario robot_logging robot_reporting)
+target_link_libraries(RobotSimulator PRIVATE robot_app)
 
 target_compile_definitions(RobotSimulator PRIVATE
-    SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios/"
     LOGS_DIR="${CMAKE_SOURCE_DIR}/logs/"
     REPORTS_DIR="${CMAKE_SOURCE_DIR}/reports/"
 )
@@ -155,3 +171,24 @@ target_compile_definitions(ScenarioIntegrationTests PRIVATE
 )
 
 gtest_discover_tests(ScenarioIntegrationTests)
+
+# --- ApplicationTests: CLI argument parsing and application-run behavior ---
+# Drives robot::app::runApplication() directly with in-memory streams and a
+# build-tree-local output directory, so tests never touch the real
+# logs/ or reports/ directories and never spawn a subprocess.
+add_executable(ApplicationTests
+    tests/ApplicationTests.cpp
+)
+
+target_link_libraries(ApplicationTests PRIVATE
+    robot_app
+    GTest::gtest_main
+)
+
+target_compile_definitions(ApplicationTests PRIVATE
+    SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios/"
+    TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/"
+    TEST_OUTPUT_DIR="${CMAKE_BINARY_DIR}/test_output/"
+)
+
+gtest_discover_tests(ApplicationTests)
