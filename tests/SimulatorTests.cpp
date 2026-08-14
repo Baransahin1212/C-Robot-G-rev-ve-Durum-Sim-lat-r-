@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -10,6 +12,7 @@
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/Simulator.hpp"
+#include "robot/StreamSimulationLogger.hpp"
 
 namespace
 {
@@ -21,6 +24,7 @@ using robot::RobotState;
 using robot::RobotStateMachine;
 using robot::Simulator;
 using robot::SimulationResult;
+using robot::StreamSimulationLogger;
 
 // In-memory IEventSource for testing Simulator independently of JSON
 // parsing: it simply replays a fixed list of events.
@@ -175,4 +179,86 @@ TEST(SimulatorTest, EmergencyStopScenarioReachesEmergencyStopped)
     EXPECT_EQ(result.eventsProcessed, 3u);
     EXPECT_EQ(result.successfulTransitions, 3u);
     EXPECT_EQ(result.rejectedTransitions, 0u);
+}
+
+TEST(SimulatorTest, NormalMissionProducesEventAndTransitionLogEntries)
+{
+    // Arrange
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::MissionCompleted),
+    });
+    RobotStateMachine machine;
+    std::ostringstream out;
+    StreamSimulationLogger logger(out);
+    Simulator simulator(source, machine, &logger);
+
+    // Act
+    simulator.run();
+
+    // Assert
+    const std::string logText = out.str();
+    EXPECT_NE(logText.find("ScenarioLoaded"), std::string::npos);
+    EXPECT_NE(logText.find("StartMission"), std::string::npos);
+    EXPECT_NE(logText.find("MissionCompleted"), std::string::npos);
+    EXPECT_NE(logText.find("Idle -> Ready"), std::string::npos);
+    EXPECT_NE(logText.find("Ready -> Moving"), std::string::npos);
+    EXPECT_NE(logText.find("Moving -> Completed"), std::string::npos);
+    EXPECT_EQ(logText.find("WARNING"), std::string::npos);
+}
+
+TEST(SimulatorTest, InvalidTransitionProducesWarningLog)
+{
+    // Arrange: MissionCompleted is invalid from Idle.
+    FakeEventSource source({
+        MakeEvent(EventType::MissionCompleted),
+    });
+    RobotStateMachine machine;
+    std::ostringstream out;
+    StreamSimulationLogger logger(out);
+    Simulator simulator(source, machine, &logger);
+
+    // Act
+    simulator.run();
+
+    // Assert
+    const std::string logText = out.str();
+    EXPECT_NE(logText.find("WARNING"), std::string::npos);
+    EXPECT_NE(logText.find("Idle"), std::string::npos);
+    EXPECT_NE(logText.find("MissionCompleted"), std::string::npos);
+}
+
+TEST(SimulatorTest, LoggingDoesNotAlterSimulationResultCounts)
+{
+    // Arrange: same scenario run once with a logger and once without.
+    auto makeEvents = []() {
+        return std::vector<Event>{
+            MakeEvent(EventType::ScenarioLoaded),
+            MakeEvent(EventType::StartMission),
+            MakeEvent(EventType::ObstacleDetected),
+            MakeEvent(EventType::ObstacleCleared),
+            MakeEvent(EventType::MissionCompleted),
+        };
+    };
+
+    FakeEventSource sourceWithoutLogger(makeEvents());
+    RobotStateMachine machineWithoutLogger;
+    Simulator simulatorWithoutLogger(sourceWithoutLogger, machineWithoutLogger);
+
+    FakeEventSource sourceWithLogger(makeEvents());
+    RobotStateMachine machineWithLogger;
+    std::ostringstream out;
+    StreamSimulationLogger logger(out);
+    Simulator simulatorWithLogger(sourceWithLogger, machineWithLogger, &logger);
+
+    // Act
+    const SimulationResult resultWithoutLogger = simulatorWithoutLogger.run();
+    const SimulationResult resultWithLogger = simulatorWithLogger.run();
+
+    // Assert
+    EXPECT_EQ(resultWithoutLogger.finalState, resultWithLogger.finalState);
+    EXPECT_EQ(resultWithoutLogger.eventsProcessed, resultWithLogger.eventsProcessed);
+    EXPECT_EQ(resultWithoutLogger.successfulTransitions, resultWithLogger.successfulTransitions);
+    EXPECT_EQ(resultWithoutLogger.rejectedTransitions, resultWithLogger.rejectedTransitions);
 }

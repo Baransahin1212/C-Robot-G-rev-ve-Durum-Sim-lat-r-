@@ -1,4 +1,7 @@
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 #include "robot/Event.hpp"
@@ -6,6 +9,7 @@
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/Simulator.hpp"
+#include "robot/StreamSimulationLogger.hpp"
 
 namespace
 {
@@ -77,6 +81,41 @@ int main()
     catch (const robot::ScenarioParseError& e)
     {
         std::cout << "Failed to read scenario: " << e.what() << std::endl;
+    }
+
+    std::cout << "\nRunning JSON scenario with file logging:" << std::endl;
+    try
+    {
+        const std::filesystem::path logsDir(LOGS_DIR);
+        std::filesystem::create_directories(logsDir);
+        const std::filesystem::path logPath = logsDir / "simulation.log";
+
+        std::ofstream logFile(logPath);
+        if (!logFile.is_open())
+        {
+            throw std::runtime_error("Could not open log file for writing: " + logPath.string());
+        }
+
+        robot::JsonScenarioSource source(std::string(SCENARIOS_DIR) + "obstacle_test.json");
+        robot::RobotStateMachine machine;
+        robot::StreamSimulationLogger logger(logFile);
+        robot::Simulator simulator(source, machine, &logger);
+
+        const robot::SimulationResult result = simulator.run();
+
+        std::cout << "Log written to: " << logPath.string() << std::endl;
+        std::cout << "Final state: " << robot::toString(result.finalState) << std::endl;
+        std::cout << "Events processed: " << result.eventsProcessed << std::endl;
+        std::cout << "Successful transitions: " << result.successfulTransitions << std::endl;
+        std::cout << "Rejected transitions: " << result.rejectedTransitions << std::endl;
+    }
+    catch (const robot::ScenarioParseError& e)
+    {
+        std::cout << "Failed to read scenario: " << e.what() << std::endl;
+    }
+    catch (const std::runtime_error& e)
+    {
+        std::cout << "Logging failed: " << e.what() << std::endl;
     }
 
     return 0;

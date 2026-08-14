@@ -54,15 +54,25 @@ target_link_libraries(robot_scenario
     PRIVATE nlohmann_json::nlohmann_json
 )
 
+# --- robot_logging: concrete ISimulationLogger implementation(s) ---
+# Depends only on robot_domain (for ISimulationLogger/Event/RobotState), not
+# on robot_core or robot_scenario, and has no JSON dependency.
+add_library(robot_logging STATIC
+    src/StreamSimulationLogger.cpp
+)
+
+target_link_libraries(robot_logging PUBLIC robot_domain)
+
 # --- RobotSimulator: the command-line application ---
 add_executable(RobotSimulator
     src/main.cpp
 )
 
-target_link_libraries(RobotSimulator PRIVATE robot_core robot_scenario)
+target_link_libraries(RobotSimulator PRIVATE robot_core robot_scenario robot_logging)
 
 target_compile_definitions(RobotSimulator PRIVATE
     SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios/"
+    LOGS_DIR="${CMAKE_SOURCE_DIR}/logs/"
 )
 
 # --- Tests (GoogleTest via FetchContent, pinned to a stable tagged release) ---
@@ -84,10 +94,12 @@ include(GoogleTest)
 add_executable(RobotSimulatorTests
     tests/RobotStateMachineTests.cpp
     tests/SimulatorTests.cpp
+    tests/StreamSimulationLoggerTests.cpp
 )
 
 target_link_libraries(RobotSimulatorTests PRIVATE
     robot_core
+    robot_logging
     GTest::gtest_main
 )
 

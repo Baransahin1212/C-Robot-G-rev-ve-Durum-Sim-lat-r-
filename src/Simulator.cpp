@@ -3,9 +3,10 @@
 namespace robot
 {
 
-Simulator::Simulator(IEventSource& eventSource, RobotStateMachine& stateMachine)
+Simulator::Simulator(IEventSource& eventSource, RobotStateMachine& stateMachine, ISimulationLogger* logger)
     : eventSource_(eventSource)
     , stateMachine_(stateMachine)
+    , logger_(logger)
 {
 }
 
@@ -15,16 +16,31 @@ SimulationResult Simulator::run()
 
     while (const std::optional<Event> event = eventSource_.nextEvent())
     {
+        const RobotState stateBeforeEvent = stateMachine_.currentState();
+
+        if (logger_ != nullptr)
+        {
+            logger_->logEventReceived(*event);
+        }
+
         const TransitionResult transitionResult = stateMachine_.processEvent(*event);
         ++result.eventsProcessed;
 
         if (transitionResult == TransitionResult::Success)
         {
             ++result.successfulTransitions;
+            if (logger_ != nullptr)
+            {
+                logger_->logTransitionSucceeded(event->timestampMs, stateBeforeEvent, stateMachine_.currentState());
+            }
         }
         else
         {
             ++result.rejectedTransitions;
+            if (logger_ != nullptr)
+            {
+                logger_->logTransitionRejected(event->timestampMs, stateBeforeEvent, event->type);
+            }
         }
     }
 
