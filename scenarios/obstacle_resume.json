@@ -1,5 +1,5 @@
 {
-  "scenario": "obstacle_test",
+  "scenario": "obstacle_resume",
   "events": [
     {
       "timestamp_ms": 0,

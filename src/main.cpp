@@ -68,7 +68,7 @@ int main()
     std::cout << "\nRunning JSON scenario through Simulator:" << std::endl;
     try
     {
-        robot::JsonScenarioSource source(std::string(SCENARIOS_DIR) + "obstacle_test.json");
+        robot::JsonScenarioSource source(std::string(SCENARIOS_DIR) + "normal_mission.json");
         robot::RobotStateMachine machine;
         robot::Simulator simulator(source, machine);
 
@@ -98,7 +98,7 @@ int main()
             throw std::runtime_error("Could not open log file for writing: " + logPath.string());
         }
 
-        robot::JsonScenarioSource source(std::string(SCENARIOS_DIR) + "obstacle_test.json");
+        robot::JsonScenarioSource source(std::string(SCENARIOS_DIR) + "normal_mission.json");
         robot::RobotStateMachine machine;
         robot::StreamSimulationLogger logger(logFile);
         robot::Simulator simulator(source, machine, &logger);

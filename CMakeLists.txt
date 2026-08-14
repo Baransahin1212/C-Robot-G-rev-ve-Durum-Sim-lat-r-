@@ -133,3 +133,25 @@ target_compile_definitions(ScenarioSourceTests PRIVATE
 )
 
 gtest_discover_tests(ScenarioSourceTests)
+
+# --- ScenarioIntegrationTests: exercises the real end-to-end pipeline
+# (JsonScenarioSource -> Simulator -> RobotStateMachine -> SimulationResult
+# -> SimulationReport) against the final scenario files under scenarios/,
+# so it needs every production library.
+add_executable(ScenarioIntegrationTests
+    tests/ScenarioIntegrationTests.cpp
+)
+
+target_link_libraries(ScenarioIntegrationTests PRIVATE
+    robot_core
+    robot_scenario
+    robot_logging
+    robot_reporting
+    GTest::gtest_main
+)
+
+target_compile_definitions(ScenarioIntegrationTests PRIVATE
+    SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios/"
+)
+
+gtest_discover_tests(ScenarioIntegrationTests)

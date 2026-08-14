@@ -1,0 +1,17 @@
+{
+  "scenario": "normal_mission",
+  "events": [
+    {
+      "timestamp_ms": 0,
+      "type": "SCENARIO_LOADED"
+    },
+    {
+      "timestamp_ms": 100,
+      "type": "START_MISSION"
+    },
+    {
+      "timestamp_ms": 5000,
+      "type": "MISSION_COMPLETED"
+    }
+  ]
+}
