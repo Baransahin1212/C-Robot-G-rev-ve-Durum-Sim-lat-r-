@@ -192,3 +192,16 @@ target_compile_definitions(ApplicationTests PRIVATE
 )
 
 gtest_discover_tests(ApplicationTests)
+
+# --- Warnings: scoped to our own targets only, never to FetchContent
+# dependencies (GoogleTest, nlohmann/json), so third-party warning noise
+# is never our concern to fix or silence.
+if (MSVC)
+    foreach(robot_target
+        robot_core robot_scenario robot_logging robot_reporting robot_app
+        RobotSimulator RobotSimulatorTests ScenarioSourceTests
+        ScenarioIntegrationTests ApplicationTests
+    )
+        target_compile_options(${robot_target} PRIVATE /W4)
+    endforeach()
+endif()
