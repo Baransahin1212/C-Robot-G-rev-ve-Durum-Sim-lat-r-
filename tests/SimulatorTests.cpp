@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -50,9 +51,9 @@ private:
     std::size_t index_ = 0;
 };
 
-Event MakeEvent(EventType type)
+Event MakeEvent(EventType type, std::uint64_t timestampMs = 0)
 {
-    return Event{type, 0, std::nullopt};
+    return Event{type, timestampMs, std::nullopt};
 }
 
 } // namespace
@@ -261,4 +262,37 @@ TEST(SimulatorTest, LoggingDoesNotAlterSimulationResultCounts)
     EXPECT_EQ(resultWithoutLogger.eventsProcessed, resultWithLogger.eventsProcessed);
     EXPECT_EQ(resultWithoutLogger.successfulTransitions, resultWithLogger.successfulTransitions);
     EXPECT_EQ(resultWithoutLogger.rejectedTransitions, resultWithLogger.rejectedTransitions);
+}
+
+TEST(SimulatorTest, LastEventTimestampReflectsMostRecentEvent)
+{
+    // Arrange
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded, 0),
+        MakeEvent(EventType::StartMission, 100),
+        MakeEvent(EventType::MissionCompleted, 6000),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    ASSERT_TRUE(result.lastEventTimestampMs.has_value());
+    EXPECT_EQ(*result.lastEventTimestampMs, 6000u);
+}
+
+TEST(SimulatorTest, LastEventTimestampIsNulloptWhenNoEventsProcessed)
+{
+    // Arrange
+    FakeEventSource source({});
+    RobotStateMachine machine;
+    Simulator simulator(source, machine);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_FALSE(result.lastEventTimestampMs.has_value());
 }

@@ -4,6 +4,7 @@ out/
 [Bb]in/
 [Oo]bj/
 logs/
+reports/
 
 # CMake
 CMakeFiles/

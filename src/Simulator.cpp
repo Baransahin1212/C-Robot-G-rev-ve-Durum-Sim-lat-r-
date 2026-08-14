@@ -25,6 +25,7 @@ SimulationResult Simulator::run()
 
         const TransitionResult transitionResult = stateMachine_.processEvent(*event);
         ++result.eventsProcessed;
+        result.lastEventTimestampMs = event->timestampMs;
 
         if (transitionResult == TransitionResult::Success)
         {

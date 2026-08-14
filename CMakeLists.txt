@@ -63,16 +63,28 @@ add_library(robot_logging STATIC
 
 target_link_libraries(robot_logging PUBLIC robot_domain)
 
+# --- robot_reporting: MissionOutcome mapping + SimulationReport writer ---
+# Depends on robot_core because SimulationReport is derived from
+# SimulationResult (defined alongside Simulator). RobotStateMachine and
+# JsonScenarioSource never depend on this target - the dependency only
+# flows one way, from reporting down to the data it summarizes.
+add_library(robot_reporting STATIC
+    src/StreamReportWriter.cpp
+)
+
+target_link_libraries(robot_reporting PUBLIC robot_core)
+
 # --- RobotSimulator: the command-line application ---
 add_executable(RobotSimulator
     src/main.cpp
 )
 
-target_link_libraries(RobotSimulator PRIVATE robot_core robot_scenario robot_logging)
+target_link_libraries(RobotSimulator PRIVATE robot_core robot_scenario robot_logging robot_reporting)
 
 target_compile_definitions(RobotSimulator PRIVATE
     SCENARIOS_DIR="${CMAKE_SOURCE_DIR}/scenarios/"
     LOGS_DIR="${CMAKE_SOURCE_DIR}/logs/"
+    REPORTS_DIR="${CMAKE_SOURCE_DIR}/reports/"
 )
 
 # --- Tests (GoogleTest via FetchContent, pinned to a stable tagged release) ---
@@ -95,11 +107,13 @@ add_executable(RobotSimulatorTests
     tests/RobotStateMachineTests.cpp
     tests/SimulatorTests.cpp
     tests/StreamSimulationLoggerTests.cpp
+    tests/SimulationReportTests.cpp
 )
 
 target_link_libraries(RobotSimulatorTests PRIVATE
     robot_core
     robot_logging
+    robot_reporting
     GTest::gtest_main
 )
 

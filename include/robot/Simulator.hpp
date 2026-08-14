@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 
 #include "robot/IEventSource.hpp"
 #include "robot/ISimulationLogger.hpp"
@@ -17,6 +19,7 @@ struct SimulationResult
     std::size_t eventsProcessed = 0;
     std::size_t successfulTransitions = 0;
     std::size_t rejectedTransitions = 0;
+    std::optional<std::uint64_t> lastEventTimestampMs;
 };
 
 // Pulls events from an IEventSource and feeds them to a RobotStateMachine

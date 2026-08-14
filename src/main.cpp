@@ -8,7 +8,9 @@
 #include "robot/JsonScenarioSource.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/SimulationReport.hpp"
 #include "robot/Simulator.hpp"
+#include "robot/StreamReportWriter.hpp"
 #include "robot/StreamSimulationLogger.hpp"
 
 namespace
@@ -104,10 +106,23 @@ int main()
         const robot::SimulationResult result = simulator.run();
 
         std::cout << "Log written to: " << logPath.string() << std::endl;
-        std::cout << "Final state: " << robot::toString(result.finalState) << std::endl;
-        std::cout << "Events processed: " << result.eventsProcessed << std::endl;
-        std::cout << "Successful transitions: " << result.successfulTransitions << std::endl;
-        std::cout << "Rejected transitions: " << result.rejectedTransitions << std::endl;
+
+        const std::filesystem::path reportsDir(REPORTS_DIR);
+        std::filesystem::create_directories(reportsDir);
+        const std::filesystem::path reportPath = reportsDir / "simulation_report.txt";
+
+        std::ofstream reportFile(reportPath);
+        if (!reportFile.is_open())
+        {
+            throw std::runtime_error("Could not open report file for writing: " + reportPath.string());
+        }
+
+        const robot::SimulationReport report = robot::makeSimulationReport(result);
+        robot::StreamReportWriter reportWriter(reportFile);
+        reportWriter.write(report);
+
+        std::cout << "Report written to: " << reportPath.string() << std::endl;
+        std::cout << "Mission outcome: " << robot::toString(report.outcome) << std::endl;
     }
     catch (const robot::ScenarioParseError& e)
     {
@@ -115,7 +130,7 @@ int main()
     }
     catch (const std::runtime_error& e)
     {
-        std::cout << "Logging failed: " << e.what() << std::endl;
+        std::cout << "File I/O failed: " << e.what() << std::endl;
     }
 
     return 0;
