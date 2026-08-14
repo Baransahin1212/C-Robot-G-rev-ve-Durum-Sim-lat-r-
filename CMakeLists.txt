@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(RobotSimulator
     src/main.cpp
+    src/RobotStateMachine.cpp
 )
 
 target_include_directories(RobotSimulator PRIVATE

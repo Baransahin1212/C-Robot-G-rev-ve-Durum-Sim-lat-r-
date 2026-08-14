@@ -3,25 +3,59 @@
 
 #include "robot/Event.hpp"
 #include "robot/RobotState.hpp"
+#include "robot/RobotStateMachine.hpp"
+
+namespace
+{
+
+void apply(robot::RobotStateMachine& machine, robot::EventType eventType, std::uint64_t timestampMs)
+{
+    const robot::Event event{eventType, timestampMs, std::nullopt};
+    const robot::TransitionResult result = machine.processEvent(event);
+
+    std::cout << "  event=" << robot::toString(eventType)
+              << " -> result=" << (result == robot::TransitionResult::Success ? "Success" : "InvalidTransition")
+              << " state=" << robot::toString(machine.currentState())
+              << std::endl;
+}
+
+} // namespace
 
 int main()
 {
     std::cout << "RobotSimulator skeleton OK" << std::endl;
 
-    const robot::RobotState state = robot::RobotState::Moving;
-    std::cout << "RobotState: " << robot::toString(state) << std::endl;
+    std::cout << "\nNormal mission: Idle -> Ready -> Moving -> Completed" << std::endl;
+    {
+        robot::RobotStateMachine machine;
+        apply(machine, robot::EventType::ScenarioLoaded, 0);
+        apply(machine, robot::EventType::StartMission, 10);
+        apply(machine, robot::EventType::MissionCompleted, 20);
+    }
 
-    const robot::Event event{robot::EventType::BatteryCritical, 1234, 17.5};
-    std::cout << "EventType: " << robot::toString(event.type)
-              << " timestampMs: " << event.timestampMs
-              << " value: " << (event.value.has_value() ? std::to_string(*event.value) : "none")
-              << std::endl;
+    std::cout << "\nObstacle: Moving -> WaitingForObstacleClear -> Moving" << std::endl;
+    {
+        robot::RobotStateMachine machine;
+        apply(machine, robot::EventType::ScenarioLoaded, 0);
+        apply(machine, robot::EventType::StartMission, 10);
+        apply(machine, robot::EventType::ObstacleDetected, 20);
+        apply(machine, robot::EventType::ObstacleCleared, 30);
+    }
 
-    const robot::Event eventNoValue{robot::EventType::StartMission, 5678, std::nullopt};
-    std::cout << "EventType: " << robot::toString(eventNoValue.type)
-              << " timestampMs: " << eventNoValue.timestampMs
-              << " value: " << (eventNoValue.value.has_value() ? std::to_string(*eventNoValue.value) : "none")
-              << std::endl;
+    std::cout << "\nLow battery: Moving -> ReturningHome -> Aborted" << std::endl;
+    {
+        robot::RobotStateMachine machine;
+        apply(machine, robot::EventType::ScenarioLoaded, 0);
+        apply(machine, robot::EventType::StartMission, 10);
+        apply(machine, robot::EventType::BatteryCritical, 20);
+        apply(machine, robot::EventType::HomeReached, 30);
+    }
+
+    std::cout << "\nInvalid transition: Idle + MissionCompleted is rejected" << std::endl;
+    {
+        robot::RobotStateMachine machine;
+        apply(machine, robot::EventType::MissionCompleted, 0);
+    }
 
     return 0;
 }
