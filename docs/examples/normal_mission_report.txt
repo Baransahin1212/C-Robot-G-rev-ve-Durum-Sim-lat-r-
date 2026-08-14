@@ -1,0 +1,8 @@
+Simulation Result
+-----------------
+Mission outcome: Completed
+Final state: Completed
+Events processed: 3
+Successful transitions: 3
+Rejected transitions: 0
+Simulation end time: 5000 ms

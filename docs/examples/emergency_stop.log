@@ -1,0 +1,6 @@
+[t=0ms] [INFO] Event: ScenarioLoaded
+[t=0ms] [INFO] State: Idle -> Ready
+[t=100ms] [INFO] Event: StartMission
+[t=100ms] [INFO] State: Ready -> Moving
+[t=2500ms] [INFO] Event: EmergencyStop
+[t=2500ms] [INFO] State: Moving -> EmergencyStopped

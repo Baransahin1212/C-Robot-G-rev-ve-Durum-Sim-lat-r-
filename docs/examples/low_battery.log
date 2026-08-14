@@ -1,0 +1,8 @@
+[t=0ms] [INFO] Event: ScenarioLoaded
+[t=0ms] [INFO] State: Idle -> Ready
+[t=100ms] [INFO] Event: StartMission
+[t=100ms] [INFO] State: Ready -> Moving
+[t=3000ms] [INFO] Event: BatteryCritical value=8
+[t=3000ms] [INFO] State: Moving -> ReturningHome
+[t=5000ms] [INFO] Event: HomeReached
+[t=5000ms] [INFO] State: ReturningHome -> Aborted
