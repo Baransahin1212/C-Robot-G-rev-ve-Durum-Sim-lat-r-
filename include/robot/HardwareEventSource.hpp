@@ -6,6 +6,7 @@
 
 #include "robot/Event.hpp"
 #include "robot/IEventSource.hpp"
+#include "robot/IPollingEventSource.hpp"
 #include "robot/IRobotHardware.hpp"
 
 namespace robot
@@ -14,39 +15,51 @@ namespace robot
 // Converts IRobotHardware sensor state into the same Event vocabulary
 // JsonScenarioSource produces (ObstacleDetected/ObstacleCleared/
 // BatteryCritical/EmergencyStop), so Simulator/RobotStateMachine can be
-// driven by either source interchangeably through IEventSource.
-// HardwareEventSource only reads sensor-like IRobotHardware methods
-// (batteryLevelPercent/obstacleDetected/emergencyStopPressed) - it never
-// calls an actuator method. It produces Events, it does not command the
-// robot; that remains RobotController's job.
+// driven by either source interchangeably. HardwareEventSource only reads
+// sensor-like IRobotHardware methods (batteryLevelPercent/obstacleDetected/
+// emergencyStopPressed) - it never calls an actuator method. It produces
+// Events, it does not command the robot; that remains RobotController's
+// job.
 //
-// Edge-triggered: each nextEvent() call compares the current sensor
-// snapshot against the previously observed one and emits an event only for
-// a state *change*, never for a condition that merely persists. There is
-// no EventType for "emergency stop released" or "battery recovered" in the
+// Edge-triggered: each poll compares the current sensor snapshot against
+// the previously observed one and emits an event only for a state
+// *change*, never for a condition that merely persists. There is no
+// EventType for "emergency stop released" or "battery recovered" in the
 // existing vocabulary, so those transitions are tracked internally (to
 // correctly detect the *next* rising edge) but produce no Event -
 // ObstacleCleared is the one recovery-direction event that does exist, and
 // is emitted when obstacleDetected() goes true -> false.
 //
-// When more than one sensor condition becomes newly active between calls,
+// When more than one sensor condition becomes newly active between polls,
 // all of them are queued (never silently dropped) and drained one at a
 // time in a fixed safety priority: emergency stop, then critical battery,
 // then obstacle. A fresh sensor snapshot is only taken once the queue is
 // empty.
 //
-// This is a finite, snapshot-driven adapter, not a continuous polling
-// service: nextEvent() returns std::nullopt whenever there is currently
-// nothing new to report, which - per IEventSource's contract - looks like
-// source exhaustion to Simulator::run(). That is intentional for Phase
-// 13E; see docs/technical-decisions.md for why continuous real-time
-// polling is a deliberately separate, later concern.
-class HardwareEventSource : public IEventSource
+// Implements BOTH IEventSource and IPollingEventSource over the same
+// underlying edge-triggered queue - nextEvent() and pollEvent() return
+// identical values (nextEvent() simply delegates to pollEvent()); only the
+// CALLER'S interpretation of std::nullopt differs:
+//   - Simulator (via IEventSource::nextEvent()) treats nullopt as "this
+//     finite source is exhausted" and stops calling it.
+//   - RobotRuntime (via IPollingEventSource::pollEvent()) treats nullopt
+//     as "nothing new this cycle" and may poll again later.
+// HardwareEventSource itself has no opinion on which is correct - it is a
+// finite, snapshot-driven adapter either way for this phase: a poll/call
+// that finds no new edge returns nullopt regardless of caller, with no
+// internal notion of "exhausted" versus "temporarily quiet." See
+// docs/technical-decisions.md for why continuous real-time polling
+// (a scheduler that keeps calling pollEvent() on a timer/loop) remains a
+// deliberately separate, later concern.
+class HardwareEventSource
+    : public IEventSource
+    , public IPollingEventSource
 {
 public:
     explicit HardwareEventSource(IRobotHardware& hardware);
 
     std::optional<Event> nextEvent() override;
+    std::optional<Event> pollEvent() override;
 
 private:
     // No existing documented threshold; 20% is this project's first

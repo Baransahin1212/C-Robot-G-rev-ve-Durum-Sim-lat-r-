@@ -411,6 +411,79 @@ source. No `--hardware`/`--live` flag was added. Connecting
 `HardwareEventSource` to the CLI is future work, once its snapshot
 semantics have been validated in isolation (this phase).
 
+## Live sensor runtime: `IPollingEventSource` / `RobotRuntime` (Phase 13F)
+
+Phase 13E's `HardwareEventSource` exposed a real semantic mismatch:
+`IEventSource::nextEvent()` returning `std::nullopt` means "this finite
+source is exhausted, stop calling it" - the contract `Simulator::run()`
+relies on to know when a scenario is over. But for live sensor input,
+"nothing changed this cycle" is not the same claim as "this robot will
+never produce another event" - conflating the two would either make
+`Simulator` loop forever waiting for a `nullopt` that never legitimately
+means "done," or would force every live poll to permanently end the run.
+Phase 13F resolves this by introducing a second interface and a second,
+parallel orchestrator, instead of overloading `IEventSource`'s meaning:
+
+- **`IEventSource`** (`robot_domain`, unchanged) - finite/exhaustible
+  input contract. `nullopt` means exhausted. `JsonScenarioSource` and
+  `Simulator` are unchanged from Phase 13A-13E.
+- **`IPollingEventSource`** (new, `robot_domain`) - live polling contract.
+  `pollEvent()` returning `nullopt` means "nothing available this cycle";
+  the source may still produce events later. One method,
+  `std::optional<Event> pollEvent()`, mirroring `IEventSource` in shape but
+  not in meaning.
+- **`HardwareEventSource`** now implements *both* interfaces
+  (`class HardwareEventSource : public IEventSource, public
+  IPollingEventSource`) over the same underlying edge-triggered queue from
+  Phase 13E - unchanged: edge-triggering, the emergency/battery/obstacle
+  priority order, the pending-event queue, the 20% critical-battery
+  threshold, the monotonic timestamp counter, and actuator-free sensor-only
+  reads. `nextEvent()` simply delegates to `pollEvent()` - the returned
+  value is identical either way; only the caller's interpretation of
+  `nullopt` differs by which interface reference it holds.
+- **`Simulator`** (`robot_core`, unchanged) - finite scenario
+  orchestration. Still loops `while (nextEvent())`, still has no idea
+  `IPollingEventSource` or `RobotRuntime` exist.
+- **`RobotRuntime`** (new, `robot_runtime`) - the live, one-cycle-at-a-time
+  counterpart to `Simulator`. `step()` polls **at most one** `Event` via
+  `IPollingEventSource::pollEvent()` and returns immediately - it never
+  loops, sleeps, retries, or blocks. `RuntimeStepResult` reports what
+  happened: `NoEvent` (nothing polled this cycle), `TransitionAccepted`
+  (the FSM accepted the event and `RobotController::applyState()` was
+  called with the resulting state), or `TransitionRejected` (the FSM
+  rejected it; the controller is not called, so actuator state never
+  changes because of a transition the FSM refused - the same rule
+  `Simulator` already follows in Phase 13C).
+
+**One-time synchronization.** On its first call only, `step()` calls
+`controller.applyState(stateMachine.currentState())` before polling, so
+hardware never starts out of sync with the FSM - exactly like
+`Simulator::run()`'s pre-loop sync in Phase 13C, just triggered by the
+first `step()` instead of by `run()` being called. Every later `step()`
+call skips this - synchronization happens once per `RobotRuntime`
+lifetime, not once per cycle.
+
+**No scheduling policy.** `RobotRuntime::step()` is a primitive, not a
+runtime. Nothing in this phase calls `step()` in a loop, on a timer, or on
+a callback - the caller (a future CLI mode, a test, anything) decides how
+often to call it. Adding an actual scheduler is explicitly out of scope
+here.
+
+**Dependency shape.** `RobotRuntime` depends on `IPollingEventSource` (the
+interface, from `robot_domain`), `RobotStateMachine` (`robot_core`), and
+`RobotController` (`robot_controller`) - never on `HardwareEventSource` or
+any concrete `IRobotHardware` implementation. It never reads a sensor
+method directly and never calls an actuator method directly; both flow
+exclusively through the objects it was given, exactly as `Simulator`
+already does.
+
+**Not wired into the CLI.** `Application`/`main.cpp` are unchanged - the
+CLI still only runs `JsonScenarioSource -> Simulator`. No `--live`/
+`--hardware`/`--runtime`/`--poll` flag was added, and no production
+scheduling loop exists yet. Connecting `RobotRuntime` to the CLI, and
+deciding an actual polling cadence, is future work once this primitive's
+semantics have been validated in isolation (this phase).
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

@@ -77,6 +77,22 @@ target_link_libraries(robot_hardware_events PUBLIC
 # only Simulator.hpp/.cpp changed.
 target_link_libraries(robot_core PUBLIC robot_controller)
 
+# --- robot_runtime: RobotRuntime, one live-polling cycle per step() ---
+# Depends on robot_domain (IPollingEventSource), robot_core
+# (RobotStateMachine), and robot_controller (RobotController). Deliberately
+# depends on the IPollingEventSource interface only, not on any concrete
+# polling source - robot_hardware_events (HardwareEventSource) is not a
+# dependency of this target, only of its tests.
+add_library(robot_runtime STATIC
+    src/RobotRuntime.cpp
+)
+
+target_link_libraries(robot_runtime PUBLIC
+    robot_domain
+    robot_core
+    robot_controller
+)
+
 # --- nlohmann/json, pinned to a stable tagged release (not main/master) ---
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 
@@ -239,6 +255,22 @@ target_link_libraries(HardwareEventSourceTests PRIVATE
 
 gtest_discover_tests(HardwareEventSourceTests)
 
+# --- RobotRuntimeTests: one-cycle live polling orchestration (step()),
+# using both a small test-only IPollingEventSource fake and the real
+# HardwareEventSource for genuine live-integration coverage.
+add_executable(RobotRuntimeTests
+    tests/RobotRuntimeTests.cpp
+)
+
+target_link_libraries(RobotRuntimeTests PRIVATE
+    robot_runtime
+    robot_hardware_events
+    robot_hardware
+    GTest::gtest_main
+)
+
+gtest_discover_tests(RobotRuntimeTests)
+
 # --- ScenarioIntegrationTests: exercises the real end-to-end pipeline
 # (JsonScenarioSource -> Simulator -> RobotStateMachine -> SimulationResult
 # -> SimulationReport) against the final scenario files under scenarios/,
@@ -288,10 +320,10 @@ gtest_discover_tests(ApplicationTests)
 if (MSVC)
     foreach(robot_target
         robot_core robot_scenario robot_logging robot_reporting robot_app
-        robot_hardware robot_controller robot_hardware_events
+        robot_hardware robot_controller robot_hardware_events robot_runtime
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
-        ScenarioIntegrationTests ApplicationTests
+        RobotRuntimeTests ScenarioIntegrationTests ApplicationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

@@ -5,6 +5,7 @@
 
 #include "robot/Event.hpp"
 #include "robot/HardwareEventSource.hpp"
+#include "robot/IPollingEventSource.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/SimulatedRobotHardware.hpp"
@@ -16,6 +17,7 @@ namespace
 using robot::Event;
 using robot::EventType;
 using robot::HardwareEventSource;
+using robot::IPollingEventSource;
 using robot::RobotCommand;
 using robot::RobotState;
 using robot::RobotStateMachine;
@@ -232,6 +234,27 @@ TEST(HardwareEventSourceTest, SafeSensorChangesDoNotProduceEvents)
 
     // Assert
     EXPECT_FALSE(event.has_value());
+}
+
+// --- IPollingEventSource conformance (Phase 13F) ---
+//
+// Compile/runtime proof that HardwareEventSource correctly implements the
+// new polling interface too, addressed purely through an
+// IPollingEventSource& - not just IEventSource&.
+TEST(HardwareEventSourceTest, CanBeUsedThroughIPollingEventSourceInterface)
+{
+    // Arrange
+    SimulatedRobotHardware hardware;
+    HardwareEventSource source(hardware);
+    IPollingEventSource& poller = source;
+    hardware.setObstacleDetected(true);
+
+    // Act
+    const std::optional<Event> event = poller.pollEvent();
+
+    // Assert
+    ASSERT_TRUE(event.has_value());
+    EXPECT_EQ(event->type, EventType::ObstacleDetected);
 }
 
 // --- Simulator integration ---

@@ -10,6 +10,13 @@ HardwareEventSource::HardwareEventSource(IRobotHardware& hardware)
 
 std::optional<Event> HardwareEventSource::nextEvent()
 {
+    // Identical underlying behavior to pollEvent() - only the caller's
+    // interpretation of std::nullopt differs (see the class comment).
+    return pollEvent();
+}
+
+std::optional<Event> HardwareEventSource::pollEvent()
+{
     if (pendingEvents_.empty())
     {
         sampleAndEnqueueEdges();
