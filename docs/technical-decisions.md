@@ -207,6 +207,138 @@ The suite is organized by what it exercises, not by arbitrary grouping:
   errors, exit codes) is tested without spawning a subprocess or touching
   the real `logs/`/`reports/` directories.
 
+## Hardware abstraction: `IRobotHardware`
+
+```cpp
+class IRobotHardware {
+public:
+    virtual ~IRobotHardware() = default;
+    virtual int batteryLevelPercent() const = 0;
+    virtual bool obstacleDetected() const = 0;
+    virtual bool emergencyStopPressed() const = 0;
+    virtual void moveForward() = 0;
+    virtual void stop() = 0;
+    virtual void returnToBase() = 0;
+};
+```
+
+`IRobotHardware` isolates the rest of the application from any concrete
+hardware, the same way `IEventSource` isolates `Simulator` from JSON.
+`SimulatedRobotHardware` (in `robot_hardware`) is the one implementation
+today: deterministic, in-memory, mutated only through explicit setters, so
+tests can drive exact sensor states without sleeps, threads, or real I/O.
+
+`RobotStateMachine` remains entirely hardware-independent: it does not
+include `IRobotHardware.hpp`, does not hold a reference to it, and
+`robot_core` has no dependency, direct or transitive, on `robot_hardware`.
+This phase only introduces the abstraction and its simulated
+implementation — a later phase will connect FSM states/events to hardware
+commands through a separate orchestration/controller layer, keeping
+`processEvent`'s job limited to `(state, event) -> state`.
+
+## Hardware orchestration: `RobotController`
+
+```text
+Event -> RobotStateMachine -> RobotState -> RobotController -> IRobotHardware
+```
+
+`RobotController` is the only place FSM states and hardware commands meet.
+It takes an `IRobotHardware&` by constructor injection (non-owning, no
+dynamic allocation, matching the reference-injection pattern used
+throughout - see [Modern C++](#modern-c) above) and maps a `RobotState` to
+exactly one actuator command: `Moving` -> `moveForward()`, `ReturningHome`
+-> `returnToBase()`, every other state -> `stop()`. The mapping `switch` has
+no `default` case, so an unhandled `RobotState` value is a compiler warning
+waiting to happen rather than a silent no-op.
+
+`RobotStateMachine.hpp`/`.cpp` still have no knowledge of `IRobotHardware`
+or `RobotController` - neither file includes either header. (As of Phase
+13C, `robot_core` as a *target* does link `robot_controller`, because
+`Simulator.hpp` optionally accepts a `RobotController*` - see below. That
+dependency is `Simulator`'s, not `RobotStateMachine`'s.) `RobotController`
+is equally one-way: it only reads a `RobotState` it is handed, and does not
+decide transitions, parse JSON, log, or report.
+
+`RobotController` is deliberately not wired into `Simulator` or
+`Application` yet - it is built and unit-tested in isolation against
+`SimulatedRobotHardware`. Connecting it to a real simulation run is future
+work.
+
+## Simulator/RobotController integration (Phase 13C)
+
+`Simulator` optionally accepts a fourth, non-owning `RobotController*`
+(default `nullptr`), following the exact pattern already established by
+`ISimulationLogger*`. When a controller is supplied:
+
+- `Simulator::run()` calls `controller->applyState(stateMachine.currentState())`
+  once before processing any events, synchronizing hardware to the FSM's
+  starting state (normally `Idle` -> `stop()`).
+- After each event, hardware is only updated when
+  `RobotStateMachine::processEvent()` returns `TransitionResult::Success` -
+  `Simulator` calls `controller->applyState(stateMachine.currentState())`
+  with the resulting state. A rejected transition never reaches the
+  controller, so hardware state always reflects a state the FSM actually
+  entered, never one it merely attempted.
+
+`Simulator` never calls `IRobotHardware` methods directly - it only ever
+calls `RobotController::applyState()`; the `RobotState` -> command mapping
+stays exclusively inside `RobotController`. `RobotStateMachine` still has no
+include of, or reference to, `IRobotHardware` or `RobotController` -
+`Simulator.hpp`/`.cpp` are the only files that changed.
+
+`Application`/CLI wiring (constructing a real `SimulatedRobotHardware` and
+`RobotController` for `RobotSimulator`) is deferred to a later phase; this
+phase only makes `Simulator` capable of driving a supplied controller.
+
+## Application/CLI hardware wiring (Phase 13D)
+
+`Application` is the hardware composition root. `runSimulation()` keeps its
+original five-parameter signature (`scenarioPath`, `logsDir`, `reportsDir`,
+`out`, `err`) unchanged for every existing caller, and now delegates to a
+new overload that additionally takes `IRobotHardware&`:
+
+```cpp
+int runSimulation(const std::string& scenarioPath,
+                   const std::filesystem::path& logsDir,
+                   const std::filesystem::path& reportsDir,
+                   std::ostream& out,
+                   std::ostream& err)
+{
+    SimulatedRobotHardware hardware;
+    return runSimulation(scenarioPath, logsDir, reportsDir, out, err, hardware);
+}
+```
+
+The default (five-parameter) overload constructs a stack-local
+`SimulatedRobotHardware` - the only hardware implementation that makes
+sense for a desktop simulator CLI with no hardware selection flag. The
+six-parameter overload does the real work: it constructs a
+`RobotController` around the supplied `hardware` and passes `&controller`
+as `Simulator`'s fourth constructor argument, alongside the existing
+`RobotStateMachine` and logger. All four objects (`hardware`, `controller`,
+`machine`, `logger`) are stack-local to `runSimulation()`, declared in
+dependency order, so lifetimes are trivially safe without any dynamic
+allocation.
+
+Callers only ever supply `IRobotHardware&`, never a `RobotController` -
+`Application` keeps sole responsibility for that composition step, exactly
+as `RobotController` keeps sole responsibility for the `RobotState ->
+command` mapping. This is what makes a future `RealRobotHardware`
+implementation a drop-in replacement for `SimulatedRobotHardware`: nothing
+in `RobotStateMachine`, `Simulator`, or `RobotController` would need to
+change, only the object `Application` constructs.
+
+`ApplicationTests.cpp` uses this overload with a test-only
+`RecordingRobotHardware` (implementing `IRobotHardware`, never added to
+production code) to prove, through the real `runSimulation()` path, that
+Application actually wires `RobotController` into `Simulator` end-to-end -
+not just that `Simulator`/`RobotController` work correctly in isolation
+(already covered by `SimulatorTests.cpp` and `RobotControllerTests.cpp`).
+
+CLI stdout/stderr output is intentionally unchanged in this phase - no
+actuator command is printed. Hardware behavior is observable through tests
+only; a dedicated hardware telemetry layer, if useful, is future work.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

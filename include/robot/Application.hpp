@@ -5,6 +5,11 @@
 #include <string>
 #include <vector>
 
+namespace robot
+{
+class IRobotHardware;
+} // namespace robot
+
 namespace robot::app
 {
 
@@ -38,17 +43,33 @@ ParsedArguments parseArguments(const std::vector<std::string>& args);
 void printUsage(std::ostream& out);
 
 // Runs one scenario end-to-end: JsonScenarioSource -> RobotStateMachine ->
-// StreamSimulationLogger -> Simulator -> SimulationResult ->
-// SimulationReport -> StreamReportWriter. Writes simulation.log and
+// StreamSimulationLogger -> RobotController -> Simulator -> SimulationResult
+// -> SimulationReport -> StreamReportWriter. Writes simulation.log and
 // simulation_report.txt under the given directories (created if needed)
 // and a summary to `out`. Returns kExitSuccess on a successfully executed
 // simulation, or a specific non-zero code for a scenario-load or I/O
 // failure (with a message written to `err`).
+//
+// Uses a default-constructed SimulatedRobotHardware, since the CLI is a
+// desktop simulator - delegates to the IRobotHardware& overload below.
 int runSimulation(const std::string& scenarioPath,
                    const std::filesystem::path& logsDir,
                    const std::filesystem::path& reportsDir,
                    std::ostream& out,
                    std::ostream& err);
+
+// Same as above, but drives the caller-supplied IRobotHardware instead of
+// constructing a SimulatedRobotHardware internally. Application still
+// constructs the RobotController that maps FSM states to hardware commands
+// - callers only ever supply hardware, never a controller - so this is the
+// extension point a future real-hardware CLI path, or a test that wants to
+// observe actuator commands, uses without touching FSM or Simulator code.
+int runSimulation(const std::string& scenarioPath,
+                   const std::filesystem::path& logsDir,
+                   const std::filesystem::path& reportsDir,
+                   std::ostream& out,
+                   std::ostream& err,
+                   IRobotHardware& hardware);
 
 // Full application logic over an already-split argument list (excludes the
 // program name), so tests can drive it directly without touching argv or

@@ -3,16 +3,25 @@
 namespace robot
 {
 
-Simulator::Simulator(IEventSource& eventSource, RobotStateMachine& stateMachine, ISimulationLogger* logger)
+Simulator::Simulator(IEventSource& eventSource,
+                      RobotStateMachine& stateMachine,
+                      ISimulationLogger* logger,
+                      RobotController* controller)
     : eventSource_(eventSource)
     , stateMachine_(stateMachine)
     , logger_(logger)
+    , controller_(controller)
 {
 }
 
 SimulationResult Simulator::run()
 {
     SimulationResult result;
+
+    if (controller_ != nullptr)
+    {
+        controller_->applyState(stateMachine_.currentState());
+    }
 
     while (const std::optional<Event> event = eventSource_.nextEvent())
     {
@@ -33,6 +42,10 @@ SimulationResult Simulator::run()
             if (logger_ != nullptr)
             {
                 logger_->logTransitionSucceeded(event->timestampMs, stateBeforeEvent, stateMachine_.currentState());
+            }
+            if (controller_ != nullptr)
+            {
+                controller_->applyState(stateMachine_.currentState());
             }
         }
         else

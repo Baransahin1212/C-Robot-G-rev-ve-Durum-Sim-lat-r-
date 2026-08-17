@@ -180,13 +180,13 @@ JsonScenarioSource   (implements IEventSource)
      |
      v
   Simulator
-   /     \
-  v       v
-FSM     Logger
-(RobotStateMachine) (StreamSimulationLogger)
- |
- v
-SimulationResult
+   /  |  \
+  v   v   v
+FSM Logger RobotController
+(RobotStateMachine) (StreamSimulationLogger)   |
+ |                                             v
+ v                                       IRobotHardware
+SimulationResult                       (SimulatedRobotHardware)
  |
  v
 SimulationReport -> StreamReportWriter
@@ -194,7 +194,16 @@ SimulationReport -> StreamReportWriter
 
 `Simulator::run()` pulls one `Event` at a time from the `IEventSource`,
 feeds it to `RobotStateMachine::processEvent()`, and (if a logger was
-supplied) records the event and its outcome. The accumulated
+supplied) records the event and its outcome. When a `RobotController` is
+attached, `Simulator` also synchronizes hardware to the FSM's starting
+state and, after every *accepted* transition, hands the resulting
+`RobotState` to `controller->applyState()` - `RobotController` alone
+decides the `RobotState -> IRobotHardware` command mapping; `Simulator`
+never calls hardware directly, and a rejected transition never reaches the
+controller. The CLI (`Application::runSimulation`) wires a
+`SimulatedRobotHardware` and `RobotController` in by default; see
+[`docs/technical-decisions.md`](docs/technical-decisions.md) for the full
+Phase 13A-13D hardware-abstraction rationale. The accumulated
 `SimulationResult` is converted to a human-facing `SimulationReport` and
 written out by a `StreamReportWriter`.
 
@@ -205,11 +214,13 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | Target | Responsibility |
 |---|---|
 | `robot_domain` | Header-only `INTERFACE` target exposing the shared vocabulary types (`Event`, `EventType`, `RobotState`, `IEventSource`). No implementation of its own. |
-| `robot_core` | `RobotStateMachine` (the FSM) and `Simulator` (orchestration). Has no JSON dependency. |
+| `robot_core` | `RobotStateMachine` (the FSM) and `Simulator` (orchestration). Has no JSON dependency. `RobotStateMachine` has no hardware dependency either — it never includes `IRobotHardware`/`RobotController`. |
+| `robot_hardware` | `IRobotHardware` abstraction and `SimulatedRobotHardware`, a deterministic in-memory implementation. Depends only on `robot_domain`. |
+| `robot_controller` | `RobotController`, which maps a resulting `RobotState` to one `IRobotHardware` actuator command. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_scenario` | `JsonScenarioSource` — converts a scenario JSON file into `Event` objects. Depends on `robot_domain` and, privately, on nlohmann/json. |
 | `robot_logging` | `StreamSimulationLogger`, the concrete `ISimulationLogger` implementation that writes to any `std::ostream`. |
 | `robot_reporting` | `MissionOutcome` mapping and `StreamReportWriter`, which turn a `SimulationResult` into a human-readable report. Depends on `robot_core` for `SimulationResult`. |
-| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Depends on all of the above. |
+| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Constructs the default `SimulatedRobotHardware`/`RobotController` for the CLI path. Depends on all of the above. |
 | `RobotSimulator` | The executable — `src/main.cpp` is a ~10-line composition root that calls into `robot_app`. |
 
 Dependencies flow one way only: `RobotStateMachine` never depends on

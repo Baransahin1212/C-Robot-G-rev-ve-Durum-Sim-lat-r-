@@ -10,8 +10,10 @@
 
 #include "robot/Event.hpp"
 #include "robot/IEventSource.hpp"
+#include "robot/RobotController.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/SimulatedRobotHardware.hpp"
 #include "robot/Simulator.hpp"
 #include "robot/StreamSimulationLogger.hpp"
 
@@ -21,8 +23,11 @@ namespace
 using robot::Event;
 using robot::EventType;
 using robot::IEventSource;
+using robot::RobotCommand;
+using robot::RobotController;
 using robot::RobotState;
 using robot::RobotStateMachine;
+using robot::SimulatedRobotHardware;
 using robot::Simulator;
 using robot::SimulationResult;
 using robot::StreamSimulationLogger;
@@ -295,4 +300,205 @@ TEST(SimulatorTest, LastEventTimestampIsNulloptWhenNoEventsProcessed)
 
     // Assert
     EXPECT_FALSE(result.lastEventTimestampMs.has_value());
+}
+
+// --- RobotController integration (Phase 13C) ---
+//
+// These tests drive Simulator with a RobotController attached to a
+// SimulatedRobotHardware, verifying that Simulator only ever calls
+// RobotController::applyState() - never a hardware method directly - and
+// only for states RobotStateMachine actually accepted.
+
+TEST(SimulatorTest, RunsWithoutControllerExactlyAsBefore)
+{
+    // Arrange: same scenario/assertions as
+    // NormalMissionReachesCompletedWithAllTransitionsSuccessful, to confirm
+    // an explicit null controller changes nothing about existing behavior.
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::MissionCompleted),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, nullptr);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::Completed);
+    EXPECT_EQ(result.eventsProcessed, 3u);
+    EXPECT_EQ(result.successfulTransitions, 3u);
+    EXPECT_EQ(result.rejectedTransitions, 0u);
+}
+
+TEST(SimulatorTest, AttachedControllerSynchronizesHardwareToInitialStateBeforeAnyEvent)
+{
+    // Arrange: hardware starts in a command inconsistent with the FSM's
+    // initial Idle state, so the synchronization is meaningful.
+    SimulatedRobotHardware hardware;
+    hardware.moveForward();
+    RobotController controller(hardware);
+    FakeEventSource source({});
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::Idle);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::Stopped);
+}
+
+TEST(SimulatorTest, ReachingMovingDrivesHardwareForward)
+{
+    // Arrange
+    SimulatedRobotHardware hardware;
+    RobotController controller(hardware);
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::Moving);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::MovingForward);
+}
+
+TEST(SimulatorTest, ReachingWaitingForObstacleClearStopsHardware)
+{
+    // Arrange
+    SimulatedRobotHardware hardware;
+    RobotController controller(hardware);
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::ObstacleDetected),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::WaitingForObstacleClear);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::Stopped);
+}
+
+TEST(SimulatorTest, ObstacleClearedResumesMovingForward)
+{
+    // Arrange: obstacle is hit while Moving, so RobotStateMachine resumes
+    // Moving (not ReturningHome) once the obstacle clears.
+    SimulatedRobotHardware hardware;
+    RobotController controller(hardware);
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::ObstacleDetected),
+        MakeEvent(EventType::ObstacleCleared),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::Moving);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::MovingForward);
+}
+
+TEST(SimulatorTest, ReachingReturningHomeDrivesHardwareToBase)
+{
+    // Arrange
+    SimulatedRobotHardware hardware;
+    RobotController controller(hardware);
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::BatteryCritical),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::ReturningHome);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::ReturningToBase);
+}
+
+TEST(SimulatorTest, ReachingEmergencyStoppedStopsHardware)
+{
+    // Arrange
+    SimulatedRobotHardware hardware;
+    RobotController controller(hardware);
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::EmergencyStop),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::EmergencyStopped);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::Stopped);
+}
+
+TEST(SimulatorTest, ReachingCompletedStopsHardware)
+{
+    // Arrange
+    SimulatedRobotHardware hardware;
+    RobotController controller(hardware);
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::MissionCompleted),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::Completed);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::Stopped);
+}
+
+TEST(SimulatorTest, RejectedTransitionDoesNotChangeHardwareCommand)
+{
+    // Arrange: reach Moving (hardware -> MovingForward), then send
+    // StartMission again - only valid from Ready, so it is rejected while
+    // Moving. Hardware must stay MovingForward, not fall back to Stopped.
+    SimulatedRobotHardware hardware;
+    RobotController controller(hardware);
+    FakeEventSource source({
+        MakeEvent(EventType::ScenarioLoaded),
+        MakeEvent(EventType::StartMission),
+        MakeEvent(EventType::StartMission),
+    });
+    RobotStateMachine machine;
+    Simulator simulator(source, machine, nullptr, &controller);
+
+    // Act
+    const SimulationResult result = simulator.run();
+
+    // Assert
+    EXPECT_EQ(result.finalState, RobotState::Moving);
+    EXPECT_EQ(result.successfulTransitions, 2u);
+    EXPECT_EQ(result.rejectedTransitions, 1u);
+    EXPECT_EQ(hardware.currentCommand(), RobotCommand::MovingForward);
 }

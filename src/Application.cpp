@@ -5,7 +5,9 @@
 #include <stdexcept>
 
 #include "robot/JsonScenarioSource.hpp"
+#include "robot/RobotController.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/SimulatedRobotHardware.hpp"
 #include "robot/SimulationReport.hpp"
 #include "robot/Simulator.hpp"
 #include "robot/StreamReportWriter.hpp"
@@ -50,6 +52,17 @@ int runSimulation(const std::string& scenarioPath,
                    std::ostream& out,
                    std::ostream& err)
 {
+    SimulatedRobotHardware hardware;
+    return runSimulation(scenarioPath, logsDir, reportsDir, out, err, hardware);
+}
+
+int runSimulation(const std::string& scenarioPath,
+                   const std::filesystem::path& logsDir,
+                   const std::filesystem::path& reportsDir,
+                   std::ostream& out,
+                   std::ostream& err,
+                   IRobotHardware& hardware)
+{
     std::optional<JsonScenarioSource> source;
     try
     {
@@ -91,7 +104,8 @@ int runSimulation(const std::string& scenarioPath,
 
     RobotStateMachine machine;
     StreamSimulationLogger logger(logFile);
-    Simulator simulator(*source, machine, &logger);
+    RobotController controller(hardware);
+    Simulator simulator(*source, machine, &logger, &controller);
 
     const SimulationResult result = simulator.run();
     const SimulationReport report = makeSimulationReport(result);

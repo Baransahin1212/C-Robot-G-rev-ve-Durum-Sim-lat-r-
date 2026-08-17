@@ -29,6 +29,38 @@ add_library(robot_core STATIC
 
 target_link_libraries(robot_core PUBLIC robot_domain)
 
+# --- robot_hardware: IRobotHardware abstraction + SimulatedRobotHardware ---
+# Depends only on robot_domain, not on robot_core or robot_scenario.
+# RobotStateMachine deliberately does not depend on robot_hardware (and
+# vice versa) - connecting FSM states/events to hardware commands is a
+# future orchestration layer, not part of this target.
+add_library(robot_hardware STATIC
+    src/SimulatedRobotHardware.cpp
+)
+
+target_link_libraries(robot_hardware PUBLIC robot_domain)
+
+# --- robot_controller: RobotState -> IRobotHardware command translation ---
+# Depends on robot_domain (RobotState) and robot_hardware (IRobotHardware).
+# RobotStateMachine has no dependency on this target, direct or transitive -
+# the controller only observes a resulting RobotState, it is never consulted
+# by, or wired into, the FSM itself.
+add_library(robot_controller STATIC
+    src/RobotController.cpp
+)
+
+target_link_libraries(robot_controller PUBLIC
+    robot_domain
+    robot_hardware
+)
+
+# Simulator.hpp includes RobotController.hpp so it can accept an optional
+# RobotController*, so robot_core needs robot_controller PUBLIC (its
+# headers, and anything that includes Simulator.hpp, need to resolve
+# RobotController). RobotStateMachine itself still has no such include -
+# only Simulator.hpp/.cpp changed.
+target_link_libraries(robot_core PUBLIC robot_controller)
+
 # --- nlohmann/json, pinned to a stable tagged release (not main/master) ---
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 
@@ -150,6 +182,31 @@ target_compile_definitions(ScenarioSourceTests PRIVATE
 
 gtest_discover_tests(ScenarioSourceTests)
 
+# --- RobotHardwareTests: SimulatedRobotHardware in isolation ---
+add_executable(RobotHardwareTests
+    tests/SimulatedRobotHardwareTests.cpp
+)
+
+target_link_libraries(RobotHardwareTests PRIVATE
+    robot_hardware
+    GTest::gtest_main
+)
+
+gtest_discover_tests(RobotHardwareTests)
+
+# --- RobotControllerTests: RobotState -> IRobotHardware command mapping,
+# exercised against SimulatedRobotHardware as the deterministic test double.
+add_executable(RobotControllerTests
+    tests/RobotControllerTests.cpp
+)
+
+target_link_libraries(RobotControllerTests PRIVATE
+    robot_controller
+    GTest::gtest_main
+)
+
+gtest_discover_tests(RobotControllerTests)
+
 # --- ScenarioIntegrationTests: exercises the real end-to-end pipeline
 # (JsonScenarioSource -> Simulator -> RobotStateMachine -> SimulationResult
 # -> SimulationReport) against the final scenario files under scenarios/,
@@ -199,8 +256,10 @@ gtest_discover_tests(ApplicationTests)
 if (MSVC)
     foreach(robot_target
         robot_core robot_scenario robot_logging robot_reporting robot_app
+        robot_hardware robot_controller
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
-        ScenarioIntegrationTests ApplicationTests
+        RobotHardwareTests RobotControllerTests ScenarioIntegrationTests
+        ApplicationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()
