@@ -93,6 +93,21 @@ target_link_libraries(robot_runtime PUBLIC
     robot_controller
 )
 
+# --- robot_runtime_runner: LiveRuntimeRunner, deterministic finite cycle
+# scheduler on top of RobotRuntime::step() ---
+# Depends only on robot_runtime (RobotRuntime, RuntimeStepResult).
+# Deliberately does not depend on robot_hardware, robot_hardware_events, or
+# robot_controller directly - LiveRuntimeRunner only ever calls
+# RobotRuntime::step() and classifies the result, with no knowledge of
+# sensors, actuators, or FSM internals.
+add_library(robot_runtime_runner STATIC
+    src/LiveRuntimeRunner.cpp
+)
+
+target_link_libraries(robot_runtime_runner PUBLIC
+    robot_runtime
+)
+
 # --- nlohmann/json, pinned to a stable tagged release (not main/master) ---
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 
@@ -271,6 +286,22 @@ target_link_libraries(RobotRuntimeTests PRIVATE
 
 gtest_discover_tests(RobotRuntimeTests)
 
+# --- LiveRuntimeRunnerTests: deterministic finite-cycle scheduling over
+# RobotRuntime::step(), including one genuine live integration test using
+# the real HardwareEventSource.
+add_executable(LiveRuntimeRunnerTests
+    tests/LiveRuntimeRunnerTests.cpp
+)
+
+target_link_libraries(LiveRuntimeRunnerTests PRIVATE
+    robot_runtime_runner
+    robot_hardware_events
+    robot_hardware
+    GTest::gtest_main
+)
+
+gtest_discover_tests(LiveRuntimeRunnerTests)
+
 # --- ScenarioIntegrationTests: exercises the real end-to-end pipeline
 # (JsonScenarioSource -> Simulator -> RobotStateMachine -> SimulationResult
 # -> SimulationReport) against the final scenario files under scenarios/,
@@ -321,9 +352,11 @@ if (MSVC)
     foreach(robot_target
         robot_core robot_scenario robot_logging robot_reporting robot_app
         robot_hardware robot_controller robot_hardware_events robot_runtime
+        robot_runtime_runner
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
-        RobotRuntimeTests ScenarioIntegrationTests ApplicationTests
+        RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
+        ApplicationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

@@ -484,6 +484,58 @@ scheduling loop exists yet. Connecting `RobotRuntime` to the CLI, and
 deciding an actual polling cadence, is future work once this primitive's
 semantics have been validated in isolation (this phase).
 
+## Live runtime scheduling: `LiveRuntimeRunner` (Phase 13G)
+
+```text
+RobotRuntime::step()  -> one live cycle
+LiveRuntimeRunner::runCycles(N) -> exactly N cycles, deterministically
+```
+
+`RobotRuntime::step()` (Phase 13F) already represents exactly one live
+polling cycle - it processes at most one `Event` and returns a
+`RuntimeStepResult`. Phase 13G adds `LiveRuntimeRunner`, a thin scheduler on
+top of it: `runCycles(cycleCount)` calls `step()` **exactly** `cycleCount`
+times, classifies every `RuntimeStepResult`, and accumulates the counts
+into a `RuntimeRunSummary` (`cyclesExecuted`, `noEventCycles`,
+`acceptedTransitions`, `rejectedTransitions`).
+
+**`NoEvent` does not stop the runner.** This is the central point of the
+phase: for a live polling source, "nothing happened this cycle" is a
+routine, expected outcome (see `IPollingEventSource`'s Phase 13F
+rationale), not a reason to give up early. `runCycles()` always executes
+every requested cycle, whether each one turns out to be `NoEvent`,
+`TransitionAccepted`, or `TransitionRejected`.
+
+**Exactly N cycles, no hidden extras.** `runCycles(0)` never calls
+`step()` at all and returns an all-zero summary. `runCycles(N)` calls
+`step()` exactly `N` times - no retries, no skipped cycles, and no
+implicit initialization cycle of its own; `RobotRuntime` already owns its
+one-time controller/FSM synchronization internally (Phase 13F), and
+`LiveRuntimeRunner` has no knowledge of that behavior at all.
+
+**Dependency boundary.** `LiveRuntimeRunner` (in `robot_runtime_runner`)
+depends only on `RobotRuntime`/`RuntimeStepResult` (`robot_runtime`). It
+has no knowledge of `IRobotHardware`, `HardwareEventSource`,
+`IPollingEventSource`, `RobotController`, `RobotStateMachine`, or
+`SimulatedRobotHardware` - it only ever calls `RobotRuntime::step()` and
+classifies the result, keeping cycle scheduling independent of robot
+internals.
+
+**No `IRuntimeStepper` interface was introduced.** `LiveRuntimeRunner`
+takes a concrete `RobotRuntime&`, not an abstraction over it. Tests
+substitute a test-only `IPollingEventSource` (a `QueuePollingEventSource`
+or similar) underneath a real `RobotRuntime`, which was already
+sufficiently simple and deterministic - `RobotRuntime` itself is the
+seam Phase 13F built for exactly this purpose, so adding a second
+interface whose only real implementor would ever be `RobotRuntime` would
+be ceremony, not simplification.
+
+**No timing policy yet.** `runCycles()` contains no `std::chrono`, no
+sleeping, no threads, and no timers - it is a pure, synchronous loop over
+a fixed cycle count, useful for deterministic tests and bounded live runs.
+Deciding an actual polling cadence (a loop, a timer, a callback) and
+wiring any of this into the CLI both remain future work.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe
