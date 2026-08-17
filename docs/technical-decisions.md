@@ -339,6 +339,78 @@ CLI stdout/stderr output is intentionally unchanged in this phase - no
 actuator command is printed. Hardware behavior is observable through tests
 only; a dedicated hardware telemetry layer, if useful, is future work.
 
+## Hardware sensor event source: `HardwareEventSource` (Phase 13E)
+
+```text
+IRobotHardware -> HardwareEventSource -> Event -> Simulator -> RobotStateMachine
+```
+
+`HardwareEventSource` (in `robot_hardware_events`) is a second
+`IEventSource` implementation, alongside `JsonScenarioSource` - not a
+replacement for it. It converts `IRobotHardware` sensor reads
+(`batteryLevelPercent`/`obstacleDetected`/`emergencyStopPressed`) into the
+same `Event`/`EventType` vocabulary `JsonScenarioSource` already produces:
+`EventType::ObstacleDetected`, `EventType::ObstacleCleared`,
+`EventType::BatteryCritical`, `EventType::EmergencyStop`. No new
+`EventType` was added.
+
+- **Edge-triggered, not level-triggered.** Each `nextEvent()` call compares
+  the current sensor snapshot to the previously observed one and emits an
+  event only on a *change*. A sensor condition that merely persists (e.g.
+  the obstacle stays detected) produces nothing on subsequent calls.
+- **No invented recovery events.** The existing vocabulary has
+  `ObstacleCleared` (obstacle going true -> false), so that transition is
+  emitted. It has no "emergency stop released" or "battery recovered"
+  event, so those transitions update internal edge-tracking state (so the
+  *next* rising edge is still detected correctly) but emit nothing -
+  exactly as instructed: don't invent an `EventType` the FSM doesn't
+  define.
+- **Startup hazards are surfaced.** The previous-sample booleans default to
+  `false`, so an already-active hazard at construction time (e.g. emergency
+  stop already pressed) is treated as a rising edge on the first sample and
+  reported immediately, rather than silently ignored. If the FSM is not yet
+  in a state that accepts that event, `RobotStateMachine`/`Simulator`
+  handle it exactly like any other rejected transition - no special-casing
+  needed here.
+- **Deterministic safety priority + no lost edges.** If more than one
+  sensor condition becomes newly active between samples, all of the
+  resulting events are queued (a `std::deque<Event>`) in a fixed order -
+  emergency stop, then critical battery, then obstacle - and drained one
+  per `nextEvent()` call before the next snapshot is taken. None are
+  silently dropped.
+- **Battery threshold.** No threshold was previously documented anywhere in
+  the project, so `HardwareEventSource::kCriticalBatteryPercent = 20` is
+  this project's first definition of "critical" battery, kept as a named
+  constant rather than a magic number.
+- **Timestamps.** `Event::timestampMs` has no default and `IRobotHardware`
+  exposes no clock, so `HardwareEventSource` uses a private monotonically
+  increasing counter (0, 1, 2, ...), incremented once per emitted event.
+  This keeps it wall-clock-free and deterministic for tests.
+- **Actuator-free.** `HardwareEventSource` only ever calls the three
+  sensor-read methods on `IRobotHardware`. It never calls
+  `moveForward()`/`stop()`/`returnToBase()`, and it has no knowledge of
+  `RobotController` at all - it produces `Event`s, nothing more.
+
+**Snapshot/exhaustion semantics (the key design decision of this phase).**
+`IEventSource::nextEvent()` returning `std::nullopt` means "exhausted" to
+`Simulator::run()` - the loop stops for good, it does not retry later.
+`HardwareEventSource` embraces this as-is rather than reworking
+`IEventSource` into a blocking/streaming abstraction: `nullopt` here means
+"nothing new right now," and a finite batch of sensor edges set up before
+a `Simulator::run()` call will all be drained before that `nullopt` is
+returned. This makes `HardwareEventSource` a **finite, snapshot-driven
+adapter** for Phase 13E, useful for deterministic tests and one-shot
+sensor-to-FSM runs, not a continuous real-time polling service. Adding
+continuous polling (a runtime loop that keeps re-invoking `Simulator`, or
+re-sampling between calls) is explicitly deferred to a later phase with its
+own design, not bolted on here.
+
+**Not wired into the CLI.** `Application`/`main.cpp` still construct only
+`JsonScenarioSource`; `JsonScenarioSource` remains the CLI's only event
+source. No `--hardware`/`--live` flag was added. Connecting
+`HardwareEventSource` to the CLI is future work, once its snapshot
+semantics have been validated in isolation (this phase).
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

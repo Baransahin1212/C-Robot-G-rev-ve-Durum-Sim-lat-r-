@@ -54,6 +54,22 @@ target_link_libraries(robot_controller PUBLIC
     robot_hardware
 )
 
+# --- robot_hardware_events: HardwareEventSource, sensor state -> Event ---
+# Depends on robot_domain (Event/IEventSource) and robot_hardware
+# (IRobotHardware). Deliberately independent of robot_core/robot_controller
+# - it only ever produces Events; Simulator/RobotStateMachine consume it
+# through the existing IEventSource interface exactly like
+# JsonScenarioSource, with no FSM-specific knowledge of its own, and it
+# never calls an IRobotHardware actuator method.
+add_library(robot_hardware_events STATIC
+    src/HardwareEventSource.cpp
+)
+
+target_link_libraries(robot_hardware_events PUBLIC
+    robot_domain
+    robot_hardware
+)
+
 # Simulator.hpp includes RobotController.hpp so it can accept an optional
 # RobotController*, so robot_core needs robot_controller PUBLIC (its
 # headers, and anything that includes Simulator.hpp, need to resolve
@@ -207,6 +223,22 @@ target_link_libraries(RobotControllerTests PRIVATE
 
 gtest_discover_tests(RobotControllerTests)
 
+# --- HardwareEventSourceTests: sensor-state -> Event edge/priority/queue
+# behavior, plus one Simulator integration test proving HardwareEventSource
+# satisfies IEventSource end-to-end. Links robot_core (RobotStateMachine,
+# Simulator) in addition to robot_hardware_events for that integration test.
+add_executable(HardwareEventSourceTests
+    tests/HardwareEventSourceTests.cpp
+)
+
+target_link_libraries(HardwareEventSourceTests PRIVATE
+    robot_core
+    robot_hardware_events
+    GTest::gtest_main
+)
+
+gtest_discover_tests(HardwareEventSourceTests)
+
 # --- ScenarioIntegrationTests: exercises the real end-to-end pipeline
 # (JsonScenarioSource -> Simulator -> RobotStateMachine -> SimulationResult
 # -> SimulationReport) against the final scenario files under scenarios/,
@@ -256,10 +288,10 @@ gtest_discover_tests(ApplicationTests)
 if (MSVC)
     foreach(robot_target
         robot_core robot_scenario robot_logging robot_reporting robot_app
-        robot_hardware robot_controller
+        robot_hardware robot_controller robot_hardware_events
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
-        RobotHardwareTests RobotControllerTests ScenarioIntegrationTests
-        ApplicationTests
+        RobotHardwareTests RobotControllerTests HardwareEventSourceTests
+        ScenarioIntegrationTests ApplicationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

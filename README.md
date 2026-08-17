@@ -217,6 +217,7 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `robot_core` | `RobotStateMachine` (the FSM) and `Simulator` (orchestration). Has no JSON dependency. `RobotStateMachine` has no hardware dependency either — it never includes `IRobotHardware`/`RobotController`. |
 | `robot_hardware` | `IRobotHardware` abstraction and `SimulatedRobotHardware`, a deterministic in-memory implementation. Depends only on `robot_domain`. |
 | `robot_controller` | `RobotController`, which maps a resulting `RobotState` to one `IRobotHardware` actuator command. Depends on `robot_domain` and `robot_hardware`. |
+| `robot_hardware_events` | `HardwareEventSource`, a second `IEventSource` implementation that turns `IRobotHardware` sensor reads into `Event`s. A finite, snapshot-driven adapter (see `docs/technical-decisions.md`), not yet wired into the CLI. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_scenario` | `JsonScenarioSource` — converts a scenario JSON file into `Event` objects. Depends on `robot_domain` and, privately, on nlohmann/json. |
 | `robot_logging` | `StreamSimulationLogger`, the concrete `ISimulationLogger` implementation that writes to any `std::ostream`. |
 | `robot_reporting` | `MissionOutcome` mapping and `StreamReportWriter`, which turn a `SimulationResult` into a human-readable report. Depends on `robot_core` for `SimulationResult`. |
