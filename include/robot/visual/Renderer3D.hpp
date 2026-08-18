@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 #include "raylib.h"
 
 #include "robot/visual/VirtualWorld.hpp"
@@ -12,9 +14,13 @@ namespace robot::visual
 // VirtualWorld. Does not create or destroy the raylib window itself; that
 // is main3d's responsibility (see docs/technical-decisions.md, Phase
 // 13M), so a Renderer3D must only be constructed/used while a window is
-// already open. Has no knowledge of RobotStateMachine, RobotRuntime, or
-// RobotController - it only ever reads VirtualWorld's plain pose/
-// obstacle/base data, never robot FSM state.
+// already open. Has no knowledge of RobotStateMachine, RobotRuntime,
+// RobotController, or IRobotHardware - it only ever reads VirtualWorld's
+// plain pose/obstacle/base data, plus the two already-formatted display
+// strings passed into renderFrame() (Phase 13N), never a FSM/hardware
+// type directly. This keeps robot_visual free of any dependency on
+// robot_visual_simulation - the two are sibling targets under
+// RobotSimulator3D, not layered on each other.
 class Renderer3D
 {
 public:
@@ -26,14 +32,18 @@ public:
     // left exactly as it was on the previous frame - main3d decides
     // `updateCamera` based on whether mouse capture (DisableCursor()) is
     // currently active, so the camera never drifts while the cursor has
-    // been released for normal desktop use. Call exactly once per
-    // iteration of the main render loop, between InitWindow() and
-    // CloseWindow().
-    void renderFrame(const VirtualWorld& world, bool updateCamera);
+    // been released for normal desktop use. `stateText`/`commandText` are
+    // shown verbatim in the HUD (e.g. "Moving"/"MoveForward") - the
+    // caller (main3d) is responsible for converting the real
+    // RobotState/VirtualDriveCommand to text, so this class never needs
+    // to know either type. Call exactly once per iteration of the main
+    // render loop, between InitWindow() and CloseWindow().
+    void renderFrame(const VirtualWorld& world, bool updateCamera, std::string_view stateText,
+                      std::string_view commandText);
 
 private:
     void drawScene(const VirtualWorld& world) const;
-    void drawHud(const VirtualWorld& world) const;
+    void drawHud(const VirtualWorld& world, std::string_view stateText, std::string_view commandText) const;
 
     Camera3D camera_;
 };

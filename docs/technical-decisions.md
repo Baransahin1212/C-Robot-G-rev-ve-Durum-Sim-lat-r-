@@ -1241,7 +1241,12 @@ wiring for the visual simulator either.** `main3d.cpp` constructs exactly
 `Application.cpp`/`Application.hpp`/`src/main.cpp` have zero diff in this
 phase; `RobotSimulator` was not given a `--3d`/`--visual` flag or any
 other new option. Connecting the visual robot's pose to the real FSM/
-runtime is explicitly future work, not attempted here.
+runtime is explicitly future work, not attempted here. (Historical note:
+this paragraph describes Phase 13M as originally shipped. Phase 13N,
+below, is that future work - `main3d.cpp` now does construct the real
+`RobotStateMachine`/`RobotController`/`RobotRuntime`. The CLI wiring
+statement remains true unchanged: `RobotSimulator`/`Application` still
+have no `--3d`/`--visual` flag or any diff in Phase 13N either.)
 
 **Tests stay headless, deliberately.** `VirtualWorldTests.cpp` exercises
 only `VirtualWorld`'s deterministic constructed scene (initial robot
@@ -1251,6 +1256,161 @@ calls `InitWindow()` or any raylib drawing function, and because
 `robot_visual_world` has no raylib dependency at all, it structurally
 cannot. No test asserts on rendered pixels or raylib draw-call behavior,
 per the task brief's explicit instruction.
+
+## Phase 13N: FSM-driven 3D robot movement
+
+Connects the existing robot-control architecture to the 3D visual
+simulator, so the on-screen robot actually moves when the real FSM/
+controller commands movement - closing the gap the Phase 13M section
+above explicitly deferred:
+
+```text
+DemoCommandSource (visual-only)
+      |
+      v
+  RobotRuntime                     (unchanged)
+      |
+      v
+RobotStateMachine                  (unchanged)
+      |
+      v
+ RobotController                   (unchanged)
+      |
+      v
+VirtualRobotHardware               (new, Phase 13N)
+      |
+      v
+VirtualWorld::setRobotPosition()   (new mutation entry point)
+      |
+      v
+   Renderer3D                      (draws whatever pose VirtualWorld holds)
+```
+
+**`VirtualRobotHardware` is a fourth `IRobotHardware` implementation,
+alongside `SimulatedRobotHardware`, `RealRobotHardware`, and (implicitly)
+any future one.** `RobotController`/`RobotRuntime` needed zero changes to
+work with it, for exactly the same reason `RealRobotHardware` (Phase 13K)
+needed none: both only ever depend on the `IRobotHardware` interface, not
+a concrete type. `VirtualRobotHardware::moveForward()/stop()/
+returnToBase()` only ever record a `VirtualDriveCommand` - they never
+touch `VirtualWorld` directly. Actual movement happens later, once per
+frame, inside `update(deltaSeconds)`, the only place this class mutates
+`VirtualWorld` - mirroring the same "record the command now, act on it
+later" split the task brief specified, and keeping actuator-command
+handling side-effect-free at the exact moment `RobotController` calls it
+(consistent with `RobotController::applyState()`'s own synchronous,
+non-blocking contract).
+
+**Movement direction was derived from `VisualRobot.cpp`'s actual
+`rlRotatef` call, not assumed.** `drawVisualRobot()` applies
+`rlRotatef(pose.headingDegrees, 0, 1, 0)` in local space before drawing
+the front marker at local `(0, h/2, L/2)` (i.e. local +Z). Working through
+the standard right-hand-rule Y-rotation matrix that `rlRotatef` implements
+gives `x' = x*cosθ + z*sinθ`, `z' = -x*sinθ + z*cosθ`; substituting the
+marker's local `(0, z=L/2)` yields a front direction of
+`(sin θ, 0, cos θ)`. `VirtualRobotHardware::update()` uses exactly that
+same `(sin, cos)` mapping for forward movement, so heading 0 moves along
++Z and heading 90 moves along +X - matching the front marker exactly, by
+construction rather than coincidence. `HeadingZeroMovesInFrontMarkerDirection`/
+`HeadingNinetyMovesInCorrectDirection` in `VirtualRobotHardwareTests.cpp`
+assert both cases numerically against this derivation.
+
+**`VirtualWorld` gained two narrow mutation methods, not a general
+setter.** `setRobotPosition(const Vec3&)` and `setRobotHeading(float)`
+are `VirtualWorld`'s only mutation entry points - rendering continues to
+consume `VirtualWorld` through a `const&` exclusively (see `Renderer3D`).
+`setRobotHeading()` has no production caller yet in this phase (the demo
+scene's heading never changes - there is no turning/differential-drive
+logic yet), but exists so `VirtualRobotHardwareTests.cpp` can exercise the
+heading-direction convention directly rather than only ever testing the
+one heading (0) the demo scene happens to start at; it is also the ready
+mutation point a future turning phase will need.
+
+**`DemoCommandSource` is a real, if minimal, `IPollingEventSource` -
+not a way to fake FSM state.** It delivers exactly `ScenarioLoaded` then
+`StartMission`, once each, then `std::nullopt` forever. `RobotRuntime`
+polls it exactly like it would poll `HardwareEventSource` or
+`ScriptedCommandEventSource` - the FSM reaches `Moving` through its real
+`processEvent()` transition rules, never by `main3d.cpp` calling
+`RobotStateMachine`'s state directly (which it can't - there is no such
+setter). This was deliberately not built by reusing `CommandScript`/
+`ScriptedCommandEventSource`: `CommandScript`'s constructor requires an
+on-disk file, and writing a temporary file at startup for a two-line,
+never-changing demo script would be more machinery than the two-`switch`-case
+class it replaces. `DemoCommandSource` is visual-only
+(`include/robot/visual/DemoCommandSource.hpp`) and does not touch
+production `CommandScript`/`ScriptedCommandEventSource` semantics at all.
+
+**Exactly one `RobotRuntime::step()` per rendered frame - the render
+loop is the scheduler, not `LiveRuntimeRunner`.** `LiveRuntimeRunner`
+(Phase 13G) is a *finite*, bounded-cycle-count scheduler - the wrong shape
+for an interactive window that runs for an unknown, unbounded number of
+frames until the user closes it. `main3d.cpp` instead calls
+`runtime.step()` directly once per iteration of its own
+`while (!WindowShouldClose())` loop, exactly as the task brief specified;
+once `DemoCommandSource` is exhausted, every subsequent `step()` call
+legitimately returns `NoEvent` (per `RobotRuntime`'s own Phase 13F
+contract) and does nothing further - this is expected steady-state
+behavior, not an error.
+
+**World bounds are a simple clamp, explicitly not collision detection.**
+`VirtualRobotHardware::update()` clamps the robot's `x`/`z` to a
+`+-10`-unit square (matching `Renderer3D`'s own ~10x10 ground/grid) after
+computing the new position, so continuous `MoveForward` cannot drift the
+robot indefinitely far from the visible scene. Obstacle boxes and the base
+platform are not checked against the robot's position at all - the robot
+can currently pass straight through them. Obstacle sensing, collision,
+differential-drive turning, and `ReturnToBase` navigation are all
+explicitly out of scope for this phase; `ReturnToBase` is accepted as a
+valid command (so `RobotController`/`VirtualRobotHardware` never reject
+it) but `update()` treats it identically to `Stopped` - the preferred
+behavior the task brief specified over silently doing nothing different.
+
+**HUD state/command text crosses the `robot_visual`/
+`robot_visual_simulation` boundary as plain strings, not typed values.**
+`Renderer3D::renderFrame()` gained two `std::string_view` parameters
+(`stateText`, `commandText`) rather than accepting a `RobotState` or
+`VirtualDriveCommand` directly - `robot_visual` has no dependency on
+`robot_visual_simulation` (they are sibling targets under
+`RobotSimulator3D`, per the task brief's preferred graph), so `Renderer3D`
+cannot know either type by name. `main3d.cpp` converts each value to text
+itself, reusing the existing `robot::toString(RobotState)` (`RobotState.hpp`,
+unmodified) and a small new visual-only `robot::visual::toString(VirtualDriveCommand)`
+(mirroring that same shape) rather than inventing a different pattern.
+`Renderer3D::drawHud()` was also refactored from five hand-tracked pixel
+Y-offsets to a small `{text, fontSize, color}` array processed in a loop -
+not required by this phase, but the two new HUD lines made the old
+hand-offset approach error-prone enough that fixing it in the same change
+was clearly worthwhile, and the panel-sizing logic (already
+content-width-aware since the HUD-readability fix) needed no further
+change to accommodate the extra lines.
+
+**CMake dependency shape.** `robot_visual_simulation` depends on
+`robot_visual_world`, `robot_hardware`, `robot_controller`, `robot_runtime`,
+and `robot_domain` - the same real FSM/controller/runtime stack the CLI's
+`robot_app` depends on, all `PUBLIC` since `VirtualRobotHardware.hpp`'s
+public API surface touches `IRobotHardware` (from `robot_hardware`) and
+`VirtualWorld` (from `robot_visual_world`). It deliberately has no
+dependency on `robot_visual` or raylib - `VirtualRobotHardware` has no
+raylib dependency of its own, matching `SimulatedRobotHardware`/
+`RealRobotHardware`'s own boundaries exactly. `RobotSimulator3D` links
+both `robot_visual` and `robot_visual_simulation` as siblings; neither of
+those two targets depends on the other, avoiding the reverse
+`robot_visual -> robot_visual_simulation` edge a shared-HUD-type approach
+would have required.
+
+**Nothing in the already-tested robot-control stack changed.**
+`RobotStateMachine`, `RobotController`, `RobotRuntime`, `IRobotHardware`,
+`HardwareEventSource`, `Application`, and `Simulator` all have zero diff
+in this phase - confirmed via `git diff --stat` before merging, the same
+verification discipline every prior phase in this document has used.
+`VirtualRobotHardwareTests.cpp`'s final integration test
+(`FsmControllerHardwareWorldIntegrationThroughRobotRuntime`) drives the
+exact same `RobotRuntime`/`DemoCommandSource`/`RobotStateMachine`/
+`RobotController`/`VirtualRobotHardware` composition `main3d.cpp` uses,
+headless, proving the full
+`FSM -> RobotController -> VirtualRobotHardware -> VirtualWorld` chain
+end to end without opening a window.
 
 ## Fail-safe / emergency stop
 

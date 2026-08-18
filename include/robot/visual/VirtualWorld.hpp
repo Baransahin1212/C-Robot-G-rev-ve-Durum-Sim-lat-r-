@@ -20,9 +20,11 @@ struct Vec3
 
 // Pose of the visual robot: world-space position plus a heading in
 // degrees, measured as a rotation around the world Y axis where 0 means
-// facing +Z. Phase 13M never mutates headingDegrees after construction -
-// the robot is stationary; a future phase will drive this from
-// RobotStateMachine, not this struct.
+// facing +Z. As of Phase 13N, position moves (via
+// VirtualRobotHardware::update()) but headingDegrees is still never
+// mutated by any production code path - the demo scene has no
+// turning/differential-drive logic yet, only straight-line forward
+// movement along whatever heading the robot already has.
 struct RobotPose
 {
     Vec3 position;
@@ -60,6 +62,23 @@ public:
     const RobotPose& robotPose() const noexcept;
     const BasePlatform& basePlatform() const noexcept;
     const std::vector<BoxObstacle>& obstacles() const noexcept;
+
+    // Moves the robot to `position`, leaving headingDegrees unchanged - no
+    // turning/differential-drive logic exists yet (Phase 13N). This is
+    // VirtualWorld's only mutation entry point; rendering continues to
+    // consume VirtualWorld through a const reference exclusively (see
+    // Renderer3D). Intended caller: VirtualRobotHardware::update(), once
+    // per rendered frame - not rendering code.
+    void setRobotPosition(const Vec3& position);
+
+    // Sets the robot's heading in degrees, leaving position unchanged. No
+    // production caller exists yet as of Phase 13N (the demo scene's
+    // heading stays fixed, and no turning/differential-drive logic
+    // exists) - this exists so VirtualRobotHardware's heading-to-movement
+    // direction convention can be tested directly (see
+    // VirtualRobotHardwareTests.cpp), and so a future turning phase has a
+    // ready mutation point.
+    void setRobotHeading(float headingDegrees);
 
 private:
     RobotPose robotPose_;

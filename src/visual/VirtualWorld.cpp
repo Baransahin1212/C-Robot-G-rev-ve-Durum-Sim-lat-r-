@@ -50,4 +50,14 @@ const std::vector<BoxObstacle>& VirtualWorld::obstacles() const noexcept
     return obstacles_;
 }
 
+void VirtualWorld::setRobotPosition(const Vec3& position)
+{
+    robotPose_.position = position;
+}
+
+void VirtualWorld::setRobotHeading(float headingDegrees)
+{
+    robotPose_.headingDegrees = headingDegrees;
+}
+
 } // namespace robot::visual

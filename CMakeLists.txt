@@ -406,17 +406,45 @@ target_link_libraries(robot_visual PUBLIC
     raylib
 )
 
+# --- robot_visual_simulation: VirtualRobotHardware, the FSM-driven
+# actuator/sensor boundary for the visual simulator (Phase 13N) ---
+# Depends on robot_visual_world (VirtualWorld), robot_hardware
+# (IRobotHardware), robot_controller (linked transitively via
+# robot_runtime, but named explicitly for clarity), and robot_runtime
+# (RobotRuntime/IPollingEventSource) - the same real FSM/runtime/
+# controller stack the CLI uses, never a raylib-aware substitute.
+# Deliberately independent of robot_visual: VirtualRobotHardware has no
+# raylib dependency of its own, matching SimulatedRobotHardware/
+# RealRobotHardware's own boundaries. robot_visual and
+# robot_visual_simulation are sibling targets under RobotSimulator3D,
+# neither depending on the other - only raylib-drawing code needs raylib,
+# and only FSM-driving code needs the robot core/runtime stack.
+add_library(robot_visual_simulation STATIC
+    src/visual/VirtualRobotHardware.cpp
+)
+
+target_link_libraries(robot_visual_simulation PUBLIC
+    robot_visual_world
+    robot_hardware
+    robot_controller
+    robot_runtime
+    robot_domain
+)
+
 # --- RobotSimulator3D: the interactive 3D visual simulator executable ---
 # Deliberately separate from RobotSimulator (the CLI) - RobotSimulator
-# never links robot_visual or raylib. Phase 13M is visualization
-# foundation only: the robot is drawn stationary, with no
-# RobotStateMachine/RobotRuntime/RobotController construction here yet.
+# never links robot_visual/robot_visual_simulation or raylib. As of Phase
+# 13N, main3d.cpp constructs the real RobotStateMachine/RobotController/
+# RobotRuntime (via robot_visual_simulation) to drive the on-screen robot
+# through VirtualRobotHardware; robot_visual (raylib) remains purely the
+# drawing layer, reading only VirtualWorld's plain data.
 add_executable(RobotSimulator3D
     src/visual/main3d.cpp
 )
 
 target_link_libraries(RobotSimulator3D PRIVATE
     robot_visual
+    robot_visual_simulation
 )
 
 # --- Tests (GoogleTest via FetchContent, pinned to a stable tagged release) ---
@@ -731,6 +759,29 @@ target_link_libraries(VirtualWorldTests PRIVATE
 
 gtest_discover_tests(VirtualWorldTests)
 
+# --- VirtualRobotHardwareTests: FSM-driven virtual actuator/movement
+# behavior (Phase 13N) - command tracking, deterministic forward movement,
+# the heading/front-marker direction convention, world-bounds clamping,
+# and one focused RobotStateMachine/RobotController/VirtualRobotHardware/
+# VirtualWorld integration test. Links robot_visual_simulation (which
+# transitively provides robot_controller/robot_core/robot_runtime) plus
+# robot_controller/robot_core explicitly, since the test file includes
+# RobotController.hpp/RobotStateMachine.hpp directly. Never links
+# robot_visual/raylib - genuinely headless, no window is ever created by
+# this target.
+add_executable(VirtualRobotHardwareTests
+    tests/visual/VirtualRobotHardwareTests.cpp
+)
+
+target_link_libraries(VirtualRobotHardwareTests PRIVATE
+    robot_visual_simulation
+    robot_controller
+    robot_core
+    GTest::gtest_main
+)
+
+gtest_discover_tests(VirtualRobotHardwareTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -741,14 +792,14 @@ if (MSVC)
         robot_runtime_runner robot_sensor_script robot_scripted_runtime
         robot_command_script robot_command_events robot_polling_composite
         robot_real_hardware robot_serial_transport
-        robot_visual_world robot_visual
+        robot_visual_world robot_visual robot_visual_simulation
         RobotSimulator RobotSimulator3D RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
         RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
         ApplicationTests SensorScriptTests ScriptedLiveRuntimeRunnerTests
         CommandScriptTests ScriptedCommandEventSourceTests
         CompositePollingEventSourceTests RealRobotHardwareTests
-        SerialRobotTransportTests VirtualWorldTests
+        SerialRobotTransportTests VirtualWorldTests VirtualRobotHardwareTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

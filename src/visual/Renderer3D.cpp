@@ -1,5 +1,6 @@
 #include "robot/visual/Renderer3D.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 #include "robot/visual/VisualRobot.hpp"
@@ -31,10 +32,18 @@ constexpr Color kBaseOutlineColor = DARKBLUE;
 constexpr int kHudMarginX = 20;
 constexpr int kHudMarginY = 20;
 constexpr int kHudPadding = 10;
+constexpr int kHudLineSpacing = 6;
 constexpr Color kHudPanelBackground = Color{0, 0, 0, 150};
 constexpr Color kHudTitleColor = RAYWHITE;
 constexpr Color kHudTextColor = RAYWHITE;
 constexpr Color kHudControlsColor = LIGHTGRAY;
+
+struct HudLine
+{
+    const char* text;
+    int fontSize;
+    Color color;
+};
 
 } // namespace
 
@@ -48,7 +57,8 @@ Renderer3D::Renderer3D()
     camera_.projection = CAMERA_PERSPECTIVE;
 }
 
-void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera)
+void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, std::string_view stateText,
+                              std::string_view commandText)
 {
     if (updateCamera)
     {
@@ -62,7 +72,7 @@ void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera)
     drawScene(world);
     EndMode3D();
 
-    drawHud(world);
+    drawHud(world, stateText, commandText);
 
     EndDrawing();
 }
@@ -87,9 +97,16 @@ void Renderer3D::drawScene(const VirtualWorld& world) const
     drawVisualRobot(world.robotPose());
 }
 
-void Renderer3D::drawHud(const VirtualWorld& world) const
+void Renderer3D::drawHud(const VirtualWorld& world, std::string_view stateText, std::string_view commandText) const
 {
     const RobotPose& pose = world.robotPose();
+
+    char stateLine[80];
+    std::snprintf(stateLine, sizeof(stateLine), "State: %.*s", static_cast<int>(stateText.size()), stateText.data());
+
+    char commandLine[80];
+    std::snprintf(commandLine, sizeof(commandLine), "Command: %.*s", static_cast<int>(commandText.size()),
+                   commandText.data());
 
     char positionLine[64];
     std::snprintf(positionLine, sizeof(positionLine), "Position: X %.2f  Z %.2f", pose.position.x, pose.position.z);
@@ -100,25 +117,41 @@ void Renderer3D::drawHud(const VirtualWorld& world) const
     char obstaclesLine[64];
     std::snprintf(obstaclesLine, sizeof(obstaclesLine), "Obstacles: %d", static_cast<int>(world.obstacles().size()));
 
-    const char* controlsLine = "TAB: capture/release mouse   F11: fullscreen/windowed   Mouse/WASD: camera";
-    constexpr int kControlsFontSize = 16;
+    // A small table of {text, fontSize, color} rather than hand-tracked Y
+    // offsets per line - adding/removing a HUD line only ever touches this
+    // array, and panel sizing/text drawing below stay generic.
+    const HudLine lines[] = {
+        {"Robot Simulator 3D", 20, kHudTitleColor},
+        {stateLine, 18, kHudTextColor},
+        {commandLine, 18, kHudTextColor},
+        {positionLine, 18, kHudTextColor},
+        {headingLine, 18, kHudTextColor},
+        {obstaclesLine, 18, kHudTextColor},
+        {"TAB: capture/release mouse   F11: fullscreen/windowed   Mouse/WASD: camera", 16, kHudControlsColor},
+    };
 
-    // Panel sized to fully contain the widest line (the controls line) so
-    // contrast holds for every line regardless of its length - a fixed
-    // guessed width could leave the tail of the controls line spilling
-    // back onto the unshaded scene.
-    const int panelWidth = MeasureText(controlsLine, kControlsFontSize) + (2 * kHudPadding);
-    constexpr int panelHeight = 96 + kControlsFontSize + (2 * kHudPadding);
+    // Panel sized to fully contain the widest line so contrast holds
+    // regardless of content length - a fixed guessed width could leave a
+    // line's tail spilling back onto the unshaded scene.
+    int panelWidth = 0;
+    int contentHeight = 0;
+    for (const HudLine& line : lines)
+    {
+        panelWidth = std::max(panelWidth, MeasureText(line.text, line.fontSize));
+        contentHeight += line.fontSize + kHudLineSpacing;
+    }
+    panelWidth += 2 * kHudPadding;
+    const int panelHeight = contentHeight + (2 * kHudPadding) - kHudLineSpacing;
+
     DrawRectangle(kHudMarginX, kHudMarginY, panelWidth, panelHeight, kHudPanelBackground);
 
     const int textX = kHudMarginX + kHudPadding;
-    const int baseY = kHudMarginY + kHudPadding;
-
-    DrawText("Robot Simulator 3D", textX, baseY, 20, kHudTitleColor);
-    DrawText(positionLine, textX, baseY + 26, 18, kHudTextColor);
-    DrawText(headingLine, textX, baseY + 48, 18, kHudTextColor);
-    DrawText(obstaclesLine, textX, baseY + 70, 18, kHudTextColor);
-    DrawText(controlsLine, textX, baseY + 96, kControlsFontSize, kHudControlsColor);
+    int textY = kHudMarginY + kHudPadding;
+    for (const HudLine& line : lines)
+    {
+        DrawText(line.text, textX, textY, line.fontSize, line.color);
+        textY += line.fontSize + kHudLineSpacing;
+    }
 
     DrawFPS(10, GetScreenHeight() - 30);
 }
