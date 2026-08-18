@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <ostream>
 #include <string>
@@ -27,14 +28,17 @@ enum class ArgumentAction
 {
     Help,
     Run,
+    RunLive,
     MissingScenario,
-    TooManyArguments
+    TooManyArguments,
+    InvalidLiveArguments
 };
 
 struct ParsedArguments
 {
     ArgumentAction action;
-    std::string scenarioPath; // meaningful only when action == Run
+    std::string scenarioPath;  // meaningful only when action == Run
+    std::size_t liveCycleCount = 0; // meaningful only when action == RunLive
 };
 
 // Pure, testable argument parser - no I/O, no process exit.
@@ -70,6 +74,16 @@ int runSimulation(const std::string& scenarioPath,
                    std::ostream& out,
                    std::ostream& err,
                    IRobotHardware& hardware);
+
+// Runs cycleCount deterministic live-polling cycles end-to-end:
+// SimulatedRobotHardware -> HardwareEventSource -> RobotStateMachine ->
+// RobotController -> RobotRuntime -> LiveRuntimeRunner. All objects are
+// stack-local to this call; nothing is persisted between invocations. This
+// is a separate orchestration path from runSimulation() - live mode never
+// touches JsonScenarioSource or Simulator. Always returns kExitSuccess;
+// there is no failure mode with default-safe simulated sensors and a
+// bounded, in-process cycle count.
+int runLiveSimulation(std::size_t cycleCount, std::ostream& out, std::ostream& err);
 
 // Full application logic over an already-split argument list (excludes the
 // program name), so tests can drive it directly without touching argv or

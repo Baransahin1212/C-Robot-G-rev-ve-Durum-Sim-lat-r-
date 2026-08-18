@@ -1,11 +1,17 @@
 #include "robot/Application.hpp"
 
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
+#include "robot/HardwareEventSource.hpp"
 #include "robot/JsonScenarioSource.hpp"
+#include "robot/LiveRuntimeRunner.hpp"
 #include "robot/RobotController.hpp"
+#include "robot/RobotRuntime.hpp"
+#include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/SimulatedRobotHardware.hpp"
 #include "robot/SimulationReport.hpp"
@@ -16,24 +22,82 @@
 namespace robot::app
 {
 
+namespace
+{
+
+// Parses a non-negative cycle count that must consume the entire input
+// string and fit in std::size_t. Rejects a leading '-' explicitly because
+// std::stoull silently accepts "-1" (wrapping it into a huge unsigned
+// value), rejects any non-numeric or trailing-garbage input by checking
+// that the whole string was consumed, and rejects out-of-range input via
+// the caught exceptions.
+std::optional<std::size_t> parseCycleCount(const std::string& text)
+{
+    if (text.empty() || text.front() == '-')
+    {
+        return std::nullopt;
+    }
+
+    std::size_t consumed = 0;
+    unsigned long long value = 0;
+    try
+    {
+        value = std::stoull(text, &consumed);
+    }
+    catch (const std::exception&)
+    {
+        return std::nullopt;
+    }
+
+    if (consumed != text.size())
+    {
+        return std::nullopt;
+    }
+
+    if (value > std::numeric_limits<std::size_t>::max())
+    {
+        return std::nullopt;
+    }
+
+    return static_cast<std::size_t>(value);
+}
+
+} // namespace
+
 ParsedArguments parseArguments(const std::vector<std::string>& args)
 {
     if (args.empty())
     {
-        return ParsedArguments{ArgumentAction::MissingScenario, {}};
+        return ParsedArguments{ArgumentAction::MissingScenario, {}, {}};
     }
 
     if (args.size() == 1 && (args[0] == "--help" || args[0] == "-h"))
     {
-        return ParsedArguments{ArgumentAction::Help, {}};
+        return ParsedArguments{ArgumentAction::Help, {}, {}};
+    }
+
+    if (args[0] == "--live")
+    {
+        if (args.size() != 3 || args[1] != "--cycles")
+        {
+            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}};
+        }
+
+        const std::optional<std::size_t> cycleCount = parseCycleCount(args[2]);
+        if (!cycleCount.has_value())
+        {
+            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}};
+        }
+
+        return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount};
     }
 
     if (args.size() > 1)
     {
-        return ParsedArguments{ArgumentAction::TooManyArguments, {}};
+        return ParsedArguments{ArgumentAction::TooManyArguments, {}, {}};
     }
 
-    return ParsedArguments{ArgumentAction::Run, args[0]};
+    return ParsedArguments{ArgumentAction::Run, args[0], {}};
 }
 
 void printUsage(std::ostream& out)
@@ -41,9 +105,14 @@ void printUsage(std::ostream& out)
     out << "RobotSimulator - C++ Robot Task and State Simulator\n\n"
         << "Usage:\n"
         << "  RobotSimulator <scenario-file>\n"
+        << "  RobotSimulator --live --cycles <N>\n"
         << "  RobotSimulator --help\n\n"
-        << "Example:\n"
-        << "  RobotSimulator scenarios/normal_mission.json\n";
+        << "Scenario mode runs a finite JSON scenario end-to-end.\n"
+        << "Live mode runs N deterministic polling cycles against\n"
+        << "simulated hardware.\n\n"
+        << "Examples:\n"
+        << "  RobotSimulator scenarios/normal_mission.json\n"
+        << "  RobotSimulator --live --cycles 100\n";
 }
 
 int runSimulation(const std::string& scenarioPath,
@@ -120,6 +189,29 @@ int runSimulation(const std::string& scenarioPath,
     return kExitSuccess;
 }
 
+int runLiveSimulation(std::size_t cycleCount, std::ostream& out, std::ostream& err)
+{
+    (void)err;
+
+    SimulatedRobotHardware hardware;
+    HardwareEventSource eventSource(hardware);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(eventSource, stateMachine, controller);
+    LiveRuntimeRunner runner(runtime);
+
+    const RuntimeRunSummary summary = runner.runCycles(cycleCount);
+
+    out << "Live runtime completed\n"
+        << "Cycles executed: " << summary.cyclesExecuted << "\n"
+        << "No-event cycles: " << summary.noEventCycles << "\n"
+        << "Accepted transitions: " << summary.acceptedTransitions << "\n"
+        << "Rejected transitions: " << summary.rejectedTransitions << "\n"
+        << "Final state: " << toString(stateMachine.currentState()) << "\n";
+
+    return kExitSuccess;
+}
+
 int runApplication(const std::vector<std::string>& args,
                     const std::filesystem::path& logsDir,
                     const std::filesystem::path& reportsDir,
@@ -144,8 +236,16 @@ int runApplication(const std::vector<std::string>& args,
             printUsage(err);
             return kExitUsageError;
 
+        case ArgumentAction::InvalidLiveArguments:
+            err << "Error: invalid live mode arguments. Expected: --live --cycles <N>\n\n";
+            printUsage(err);
+            return kExitUsageError;
+
         case ArgumentAction::Run:
             return runSimulation(parsed.scenarioPath, logsDir, reportsDir, out, err);
+
+        case ArgumentAction::RunLive:
+            return runLiveSimulation(parsed.liveCycleCount, out, err);
     }
 
     return kExitUsageError;

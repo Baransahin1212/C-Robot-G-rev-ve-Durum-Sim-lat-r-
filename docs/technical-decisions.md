@@ -536,6 +536,79 @@ a fixed cycle count, useful for deterministic tests and bounded live runs.
 Deciding an actual polling cadence (a loop, a timer, a callback) and
 wiring any of this into the CLI both remain future work.
 
+## Phase 13H: CLI live mode
+
+Exposes the existing live-runtime pipeline (Phases 13F/13G) through the CLI
+as a second, independent orchestration path alongside scenario mode:
+
+```text
+Scenario mode:  JsonScenarioSource -> Simulator
+Live mode:      SimulatedRobotHardware -> HardwareEventSource ->
+                RobotRuntime -> LiveRuntimeRunner
+```
+
+**Two syntaxes, one executable.** `RobotSimulator <scenario-file>` is
+unchanged. `RobotSimulator --live --cycles <N>` is new. `Application` is
+the composition root for both - `main.cpp` still only splits `argv` and
+calls `runApplication()`.
+
+**`runLiveSimulation(cycleCount, out, err)` is the new testable entry
+point**, parallel to `runSimulation()`. It builds every live-pipeline
+object as a stack-local in a single function call - `SimulatedRobotHardware`,
+`HardwareEventSource`, `RobotStateMachine`, `RobotController`,
+`RobotRuntime`, `LiveRuntimeRunner` - runs `runner.runCycles(cycleCount)`
+once, and prints the resulting `RuntimeRunSummary` plus the FSM's final
+state (via the existing `toString(RobotState)`). No object is held past
+the call; nothing is shared with scenario mode's `runSimulation()`.
+
+**Scenario mode and live mode do not share orchestration.** Live mode
+never touches `JsonScenarioSource` or `Simulator`; scenario mode never
+touches `HardwareEventSource`, `RobotRuntime`, or `LiveRuntimeRunner`. The
+only things they share are `RobotStateMachine`, `RobotController`, and
+`SimulatedRobotHardware` - each path constructs its own instances.
+
+**Cycle-count parsing is intentionally small.** A private
+`parseCycleCount()` helper in `Application.cpp` uses `std::stoull`, then
+enforces three things `std::stoull` alone does not: no leading `-` (which
+`std::stoull` would otherwise silently accept and wrap into a huge
+unsigned value), full-string consumption (rejects `"1.5"`, `"10abc"`), and
+range/exception safety (catches `std::invalid_argument`/`std::out_of_range`
+and rejects anything that would not fit in `std::size_t`). This lives in
+Application.cpp, not as a new reusable parser type - it is a single,
+narrow validation used in exactly one place.
+
+**Boring output is correct output.** `SimulatedRobotHardware` defaults to
+battery 100 / no obstacle / no emergency stop, and live mode has no CLI
+flag (yet) to change those defaults. `--live --cycles N` therefore always
+produces `N` `NoEvent` cycles and a final state of `Idle` - this is the
+expected, deterministic result for this phase, not a bug. Sensor
+scripting/injection is future work.
+
+**Zero cycles has no hidden step.** `--live --cycles 0` calls
+`runner.runCycles(0)`, which (per Phase 13G) never calls `step()` and
+returns an all-zero summary. There is no separate initialization cycle;
+`RobotRuntime`'s one-time controller/FSM sync (Phase 13F) only happens
+inside `step()`, so it never runs at `cycleCount == 0`, and the reported
+final state is the FSM's untouched starting state, `Idle`.
+
+**No new dependency direction, only new edges from `robot_app`.**
+`robot_app` now additionally links `robot_hardware_events`,
+`robot_runtime`, and `robot_runtime_runner`, all `PUBLIC` - matching the
+existing (`robot_core`/`robot_scenario`/`robot_logging`/`robot_reporting`)
+pattern on that target, none of which appear in `Application.hpp` either.
+This is required, not merely a style choice: `robot_app` is a `STATIC`
+library, and CMake does not propagate a static library's `PRIVATE` link
+dependencies to whatever finally links it - a `PRIVATE` dependency here
+would build `robot_app.lib` successfully but leave `RobotSimulator.exe`/
+`ApplicationTests.exe` unable to resolve `HardwareEventSource`/
+`RobotRuntime`/`LiveRuntimeRunner` symbols at final link time.
+
+**Nothing in the live pipeline itself changed.** `RobotStateMachine`,
+`RobotRuntime`, `LiveRuntimeRunner`, `HardwareEventSource`, and
+`RobotController` are untouched by this phase - only `Application.hpp`/
+`.cpp`, `CMakeLists.txt`, and `ApplicationTests.cpp` changed. This phase is
+CLI composition, not a redesign of any already-tested component.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

@@ -88,9 +88,24 @@ grows).
 
 ```text
 RobotSimulator <scenario-file>
+RobotSimulator --live --cycles <N>
 RobotSimulator --help
 RobotSimulator -h
 ```
+
+**Scenario mode** reads a finite JSON scenario file and runs it end-to-end
+through `JsonScenarioSource -> Simulator`, exactly as described throughout
+this document.
+
+**Live mode** (`--live --cycles <N>`) instead runs `N` deterministic
+polling cycles through the live runtime pipeline
+(`SimulatedRobotHardware -> HardwareEventSource -> RobotRuntime ->
+LiveRuntimeRunner`) - see [Architecture](#architecture) below. `N` must be
+a non-negative integer that fully matches the value passed. Live mode
+currently uses `SimulatedRobotHardware`'s default, safe sensor values
+(battery 100, no obstacle, no emergency stop) with no way to change them
+from the CLI, so a run naturally produces `N` `NoEvent` cycles and stays in
+`Idle`. Sensor scripting/injection is not implemented yet.
 
 Windows Debug example, run from the project root:
 
@@ -111,6 +126,21 @@ Events processed: 3
 Successful transitions: 3
 Rejected transitions: 0
 Simulation end time: 5000 ms
+```
+
+Live mode example:
+
+```powershell
+.\build\Debug\RobotSimulator.exe --live --cycles 5
+```
+
+```text
+Live runtime completed
+Cycles executed: 5
+No-event cycles: 5
+Accepted transitions: 0
+Rejected transitions: 0
+Final state: Idle
 ```
 
 ### Exit codes
@@ -218,12 +248,12 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `robot_hardware` | `IRobotHardware` abstraction and `SimulatedRobotHardware`, a deterministic in-memory implementation. Depends only on `robot_domain`. |
 | `robot_controller` | `RobotController`, which maps a resulting `RobotState` to one `IRobotHardware` actuator command. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_hardware_events` | `HardwareEventSource`, an `IEventSource`/`IPollingEventSource` implementation that turns `IRobotHardware` sensor reads into `Event`s. Depends on `robot_domain` and `robot_hardware`. |
-| `robot_runtime` | `RobotRuntime`, the live one-cycle-per-`step()` counterpart to `Simulator` (see `docs/technical-decisions.md`), not yet wired into the CLI. Depends on `robot_domain`, `robot_core`, and `robot_controller`. |
+| `robot_runtime` | `RobotRuntime`, the live one-cycle-per-`step()` counterpart to `Simulator` (see `docs/technical-decisions.md`), wired into the CLI's `--live` mode via `robot_app`. Depends on `robot_domain`, `robot_core`, and `robot_controller`. |
 | `robot_runtime_runner` | `LiveRuntimeRunner`, a deterministic finite scheduler that calls `RobotRuntime::step()` an exact number of times and tallies the results. No timing policy yet. Depends only on `robot_runtime`. |
 | `robot_scenario` | `JsonScenarioSource` — converts a scenario JSON file into `Event` objects. Depends on `robot_domain` and, privately, on nlohmann/json. |
 | `robot_logging` | `StreamSimulationLogger`, the concrete `ISimulationLogger` implementation that writes to any `std::ostream`. |
 | `robot_reporting` | `MissionOutcome` mapping and `StreamReportWriter`, which turn a `SimulationResult` into a human-readable report. Depends on `robot_core` for `SimulationResult`. |
-| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Constructs the default `SimulatedRobotHardware`/`RobotController` for the CLI path. Depends on all of the above. |
+| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation`/`runLiveSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Constructs the default `SimulatedRobotHardware`/`RobotController` for the CLI's scenario path, and the full live pipeline (`HardwareEventSource`/`RobotRuntime`/`LiveRuntimeRunner`) for `--live`. Depends on all of the above. |
 | `RobotSimulator` | The executable — `src/main.cpp` is a ~10-line composition root that calls into `robot_app`. |
 
 Dependencies flow one way only: `RobotStateMachine` never depends on

@@ -340,3 +340,130 @@ TEST(ApplicationTest, RejectedLeadingTransitionProducesNoExtraHardwareCommand)
     };
     EXPECT_EQ(hardware.commands, expected);
 }
+
+// --- CLI live mode (Phase 13H) ---
+//
+// These tests drive the real runApplication() path in --live mode, proving
+// Application composes SimulatedRobotHardware -> HardwareEventSource ->
+// RobotStateMachine -> RobotController -> RobotRuntime -> LiveRuntimeRunner
+// end-to-end. Default SimulatedRobotHardware sensors are safe (battery=100,
+// no obstacle, no e-stop), so every cycle is expected to be NoEvent and the
+// final state stays Idle - a boring result is the correct result.
+
+// N: --live --cycles 5 runs exactly 5 cycles, all NoEvent, final state Idle.
+TEST(ApplicationTest, LiveModeRunsRequestedCycles)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "5"}, "live_five_cycles");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_NE(outcome.stdOut.find("Cycles executed: 5"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("No-event cycles: 5"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Accepted transitions: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Rejected transitions: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Final state: Idle"), std::string::npos);
+}
+
+// O: --live --cycles 0 runs no cycles at all, all-zero summary.
+TEST(ApplicationTest, LiveModeAcceptsZeroCycles)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "0"}, "live_zero_cycles");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_NE(outcome.stdOut.find("Cycles executed: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("No-event cycles: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Accepted transitions: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Rejected transitions: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Final state: Idle"), std::string::npos);
+}
+
+// P: --live with no --cycles option at all.
+TEST(ApplicationTest, LiveModeRejectsMissingCyclesOption)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live"}, "live_missing_cycles_option");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// Q: --live --cycles with no value.
+TEST(ApplicationTest, LiveModeRejectsMissingCycleValue)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles"}, "live_missing_cycle_value");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// R: --live --cycles -1
+TEST(ApplicationTest, LiveModeRejectsNegativeCycleCount)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "-1"}, "live_negative_cycle_count");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// S: --live --cycles abc
+TEST(ApplicationTest, LiveModeRejectsNonNumericCycleCount)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "abc"}, "live_non_numeric_cycle_count");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// T: --live --cycles 1.5
+TEST(ApplicationTest, LiveModeRejectsFloatingPointCycleCount)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "1.5"}, "live_floating_point_cycle_count");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// U: --live --cycles 10abc - trailing garbage after a valid numeric prefix.
+TEST(ApplicationTest, LiveModeRejectsTrailingGarbage)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "10abc"}, "live_trailing_garbage");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// V: --live --cycles 10 extra - unexpected extra argument after a valid pair.
+TEST(ApplicationTest, LiveModeRejectsUnexpectedExtraArguments)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "10", "extra"}, "live_extra_arguments");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// W: --help documents live mode.
+TEST(ApplicationTest, HelpDocumentsLiveMode)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--help"}, "help_documents_live_mode");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_NE(outcome.stdOut.find("--live --cycles"), std::string::npos);
+}

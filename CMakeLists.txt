@@ -170,6 +170,19 @@ target_link_libraries(robot_app PUBLIC
     robot_reporting
 )
 
+# Live-mode composition (runLiveSimulation) constructs HardwareEventSource,
+# RobotRuntime, and LiveRuntimeRunner internally. None of those types appear
+# in Application.hpp, but - matching robot_core/robot_scenario/robot_logging/
+# robot_reporting above - they must still be PUBLIC: robot_app is a STATIC
+# library, and a STATIC library's PRIVATE link dependencies are not added to
+# the final executable's link line, so a PRIVATE dependency here would leave
+# RobotSimulator/ApplicationTests unable to resolve these symbols.
+target_link_libraries(robot_app PUBLIC
+    robot_hardware_events
+    robot_runtime
+    robot_runtime_runner
+)
+
 # --- RobotSimulator: the command-line application ---
 add_executable(RobotSimulator
     src/main.cpp
