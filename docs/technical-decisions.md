@@ -886,6 +886,119 @@ seam from Phase 13I - introducing a second, competing orchestrator instead
 would have duplicated the cycle loop the task brief explicitly said to
 avoid duplicating.
 
+## Phase 13K: real-hardware boundary / transport abstraction
+
+Prepares for a future physical robot by adding a second `IRobotHardware`
+implementation, without adding any platform-specific code:
+
+```text
+RobotController / HardwareEventSource
+              |
+              v
+        IRobotHardware  (unchanged since Phase 13A)
+             / \
+            /   \
+           v     v
+SimulatedRobotHardware   RealRobotHardware
+     (existing)                |
+                                v
+                          IRobotTransport
+                                |
+                                v
+                (not implemented) SerialRobotTransport
+```
+
+**`IRobotHardware` itself needed no change.** `RobotController` and
+`HardwareEventSource` already depended on nothing but that interface
+(Phase 13A/13E), which is exactly the seam this phase needed - a second
+implementation slots in without either of those two classes, or anything
+downstream of them, being touched. This is verified directly, not just
+assumed: `RealRobotHardwareTests.cpp` drives the real, unmodified
+`RobotController` and `HardwareEventSource` against `RealRobotHardware`
+and asserts the same outcomes their own test files already assert against
+`SimulatedRobotHardware`.
+
+**`IRobotTransport` is a text request/response abstraction, not a
+strongly-typed robot API.** The task brief's own suggested shape
+(`sendCommand(string)`/`query(string)`) was kept close to verbatim after
+considering the alternative: a strongly-typed transport (e.g.
+`moveForwardCommand()`/`batteryQuery()`) would require `IRobotTransport`
+itself to know the wire protocol's command/query vocabulary, which is
+exactly the RealRobotHardware-specific knowledge this interface must stay
+ignorant of to remain a generic "move bytes" boundary reusable by any
+future concrete transport. `IRobotTransport` knows only that a message is
+one request or command string in, and (for queries) one response string
+out - never `RobotState`, `Event`, `EventType`, `RobotController`, or
+`RobotRuntime`.
+
+**The wire protocol is centralized in `RobotProtocol.hpp`, not scattered
+as literals.** Three one-way commands (`MOVE_FORWARD`/`STOP`/
+`RETURN_TO_BASE`), three queries (`GET_BATTERY`/`GET_OBSTACLE`/
+`GET_ESTOP`), and their three expected response prefixes (`BATTERY`/
+`OBSTACLE`/`ESTOP`) are `constexpr std::string_view` constants in one
+header, referenced by both `RealRobotHardware.cpp` and
+`RealRobotHardwareTests.cpp`. This is a *logical* protocol only - no
+framing, checksum, retry, or serialization library (no JSON) - deliberately
+minimal, since defining that logical contract, not implementing it over a
+real wire, is this phase's scope.
+
+**Response parsing is strict, with no partial acceptance.** A response
+must be exactly two whitespace-separated tokens: the expected prefix, then
+a value. `BATTERY` alone (missing value), `BATTERY 50 extra` (trailing
+tokens), a wrong prefix, or an empty response are all rejected the same
+way as a genuinely invalid value (`BATTERY abc`, `BATTERY -1`,
+`BATTERY 101`, `OBSTACLE 2`) - every case throws `RobotTransportError`
+rather than falling back to a default/fabricated sensor value, matching
+this project's existing "bad input fails loudly, eagerly, before it can
+propagate" philosophy (`ScenarioParseError`, `SensorScriptParseError`,
+`CommandScriptParseError`). The three sensor parsers
+(`batteryLevelPercent()`/`obstacleDetected()`/`emergencyStopPressed()`)
+share one `ExtractValueToken()` helper for the "exactly two tokens, first
+matches prefix" structural check, then apply their own
+range/boolean-specific validation - avoiding three near-duplicate
+tokenizing implementations without inventing a shared class hierarchy for
+what is, underneath, three independent small parsers.
+
+**`const` sensor methods calling a non-`const` `query()` is legal, not
+a workaround.** `IRobotHardware`'s sensor methods are `const` (Phase 13A);
+`IRobotTransport::query()` is not, since issuing a request is naturally a
+side-effecting operation. `RealRobotHardware` stores `transport_` as a
+reference member (`IRobotTransport&`), not a value or pointer - C++ does
+not propagate `const` through a reference member the way it does through a
+value or raw-pointer member, so calling `transport_.query(...)` from
+inside a `const` `RealRobotHardware` method is ordinary, standard-conforming
+C++, not a `const_cast` or `mutable` escape hatch.
+
+**Test-only transport, not a production fake.** Per the task brief,
+`RecordingRobotTransport` lives entirely inside
+`tests/RealRobotHardwareTests.cpp` - no `FakeRobotTransport` production
+type was added anywhere under `include/`/`src/`. It records every sent
+command and every query string, and returns a per-request configured
+response (or `""` for an unconfigured request, which doubles as free
+coverage of the "empty response" rejection path).
+
+**No CLI wiring, no serial implementation - both deliberately out of
+scope.** `Application.cpp`/`Application.hpp` have no diff in this phase;
+`RobotSimulator`/`robot_app` continue to construct only
+`SimulatedRobotHardware`, exactly as before. No `--real`/`--serial`/
+`--port`/`--device` flag exists. No `CreateFile`, COM port, `termios`,
+`/dev/tty*`, Boost.Asio, libserialport, or any other platform-specific or
+USB/serial API appears anywhere in this phase's changes - `IRobotTransport`
+existing as an abstraction is the entire deliverable; an actual
+`SerialRobotTransport` (or similar) is explicitly future work.
+
+**CMake dependency shape.** `robot_transport` is header-only
+(`IRobotTransport.hpp` is pure virtual; `RobotProtocol.hpp` is only
+constants - neither has a `.cpp`), so it is an `INTERFACE` target
+depending only on `robot_domain`, matching `robot_domain`'s own pattern
+(and, like `robot_domain`, deliberately excluded from the `/W4` `foreach`
+loop, since `target_compile_options(... PRIVATE ...)` is not valid on an
+`INTERFACE` library that compiles nothing itself). `robot_real_hardware`
+depends on `robot_hardware` (`IRobotHardware`) and `robot_transport`
+(`IRobotTransport`/`RobotProtocol`), both `PUBLIC` since both types appear
+in `RealRobotHardware.hpp`'s public API. Neither target is linked into
+`robot_app`.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

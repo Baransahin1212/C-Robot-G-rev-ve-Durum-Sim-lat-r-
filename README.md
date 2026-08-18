@@ -406,6 +406,63 @@ Phase 13A-13D hardware-abstraction rationale. The accumulated
 `SimulationResult` is converted to a human-facing `SimulationReport` and
 written out by a `StreamReportWriter`.
 
+### Hardware transport boundary (Phase 13K)
+
+`RobotController`/`HardwareEventSource` only ever depend on `IRobotHardware`
+- they cannot tell, and do not need to know, which implementation sits
+behind it. Alongside the simulated path used everywhere in this document,
+there is now a second, parallel `IRobotHardware` implementation that
+prepares for a future physical robot without adding any platform-specific
+code yet:
+
+```text
+Simulated path (used everywhere today):
+
+RobotController / HardwareEventSource
+              |
+              v
+        IRobotHardware
+              |
+              v
+     SimulatedRobotHardware
+
+
+Future real path (implementation boundary only - not wired into the CLI):
+
+RobotController / HardwareEventSource
+              |
+              v
+        IRobotHardware
+              |
+              v
+      RealRobotHardware
+              |
+              v
+       IRobotTransport
+              |
+              v
+   (not implemented yet) SerialRobotTransport
+```
+
+`RealRobotHardware` speaks a small, deliberately tiny text protocol over
+`IRobotTransport` (documented centrally in
+[`include/robot/RobotProtocol.hpp`](include/robot/RobotProtocol.hpp)):
+`MOVE_FORWARD`/`STOP`/`RETURN_TO_BASE` commands, and
+`GET_BATTERY`/`GET_OBSTACLE`/`GET_ESTOP` queries answered with
+`BATTERY <0-100>`/`OBSTACLE <0|1>`/`ESTOP <0|1>` responses. Response
+parsing is strict - a wrong prefix, a missing or extra token, a
+non-numeric or out-of-range value, or an empty response all throw
+`RobotTransportError` rather than silently substituting a fake sensor
+value.
+
+**No serial-port, USB, network, or other platform-specific transport is
+implemented in this phase** - `IRobotTransport` is tested only through a
+deterministic, test-only `RecordingRobotTransport` fake that lives in
+`tests/RealRobotHardwareTests.cpp` (not shipped as a production type), and
+`RobotSimulator`/`robot_app` continue to use only
+`SimulatedRobotHardware`, unchanged. See `docs/technical-decisions.md` for
+the full rationale.
+
 ### CMake / library structure
 
 Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
@@ -415,6 +472,8 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `robot_domain` | Header-only `INTERFACE` target exposing the shared vocabulary types (`Event`, `EventType`, `RobotState`, `IEventSource`). No implementation of its own. |
 | `robot_core` | `RobotStateMachine` (the FSM) and `Simulator` (orchestration). Has no JSON dependency. `RobotStateMachine` has no hardware dependency either — it never includes `IRobotHardware`/`RobotController`. |
 | `robot_hardware` | `IRobotHardware` abstraction and `SimulatedRobotHardware`, a deterministic in-memory implementation. Depends only on `robot_domain`. |
+| `robot_transport` | `IRobotTransport` abstraction and `RobotProtocol.hpp`'s wire-protocol constants (Phase 13K). Header-only `INTERFACE` target, matching `robot_domain`'s own pattern - `IRobotTransport` is pure virtual and `RobotProtocol.hpp` is only `constexpr` constants, so neither has a `.cpp`. Depends only on `robot_domain` for the include directory; knows no `RobotState`/`Event`/`RobotController`/`RobotRuntime` type. |
+| `robot_real_hardware` | `RealRobotHardware` (Phase 13K), an `IRobotHardware` implementation that drives `IRobotTransport`'s tiny text protocol instead of `SimulatedRobotHardware`'s in-memory state. Depends on `robot_hardware` and `robot_transport`. Not linked into `robot_app`/`RobotSimulator` - no CLI wiring yet, and no concrete transport (serial or otherwise) exists yet. |
 | `robot_controller` | `RobotController`, which maps a resulting `RobotState` to one `IRobotHardware` actuator command. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_hardware_events` | `HardwareEventSource`, an `IEventSource`/`IPollingEventSource` implementation that turns `IRobotHardware` sensor reads into `Event`s. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_runtime` | `RobotRuntime`, the live one-cycle-per-`step()` counterpart to `Simulator` (see `docs/technical-decisions.md`), wired into the CLI's `--live` mode via `robot_app`. Depends on `robot_domain`, `robot_core`, and `robot_controller`. |

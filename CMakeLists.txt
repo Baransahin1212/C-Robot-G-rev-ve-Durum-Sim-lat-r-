@@ -70,6 +70,42 @@ target_link_libraries(robot_hardware_events PUBLIC
     robot_hardware
 )
 
+# --- robot_transport: IRobotTransport abstraction + RobotProtocol wire-
+# protocol constants (Phase 13K) ---
+# Header-only (IRobotTransport is pure virtual; RobotProtocol.hpp is only
+# constexpr string_view constants - neither has a .cpp), so this is an
+# INTERFACE target, matching robot_domain's own pattern. Depends on
+# robot_domain purely for the shared include directory - neither header
+# uses any robot_domain type (Event/RobotState/IEventSource).
+# IRobotTransport knows only std::string request/response messages, never
+# RobotState, Event, RobotController, or RobotRuntime.
+add_library(robot_transport INTERFACE)
+
+target_link_libraries(robot_transport INTERFACE
+    robot_domain
+)
+
+# --- robot_real_hardware: RealRobotHardware, an IRobotHardware
+# implementation that drives a future physical robot through
+# IRobotTransport instead of SimulatedRobotHardware's in-memory state
+# (Phase 13K) ---
+# Depends on robot_hardware (IRobotHardware) and robot_transport
+# (IRobotTransport/RobotProtocol). Deliberately independent of robot_core/
+# robot_controller/robot_runtime/robot_app - it implements IRobotHardware
+# only, with no knowledge of RobotState, Event, RobotStateMachine,
+# RobotController, RobotRuntime, CommandScript, or SensorScript. No serial-
+# port or other platform-specific transport is implemented yet, and
+# RobotSimulator/robot_app do not link this target - the CLI continues to
+# use SimulatedRobotHardware exclusively; see docs/technical-decisions.md.
+add_library(robot_real_hardware STATIC
+    src/RealRobotHardware.cpp
+)
+
+target_link_libraries(robot_real_hardware PUBLIC
+    robot_hardware
+    robot_transport
+)
+
 # Simulator.hpp includes RobotController.hpp so it can accept an optional
 # RobotController*, so robot_core needs robot_controller PUBLIC (its
 # headers, and anything that includes Simulator.hpp, need to resolve
@@ -422,6 +458,26 @@ target_link_libraries(LiveRuntimeRunnerTests PRIVATE
 
 gtest_discover_tests(LiveRuntimeRunnerTests)
 
+# --- RealRobotHardwareTests: RealRobotHardware's actuator command mapping
+# and strict wire-protocol response parsing (Phase 13K), plus focused
+# RobotController/HardwareEventSource integration tests proving both
+# consume RealRobotHardware through IRobotHardware exactly like
+# SimulatedRobotHardware, unmodified. Uses a test-only
+# RecordingRobotTransport defined inside the test file, not a production
+# fake.
+add_executable(RealRobotHardwareTests
+    tests/RealRobotHardwareTests.cpp
+)
+
+target_link_libraries(RealRobotHardwareTests PRIVATE
+    robot_real_hardware
+    robot_controller
+    robot_hardware_events
+    GTest::gtest_main
+)
+
+gtest_discover_tests(RealRobotHardwareTests)
+
 # --- SensorScriptTests: sensor script text-format parsing/validation
 # (Phase 13I) - format, ordering, and error-message behavior in isolation
 # from any runtime execution.
@@ -565,12 +621,13 @@ if (MSVC)
         robot_hardware robot_controller robot_hardware_events robot_runtime
         robot_runtime_runner robot_sensor_script robot_scripted_runtime
         robot_command_script robot_command_events robot_polling_composite
+        robot_real_hardware
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
         RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
         ApplicationTests SensorScriptTests ScriptedLiveRuntimeRunnerTests
         CommandScriptTests ScriptedCommandEventSourceTests
-        CompositePollingEventSourceTests
+        CompositePollingEventSourceTests RealRobotHardwareTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()
