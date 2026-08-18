@@ -1,0 +1,3 @@
+10 obstacle true
+2 obstacle false
+5 battery 20

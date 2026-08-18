@@ -467,3 +467,111 @@ TEST(ApplicationTest, HelpDocumentsLiveMode)
     EXPECT_EQ(outcome.exitCode, kExitSuccess);
     EXPECT_NE(outcome.stdOut.find("--live --cycles"), std::string::npos);
 }
+
+// --- CLI scripted sensor injection (Phase 13I) ---
+//
+// These tests drive runApplication() with --sensor-script, proving
+// Application wires SensorScript -> ScriptedLiveRuntimeRunner into the
+// live path, while --live without --sensor-script and scenario mode both
+// remain exactly as they were in Phase 13H.
+
+// X: --live --cycles 20 --sensor-script <valid script> succeeds. Live mode
+// starts in Idle, and Idle only accepts ScenarioLoaded, so every scripted
+// obstacle/battery/emergency edge in valid_sensor_script.txt (4 edges: two
+// obstacle transitions, one battery-critical crossing, one emergency
+// stop) is handed to the FSM and rejected - this is expected, not a bug.
+TEST(ApplicationTest, LiveModeAcceptsSensorScript)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "20", "--sensor-script", FixturePath("valid_sensor_script.txt")},
+        "live_with_script");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_NE(outcome.stdOut.find("Sensor script: "), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Cycles executed: 20"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Accepted transitions: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Rejected transitions: 4"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Final state: Idle"), std::string::npos);
+}
+
+// Y: --live --cycles 20 --sensor-script with no file value.
+TEST(ApplicationTest, MissingSensorScriptValueRejected)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "20", "--sensor-script"}, "live_missing_script_value");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// Z: trailing token after a syntactically complete --sensor-script pair.
+TEST(ApplicationTest, ExtraArgumentsAfterScriptRejected)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "20", "--sensor-script", "a.txt", "extra"}, "live_extra_after_script");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// AA: CLI syntax is valid, but the script file does not exist - this must
+// not be reported as a generic usage error.
+TEST(ApplicationTest, MissingScriptFileReturnsNonZero)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "5", "--sensor-script", FixturePath("does_not_exist.txt")},
+        "live_missing_script_file");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitScenarioError);
+    EXPECT_NE(outcome.stdErr.find("Error loading sensor script"), std::string::npos);
+}
+
+// BB: CLI syntax is valid, but the script content is malformed - same
+// non-usage-error treatment, with a message useful enough to locate the
+// bad line.
+TEST(ApplicationTest, MalformedScriptReturnsNonZeroAndUsefulError)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "5", "--sensor-script", FixturePath("invalid_boolean.txt")},
+        "live_malformed_script");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitScenarioError);
+    EXPECT_NE(outcome.stdErr.find("Error loading sensor script"), std::string::npos);
+    EXPECT_NE(outcome.stdErr.find("line 1"), std::string::npos);
+}
+
+// CC: --live --cycles without --sensor-script is unchanged from Phase 13H.
+TEST(ApplicationTest, ExistingLiveModeWithoutScriptStillWorksUnchanged)
+{
+    // Act
+    const RunOutcome outcome = Invoke({"--live", "--cycles", "5"}, "live_unchanged_no_script");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_EQ(outcome.stdOut.find("Sensor script:"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Cycles executed: 5"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("No-event cycles: 5"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Final state: Idle"), std::string::npos);
+}
+
+// DD: scenario mode is untouched by this phase.
+TEST(ApplicationTest, ExistingScenarioModeStillWorksUnchanged)
+{
+    // Act
+    const RunOutcome outcome = Invoke({ScenarioPath("normal_mission.json")}, "scenario_mode_unchanged");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_NE(outcome.stdOut.find("Mission outcome: Completed"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Successful transitions: 3"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Rejected transitions: 0"), std::string::npos);
+}

@@ -108,6 +108,42 @@ target_link_libraries(robot_runtime_runner PUBLIC
     robot_runtime
 )
 
+# --- robot_sensor_script: SensorScript, deterministic sensor-injection
+# script parsing (Phase 13I) ---
+# Depends only on robot_domain (for the include directory - SensorScript
+# itself uses no domain types, only the standard library) and is
+# deliberately independent of robot_hardware/robot_runtime/robot_app: it
+# only ever parses a script file into SensorScriptEntry values, with no
+# knowledge of SimulatedRobotHardware or cycle execution.
+add_library(robot_sensor_script STATIC
+    src/SensorScript.cpp
+)
+
+target_link_libraries(robot_sensor_script PUBLIC
+    robot_domain
+)
+
+# --- robot_scripted_runtime: ScriptedLiveRuntimeRunner, applies a
+# SensorScript's mutations to SimulatedRobotHardware immediately before
+# each RobotRuntime::step() (Phase 13I) ---
+# Depends on robot_runtime (RobotRuntime/RuntimeStepResult),
+# robot_runtime_runner (reuses RuntimeRunSummary), robot_hardware
+# (SimulatedRobotHardware), and robot_sensor_script (SensorScript). All
+# PUBLIC because every one of those types appears in
+# ScriptedLiveRuntimeRunner.hpp's public API. Deliberately does not modify
+# or depend on anything inside robot_runtime/robot_runtime_runner - this is
+# a simulator-only adapter layered on top of them.
+add_library(robot_scripted_runtime STATIC
+    src/ScriptedLiveRuntimeRunner.cpp
+)
+
+target_link_libraries(robot_scripted_runtime PUBLIC
+    robot_runtime
+    robot_runtime_runner
+    robot_hardware
+    robot_sensor_script
+)
+
 # --- nlohmann/json, pinned to a stable tagged release (not main/master) ---
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 
@@ -181,6 +217,13 @@ target_link_libraries(robot_app PUBLIC
     robot_hardware_events
     robot_runtime
     robot_runtime_runner
+)
+
+# Phase 13I: --sensor-script support. Same PUBLIC/STATIC-library
+# propagation reasoning as immediately above.
+target_link_libraries(robot_app PUBLIC
+    robot_sensor_script
+    robot_scripted_runtime
 )
 
 # --- RobotSimulator: the command-line application ---
@@ -315,6 +358,44 @@ target_link_libraries(LiveRuntimeRunnerTests PRIVATE
 
 gtest_discover_tests(LiveRuntimeRunnerTests)
 
+# --- SensorScriptTests: sensor script text-format parsing/validation
+# (Phase 13I) - format, ordering, and error-message behavior in isolation
+# from any runtime execution.
+add_executable(SensorScriptTests
+    tests/SensorScriptTests.cpp
+)
+
+target_link_libraries(SensorScriptTests PRIVATE
+    robot_sensor_script
+    GTest::gtest_main
+)
+
+target_compile_definitions(SensorScriptTests PRIVATE
+    TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/"
+)
+
+gtest_discover_tests(SensorScriptTests)
+
+# --- ScriptedLiveRuntimeRunnerTests: cycle-based sensor-script injection
+# (Phase 13I) - mutate-before-step ordering, same-cycle file ordering, and
+# integration with the real RobotRuntime/HardwareEventSource/
+# RobotStateMachine/SimulatedRobotHardware pipeline.
+add_executable(ScriptedLiveRuntimeRunnerTests
+    tests/ScriptedLiveRuntimeRunnerTests.cpp
+)
+
+target_link_libraries(ScriptedLiveRuntimeRunnerTests PRIVATE
+    robot_scripted_runtime
+    robot_hardware_events
+    GTest::gtest_main
+)
+
+target_compile_definitions(ScriptedLiveRuntimeRunnerTests PRIVATE
+    TEST_OUTPUT_DIR="${CMAKE_BINARY_DIR}/test_output/"
+)
+
+gtest_discover_tests(ScriptedLiveRuntimeRunnerTests)
+
 # --- ScenarioIntegrationTests: exercises the real end-to-end pipeline
 # (JsonScenarioSource -> Simulator -> RobotStateMachine -> SimulationResult
 # -> SimulationReport) against the final scenario files under scenarios/,
@@ -365,11 +446,11 @@ if (MSVC)
     foreach(robot_target
         robot_core robot_scenario robot_logging robot_reporting robot_app
         robot_hardware robot_controller robot_hardware_events robot_runtime
-        robot_runtime_runner
+        robot_runtime_runner robot_sensor_script robot_scripted_runtime
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
         RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
-        ApplicationTests
+        ApplicationTests SensorScriptTests ScriptedLiveRuntimeRunnerTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

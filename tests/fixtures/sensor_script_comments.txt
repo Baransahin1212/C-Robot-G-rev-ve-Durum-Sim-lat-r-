@@ -1,0 +1,4 @@
+# this is a comment
+0 obstacle true
+# another comment
+3 battery 20

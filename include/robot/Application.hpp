@@ -37,8 +37,9 @@ enum class ArgumentAction
 struct ParsedArguments
 {
     ArgumentAction action;
-    std::string scenarioPath;  // meaningful only when action == Run
+    std::string scenarioPath;       // meaningful only when action == Run
     std::size_t liveCycleCount = 0; // meaningful only when action == RunLive
+    std::string sensorScriptPath;   // meaningful only when action == RunLive; empty means no script
 };
 
 // Pure, testable argument parser - no I/O, no process exit.
@@ -84,6 +85,17 @@ int runSimulation(const std::string& scenarioPath,
 // there is no failure mode with default-safe simulated sensors and a
 // bounded, in-process cycle count.
 int runLiveSimulation(std::size_t cycleCount, std::ostream& out, std::ostream& err);
+
+// Same live pipeline as above, but with a SensorScript loaded from
+// sensorScriptPath applied via ScriptedLiveRuntimeRunner instead of
+// LiveRuntimeRunner - see docs/technical-decisions.md (Phase 13I). The
+// script is parsed eagerly before any cycle runs; a load/parse failure
+// returns kExitScenarioError with a message on `err` and runs zero cycles,
+// mirroring how runSimulation() treats a bad scenario file.
+int runLiveSimulation(std::size_t cycleCount,
+                       const std::string& sensorScriptPath,
+                       std::ostream& out,
+                       std::ostream& err);
 
 // Full application logic over an already-split argument list (excludes the
 // program name), so tests can drive it directly without touching argv or

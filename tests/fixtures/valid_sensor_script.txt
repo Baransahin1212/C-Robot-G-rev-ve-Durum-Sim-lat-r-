@@ -1,0 +1,6 @@
+# Example sensor script (Phase 13I)
+0 obstacle false
+2 obstacle true
+5 obstacle false
+8 battery 15
+12 emergency true

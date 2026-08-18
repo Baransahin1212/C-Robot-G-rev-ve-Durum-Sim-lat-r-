@@ -609,6 +609,119 @@ would build `robot_app.lib` successfully but leave `RobotSimulator.exe`/
 `.cpp`, `CMakeLists.txt`, and `ApplicationTests.cpp` changed. This phase is
 CLI composition, not a redesign of any already-tested component.
 
+## Phase 13I: scripted sensor injection
+
+Adds an optional, deterministic way to change `SimulatedRobotHardware`'s
+sensor values at specific live-mode cycles, without touching any of the
+already-tested live-runtime components from Phases 13F-13H:
+
+```text
+SensorScript
+    v
+ScriptedLiveRuntimeRunner
+    v
+SimulatedRobotHardware
+    v
+HardwareEventSource
+    v
+RobotRuntime
+    v
+RobotStateMachine (FSM)
+```
+
+**Two new libraries, no changes to existing ones.** `robot_sensor_script`
+(`SensorScript`) parses the script text format; `robot_scripted_runtime`
+(`ScriptedLiveRuntimeRunner`) applies its entries to
+`SimulatedRobotHardware` around calls to `RobotRuntime::step()`. Neither
+`RobotStateMachine`, `RobotRuntime`, `LiveRuntimeRunner`, nor
+`HardwareEventSource` has any diff in this phase - confirmed via `git diff
+--stat` before merging. `HardwareEventSource` in particular must stay
+exactly as it is: it only ever observes `IRobotHardware`, so it behaves
+identically whether the sensor changes it sees came from a script or real
+hardware - that equivalence is the entire point of layering the script
+*underneath* it rather than teaching it about scripts directly.
+
+**Why a separate `ScriptedLiveRuntimeRunner` instead of extending
+`LiveRuntimeRunner`.** `LiveRuntimeRunner` is deliberately generic - it
+only knows `RobotRuntime`/`RuntimeStepResult` (see Phase 13G) and must stay
+that way so it keeps working unmodified for any future non-simulated
+`IPollingEventSource`. Simulator-only concerns (`SimulatedRobotHardware`,
+`SensorScript`, cycle-indexed injection) belong in a distinct class that
+sits *alongside* `LiveRuntimeRunner`, not inside it. `ScriptedLiveRuntimeRunner`
+reuses `LiveRuntimeRunner.hpp`'s `RuntimeRunSummary` type purely for a
+consistent return shape - it does not construct or delegate to a
+`LiveRuntimeRunner` instance, since its own `runCycles()` loop needs to
+interleave a mutation step that `LiveRuntimeRunner::runCycles()` has no
+hook for.
+
+**Script format.** One entry per non-empty, non-comment line:
+`<cycle> <sensor> <value>` (`sensor` is `obstacle`/`battery`/`emergency`;
+`value` is `true`/`false` for the two booleans or `0`-`100` for battery).
+Blank lines and `#`-prefixed comment lines are ignored. `SensorScript`'s
+constructor parses and validates the entire file eagerly - exactly
+`JsonScenarioSource`'s philosophy - so a successfully constructed
+`SensorScript` is guaranteed to contain only well-formed entries;
+`ScriptedLiveRuntimeRunner` can never observe a malformed one. Parse errors
+report a 1-based line number (`"sensor script line N: ..."`), matched by a
+private `SensorScript.cpp` helper deliberately duplicated from
+`Application.cpp`'s `parseCycleCount()` rather than shared - `robot_sensor_script`
+must not depend on `robot_app`, and the helper is small enough that the
+duplication costs less than the coupling would.
+
+**Cycles are zero-based; mutation happens strictly before its cycle's
+step().** `--live --cycles N` executes cycles `0..N-1`.
+`ScriptedLiveRuntimeRunner::runCycles()` applies every entry scheduled for
+cycle `i` to `SimulatedRobotHardware` and only then calls
+`RobotRuntime::step()` for cycle `i` - so a `0 obstacle true` entry is
+visible to the very first `step()` call, including the one-time FSM/
+controller sync `RobotRuntime` performs internally on that first call
+(Phase 13F). An entry scheduled at or beyond `cycleCount` is not an error;
+it is simply never applied, since the run never reaches that cycle.
+
+**Same-cycle ordering is file order, via a stable sort.**
+`SensorScript`'s entries need not already be sorted by cycle in the file -
+the constructor stable-sorts them by cycle after parsing. Because a stable
+sort preserves the relative order of equal elements, and entries are
+pushed in file order during parsing, entries sharing a cycle retain their
+original file order after sorting - `ScriptedLiveRuntimeRunner` then
+applies them via the existing `setObstacleDetected()`/
+`setBatteryLevelPercent()`/`setEmergencyStopPressed()` setters in exactly
+that order, with no separate "apply group" concept needed.
+
+**Live mode starting in `Idle` limits what scripted events can
+demonstrate, and that is intentional.** `RobotStateMachine` (unmodified by
+this phase) only accepts `ScenarioLoaded` from `Idle` - there is still no
+sensor-driven way to reach `Moving` from the CLI, since `HardwareEventSource`
+has no lifecycle events of its own (Phase 13E) and this phase does not
+invent one. A script run directly via `--sensor-script` from the CLI will
+therefore see its obstacle/battery/emergency edges rejected by the FSM,
+which is the *correct* documented outcome, not a shortcoming to work
+around with an FSM change or a `--start-moving` flag. Richer scripted
+scenarios (obstacle-hit-while-Moving, battery-critical-while-Moving,
+emergency-stop-while-Moving) are exercised in
+`ScriptedLiveRuntimeRunnerTests.cpp` by preparing `RobotStateMachine` into
+`Moving` through its real event API first, the same pattern
+`RobotRuntimeTests.cpp`/`LiveRuntimeRunnerTests.cpp` already use.
+
+**Script errors use the scenario-file exit code, not a usage error.** A
+`--sensor-script` file that cannot be opened or contains a malformed line
+throws `SensorScriptParseError`, caught in `Application.cpp` and reported
+via `kExitScenarioError` (the same code `runSimulation()` uses for a bad
+scenario JSON file) - not `kExitUsageError`, since the CLI syntax itself
+was valid. A malformed `--live`/`--sensor-script` invocation (missing
+`--cycles`, missing script value, trailing arguments) is still a
+`kExitUsageError`, caught entirely during argument parsing before any file
+is opened.
+
+**CMake dependency shape.** `robot_sensor_script` depends only on
+`robot_domain` (for the include directory; it uses no domain types).
+`robot_scripted_runtime` depends on `robot_runtime`, `robot_runtime_runner`,
+`robot_hardware`, and `robot_sensor_script` - all `PUBLIC`, since every one
+of those types appears in `ScriptedLiveRuntimeRunner.hpp`'s public API.
+`robot_app` gained both new libraries `PUBLIC` too, for the same
+static-library link-propagation reason documented in the Phase 13H section
+above.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

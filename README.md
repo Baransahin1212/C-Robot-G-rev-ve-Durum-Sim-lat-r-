@@ -89,6 +89,7 @@ grows).
 ```text
 RobotSimulator <scenario-file>
 RobotSimulator --live --cycles <N>
+RobotSimulator --live --cycles <N> --sensor-script <file>
 RobotSimulator --help
 RobotSimulator -h
 ```
@@ -101,11 +102,60 @@ this document.
 polling cycles through the live runtime pipeline
 (`SimulatedRobotHardware -> HardwareEventSource -> RobotRuntime ->
 LiveRuntimeRunner`) - see [Architecture](#architecture) below. `N` must be
-a non-negative integer that fully matches the value passed. Live mode
-currently uses `SimulatedRobotHardware`'s default, safe sensor values
-(battery 100, no obstacle, no emergency stop) with no way to change them
-from the CLI, so a run naturally produces `N` `NoEvent` cycles and stays in
-`Idle`. Sensor scripting/injection is not implemented yet.
+a non-negative integer that fully matches the value passed. Without a
+sensor script, live mode uses `SimulatedRobotHardware`'s default, safe
+sensor values (battery 100, no obstacle, no emergency stop) unchanged for
+the whole run, so it naturally produces `N` `NoEvent` cycles and stays in
+`Idle`.
+
+**Scripted sensor injection** (`--live --cycles <N> --sensor-script
+<file>`) additionally replays a deterministic script of sensor changes at
+specific cycles, through `SensorScript -> ScriptedLiveRuntimeRunner ->
+SimulatedRobotHardware`, still feeding the same unmodified
+`HardwareEventSource -> RobotRuntime -> RobotStateMachine` pipeline - see
+[Sensor script format](#sensor-script-format) below and
+`docs/technical-decisions.md` (Phase 13I) for the full separation
+rationale.
+
+### Sensor script format
+
+One entry per non-empty, non-comment line:
+
+```text
+<cycle> <sensor> <value>
+```
+
+```text
+0 obstacle false
+3 obstacle true
+8 obstacle false
+12 battery 15
+15 emergency true
+```
+
+- **Cycles are zero-based.** `--live --cycles 5` executes cycles `0`
+  through `4`.
+- Each entry's mutation is applied to `SimulatedRobotHardware` immediately
+  **before** the runtime step for its cycle runs - `2 obstacle true` means
+  `hardware.setObstacleDetected(true)` happens right before cycle `2`'s
+  `RobotRuntime::step()`.
+- Entries sharing the same cycle are applied in **file order**.
+- Lines are not required to already be sorted by cycle - the parser sorts
+  them internally.
+- Blank lines are ignored; lines whose first non-whitespace character is
+  `#` are comments and are ignored.
+- `sensor` is one of `obstacle`, `battery`, `emergency`. `value` is
+  `true`/`false` for `obstacle`/`emergency`, or an integer `0`-`100` for
+  `battery`.
+- An entry scheduled at or beyond `--cycles <N>` is not an error - it
+  simply never executes.
+- The script only mutates `SimulatedRobotHardware`; `HardwareEventSource`
+  then detects the resulting sensor edges exactly as it would with any
+  other hardware change, and the FSM only accepts transitions its existing
+  rules already allow (live mode starts in `Idle`, which does not accept
+  obstacle/battery/emergency events - see `docs/technical-decisions.md`).
+- Live mode without `--sensor-script` is unaffected and behaves exactly as
+  in Phase 13H.
 
 Windows Debug example, run from the project root:
 
@@ -143,13 +193,29 @@ Rejected transitions: 0
 Final state: Idle
 ```
 
+Scripted live mode example:
+
+```powershell
+.\build\Debug\RobotSimulator.exe --live --cycles 20 --sensor-script sensors.txt
+```
+
+```text
+Sensor script: sensors.txt
+Live runtime completed
+Cycles executed: 20
+No-event cycles: 16
+Accepted transitions: 0
+Rejected transitions: 4
+Final state: Idle
+```
+
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | The simulation executed successfully — **regardless of mission outcome**. `Aborted`, `EmergencyStopped`, `Error`, and a scenario containing rejected transitions are all legitimate simulation *results*, not application failures. |
-| `1` | Invalid command line (missing or too many arguments). |
-| `2` | The scenario file could not be loaded (not found, malformed JSON, or fails schema validation). |
+| `1` | Invalid command line (missing or too many arguments, or malformed `--live`/`--sensor-script` syntax). |
+| `2` | The scenario file could not be loaded (not found, malformed JSON, or fails schema validation), or a `--sensor-script` file could not be opened or contained a malformed line. |
 | `3` | An output file (log or report) could not be created or written. |
 
 ### Generated runtime outputs
@@ -250,10 +316,12 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `robot_hardware_events` | `HardwareEventSource`, an `IEventSource`/`IPollingEventSource` implementation that turns `IRobotHardware` sensor reads into `Event`s. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_runtime` | `RobotRuntime`, the live one-cycle-per-`step()` counterpart to `Simulator` (see `docs/technical-decisions.md`), wired into the CLI's `--live` mode via `robot_app`. Depends on `robot_domain`, `robot_core`, and `robot_controller`. |
 | `robot_runtime_runner` | `LiveRuntimeRunner`, a deterministic finite scheduler that calls `RobotRuntime::step()` an exact number of times and tallies the results. No timing policy yet. Depends only on `robot_runtime`. |
+| `robot_sensor_script` | `SensorScript`, the deterministic sensor-injection script parser (Phase 13I). Parses `<cycle> <sensor> <value>` text files into sorted `SensorScriptEntry` values. Depends only on `robot_domain` (for its include directory - it uses no domain types). |
+| `robot_scripted_runtime` | `ScriptedLiveRuntimeRunner` (Phase 13I), a simulator-only adapter that applies `SensorScript` mutations to `SimulatedRobotHardware` immediately before each `RobotRuntime::step()`. Reuses `RuntimeRunSummary` from `robot_runtime_runner`. Depends on `robot_runtime`, `robot_runtime_runner`, `robot_hardware`, and `robot_sensor_script`. |
 | `robot_scenario` | `JsonScenarioSource` — converts a scenario JSON file into `Event` objects. Depends on `robot_domain` and, privately, on nlohmann/json. |
 | `robot_logging` | `StreamSimulationLogger`, the concrete `ISimulationLogger` implementation that writes to any `std::ostream`. |
 | `robot_reporting` | `MissionOutcome` mapping and `StreamReportWriter`, which turn a `SimulationResult` into a human-readable report. Depends on `robot_core` for `SimulationResult`. |
-| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation`/`runLiveSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Constructs the default `SimulatedRobotHardware`/`RobotController` for the CLI's scenario path, and the full live pipeline (`HardwareEventSource`/`RobotRuntime`/`LiveRuntimeRunner`) for `--live`. Depends on all of the above. |
+| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation`/`runLiveSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Constructs the default `SimulatedRobotHardware`/`RobotController` for the CLI's scenario path, the live pipeline (`HardwareEventSource`/`RobotRuntime`/`LiveRuntimeRunner`) for `--live`, and additionally `SensorScript`/`ScriptedLiveRuntimeRunner` for `--live --sensor-script`. Depends on all of the above. |
 | `RobotSimulator` | The executable — `src/main.cpp` is a ~10-line composition root that calls into `robot_app`. |
 
 Dependencies flow one way only: `RobotStateMachine` never depends on

@@ -1,0 +1,3 @@
+0 obstacle true
+1 obstacle false
+2 battery 999

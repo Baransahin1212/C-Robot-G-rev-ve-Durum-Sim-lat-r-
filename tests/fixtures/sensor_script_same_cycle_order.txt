@@ -1,0 +1,3 @@
+5 obstacle true
+5 battery 15
+5 emergency true

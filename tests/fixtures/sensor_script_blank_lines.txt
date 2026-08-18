@@ -1,0 +1,5 @@
+0 obstacle true
+
+
+2 battery 50
+

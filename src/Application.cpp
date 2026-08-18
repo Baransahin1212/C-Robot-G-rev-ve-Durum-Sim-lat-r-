@@ -13,6 +13,8 @@
 #include "robot/RobotRuntime.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/ScriptedLiveRuntimeRunner.hpp"
+#include "robot/SensorScript.hpp"
 #include "robot/SimulatedRobotHardware.hpp"
 #include "robot/SimulationReport.hpp"
 #include "robot/Simulator.hpp"
@@ -62,6 +64,16 @@ std::optional<std::size_t> parseCycleCount(const std::string& text)
     return static_cast<std::size_t>(value);
 }
 
+void printLiveSummary(std::ostream& out, const RuntimeRunSummary& summary, RobotState finalState)
+{
+    out << "Live runtime completed\n"
+        << "Cycles executed: " << summary.cyclesExecuted << "\n"
+        << "No-event cycles: " << summary.noEventCycles << "\n"
+        << "Accepted transitions: " << summary.acceptedTransitions << "\n"
+        << "Rejected transitions: " << summary.rejectedTransitions << "\n"
+        << "Final state: " << toString(finalState) << "\n";
+}
+
 } // namespace
 
 ParsedArguments parseArguments(const std::vector<std::string>& args)
@@ -78,18 +90,28 @@ ParsedArguments parseArguments(const std::vector<std::string>& args)
 
     if (args[0] == "--live")
     {
-        if (args.size() != 3 || args[1] != "--cycles")
+        if (args.size() < 3 || args[1] != "--cycles")
         {
-            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}};
+            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}};
         }
 
         const std::optional<std::size_t> cycleCount = parseCycleCount(args[2]);
         if (!cycleCount.has_value())
         {
-            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}};
+            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}};
         }
 
-        return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount};
+        if (args.size() == 3)
+        {
+            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, {}};
+        }
+
+        if (args.size() == 5 && args[3] == "--sensor-script")
+        {
+            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, args[4]};
+        }
+
+        return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}};
     }
 
     if (args.size() > 1)
@@ -106,13 +128,16 @@ void printUsage(std::ostream& out)
         << "Usage:\n"
         << "  RobotSimulator <scenario-file>\n"
         << "  RobotSimulator --live --cycles <N>\n"
+        << "  RobotSimulator --live --cycles <N> --sensor-script <file>\n"
         << "  RobotSimulator --help\n\n"
         << "Scenario mode runs a finite JSON scenario end-to-end.\n"
         << "Live mode runs N deterministic polling cycles against\n"
-        << "simulated hardware.\n\n"
+        << "simulated hardware. --sensor-script optionally replays\n"
+        << "deterministic sensor changes at specific cycles.\n\n"
         << "Examples:\n"
         << "  RobotSimulator scenarios/normal_mission.json\n"
-        << "  RobotSimulator --live --cycles 100\n";
+        << "  RobotSimulator --live --cycles 100\n"
+        << "  RobotSimulator --live --cycles 100 --sensor-script sensors.txt\n";
 }
 
 int runSimulation(const std::string& scenarioPath,
@@ -202,13 +227,37 @@ int runLiveSimulation(std::size_t cycleCount, std::ostream& out, std::ostream& e
 
     const RuntimeRunSummary summary = runner.runCycles(cycleCount);
 
-    out << "Live runtime completed\n"
-        << "Cycles executed: " << summary.cyclesExecuted << "\n"
-        << "No-event cycles: " << summary.noEventCycles << "\n"
-        << "Accepted transitions: " << summary.acceptedTransitions << "\n"
-        << "Rejected transitions: " << summary.rejectedTransitions << "\n"
-        << "Final state: " << toString(stateMachine.currentState()) << "\n";
+    printLiveSummary(out, summary, stateMachine.currentState());
+    return kExitSuccess;
+}
 
+int runLiveSimulation(std::size_t cycleCount,
+                       const std::string& sensorScriptPath,
+                       std::ostream& out,
+                       std::ostream& err)
+{
+    std::optional<SensorScript> script;
+    try
+    {
+        script.emplace(sensorScriptPath);
+    }
+    catch (const SensorScriptParseError& e)
+    {
+        err << "Error loading sensor script: " << e.what() << "\n";
+        return kExitScenarioError;
+    }
+
+    SimulatedRobotHardware hardware;
+    HardwareEventSource eventSource(hardware);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(eventSource, stateMachine, controller);
+    ScriptedLiveRuntimeRunner runner(runtime, hardware, *script);
+
+    const RuntimeRunSummary summary = runner.runCycles(cycleCount);
+
+    out << "Sensor script: " << sensorScriptPath << "\n";
+    printLiveSummary(out, summary, stateMachine.currentState());
     return kExitSuccess;
 }
 
@@ -245,7 +294,11 @@ int runApplication(const std::vector<std::string>& args,
             return runSimulation(parsed.scenarioPath, logsDir, reportsDir, out, err);
 
         case ArgumentAction::RunLive:
-            return runLiveSimulation(parsed.liveCycleCount, out, err);
+            if (parsed.sensorScriptPath.empty())
+            {
+                return runLiveSimulation(parsed.liveCycleCount, out, err);
+            }
+            return runLiveSimulation(parsed.liveCycleCount, parsed.sensorScriptPath, out, err);
     }
 
     return kExitUsageError;
