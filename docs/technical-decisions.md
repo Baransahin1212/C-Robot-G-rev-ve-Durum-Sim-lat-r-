@@ -1126,6 +1126,132 @@ benefit, the same judgment call already made for `IRobotTransport`
 co-existing with `RobotProtocol.hpp` inside `robot_transport` in Phase
 13K. `robot_serial_transport` is not linked into `robot_app`.
 
+## Phase 13M: 3D visual simulator foundation
+
+Adds a second, completely independent executable - `RobotSimulator3D` - a
+real 3D window showing a stationary demo robot/world, built on raylib.
+This is purely a visualization foundation: no FSM, runtime, sensor, or
+physics integration exists yet.
+
+```text
+RobotSimulator3D
+      |
+      v
+  robot_visual            (VisualRobot, Renderer3D - raylib-based drawing)
+      |
+      v
+robot_visual_world         (VirtualWorld - plain scene data, raylib-free)
+      |
+      v
+  robot_domain             (include-directory only)
+
+  robot_visual
+      |
+      v
+    raylib                 (Phase 13M - new)
+```
+
+**raylib 6.0, fetched via `FetchContent`, pinned to a tagged release -
+never `master`.** Matches this project's existing dependency convention
+exactly (nlohmann/json `v3.11.3`, GoogleTest `v1.15.2`): `GIT_REPOSITORY`
++ `GIT_TAG 6.0`, not a floating branch. `BUILD_EXAMPLES`/`BUILD_GAMES` are
+forced `OFF` before `FetchContent_MakeAvailable(raylib)` so raylib's own
+example/game subdirectories never get configured or built - they are not
+something this project needs, and skipping them keeps the dependency
+footprint and build time down.
+
+**raylib is isolated to exactly one target boundary, `robot_visual ->
+raylib`, and nothing upstream of it.** No `robot_core`/`robot_domain`/
+`robot_hardware`/`robot_app`/`RobotSimulator` target links raylib, and no
+header under those targets includes `raylib.h` or `rlgl.h` - confirmed by
+grepping every non-`visual/` header and source file for `raylib`/`rlgl`
+and finding zero matches. This is the same "dependency points inward
+only" discipline already applied to `IRobotTransport`/`ISerialPort`
+(Phase 13K/13L: transport knows nothing about robot-domain vocabulary) and
+nlohmann/json (linked `PRIVATE` into `robot_scenario` only) - a third-party
+dependency's blast radius is deliberately confined to the one target that
+actually needs it.
+
+**`VirtualWorld` (data) and rendering are two different targets, not just
+two different files.** `robot_visual_world` (`VirtualWorld.cpp` only)
+depends only on `robot_domain` and defines its own tiny `Vec3` - never
+raylib's `Vector3` - so it has *no* dependency on raylib at all, provably:
+`VirtualWorldTests` links only `robot_visual_world` and `GTest::gtest_main`,
+never `robot_visual` or `raylib`, and still passes. `robot_visual`
+(`VisualRobot.cpp`, `Renderer3D.cpp`) depends on both `robot_visual_world`
+and `raylib`, and is where the `Vec3 -> Vector3` conversion happens (a
+small `toRaylibVector3()` helper in `Renderer3D.cpp`). This mirrors the
+task brief's explicit instruction - "VirtualWorld should represent the
+world. Renderer3D should draw the world. Do NOT put rendering code inside
+world mutation logic." - enforced at the build-system level, not just by
+convention: `VirtualWorld.cpp` physically cannot call a raylib drawing
+function, because it is never linked against raylib in the first place.
+
+**Primitive geometry, not external model files.** The robot (body,
+two `DrawCylinderEx`-based wheels, a small front marker), the box
+obstacles, and the base platform are all drawn with raylib's built-in
+`DrawCube`/`DrawCubeWires`/`DrawCylinderEx`/`DrawPlane`/`DrawGrid` calls -
+no `.obj`/`.gltf`/texture asset loading exists yet. `DrawCylinderEx`
+(start/end points) was chosen over the simpler `DrawCylinder` (which
+always extrudes along +Y) specifically because a wheel needs to extrude
+along the robot's local X axis (its rolling axis) - using `DrawCylinder`
+here would draw a wheel standing on its flat face like a can, not lying
+against the body like a wheel.
+
+**World coordinate convention: X = horizontal, Y = up, Z = depth; ground
+is Y = 0.** `VisualRobot`'s heading rotation is applied around Y via
+`rlPushMatrix()`/`rlTranslatef()`/`rlRotatef()`/`rlPopMatrix()` in local
+space (heading 0 = facing +Z), so a future phase that starts changing
+`headingDegrees` needs no rendering-code changes - the rotation plumbing
+already exists, only the value driving it is currently constant.
+
+**Camera: `CAMERA_FREE`, raylib's built-in mode, not a custom camera
+framework.** A single `UpdateCamera(&camera_, CAMERA_FREE)` call per frame
+gives mouse-drag-to-orbit and scroll-to-zoom for free - enough to inspect
+the whole scene from any angle without writing or maintaining any camera
+math. Initial position `(8, 8, 8)` looking at the origin with a 45°
+`fovy` was chosen specifically so the entire ~10x10-unit demo scene (both
+the robot's start position and the base platform in the opposite corner)
+is inside the frustum on the very first rendered frame, with no camera
+adjustment required to see the whole layout.
+
+**No `InitWindow()`/`CloseWindow()` inside `Renderer3D`.** Window
+lifecycle (`InitWindow`, `SetTargetFPS`, the `while (!WindowShouldClose())`
+loop, `CloseWindow`) lives entirely in `main3d.cpp`, matching the task
+brief's suggested split ("Renderer3D: rendering" / "main3d: application
+lifecycle / render loop"). `Renderer3D::renderFrame()` assumes a window is
+already open; it only ever calls `BeginDrawing()`/`EndDrawing()` and the
+3D/2D drawing calls in between. This keeps `Renderer3D` a pure "draw one
+frame given a world" component, independently reasoned-about from
+"when/how often does a frame get drawn."
+
+**The `while (!WindowShouldClose())` loop in `main3d.cpp` is not a
+violation of the "no infinite loops in robot core/runtime" rule.** It is
+the interactive window's own render loop, exactly the shape every raylib
+application takes, and it lives entirely inside `RobotSimulator3D` - a
+target that `RobotStateMachine`/`RobotRuntime`/`RobotController`/
+`Simulator`/`LiveRuntimeRunner` know nothing about and never execute
+inside. No sleep/thread/timer of this project's own was added;
+`SetTargetFPS(60)` is raylib's own internal frame pacing.
+
+**No FSM/runtime construction in `RobotSimulator3D` yet, and no CLI
+wiring for the visual simulator either.** `main3d.cpp` constructs exactly
+`VirtualWorld` and `Renderer3D` - no `RobotStateMachine`, `RobotRuntime`,
+`RobotController`, `CommandScript`, or `SensorScript`. Conversely,
+`Application.cpp`/`Application.hpp`/`src/main.cpp` have zero diff in this
+phase; `RobotSimulator` was not given a `--3d`/`--visual` flag or any
+other new option. Connecting the visual robot's pose to the real FSM/
+runtime is explicitly future work, not attempted here.
+
+**Tests stay headless, deliberately.** `VirtualWorldTests.cpp` exercises
+only `VirtualWorld`'s deterministic constructed scene (initial robot
+position/height/heading, obstacle count and sizes, base platform position/
+footprint, and construction determinism across instances) - it never
+calls `InitWindow()` or any raylib drawing function, and because
+`robot_visual_world` has no raylib dependency at all, it structurally
+cannot. No test asserts on rendered pixels or raylib draw-call behavior,
+per the task brief's explicit instruction.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

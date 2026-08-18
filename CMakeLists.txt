@@ -359,6 +359,66 @@ target_compile_definitions(RobotSimulator PRIVATE
     REPORTS_DIR="${CMAKE_SOURCE_DIR}/reports/"
 )
 
+# --- raylib, pinned to the 6.0 tagged release (not master) - dependency
+# of the visual simulator only (Phase 13M) ---
+# No other target links raylib, and it must never leak into
+# robot_core/robot_domain/robot_hardware/robot_app - the dependency points
+# inward, robot_visual -> raylib, never the reverse. See
+# docs/technical-decisions.md.
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    raylib
+    GIT_REPOSITORY https://github.com/raysan5/raylib.git
+    GIT_TAG 6.0
+)
+
+FetchContent_MakeAvailable(raylib)
+
+# --- robot_visual_world: VirtualWorld, plain world/scene data (Phase 13M) ---
+# Deliberately raylib-free: VirtualWorld/RobotPose/BoxObstacle/
+# BasePlatform use only this project's own Vec3, never raylib's Vector3,
+# so this target - and anything testing it - never needs to link raylib.
+# Depends only on robot_domain for the shared include directory; it uses
+# no domain type (Event/RobotState/...).
+add_library(robot_visual_world STATIC
+    src/visual/VirtualWorld.cpp
+)
+
+target_link_libraries(robot_visual_world PUBLIC
+    robot_domain
+)
+
+# --- robot_visual: VisualRobot + Renderer3D, the raylib-based 3D drawing
+# layer (Phase 13M) ---
+# Depends on robot_visual_world (VirtualWorld/RobotPose/BoxObstacle/
+# BasePlatform) and raylib. This is the only point where this project
+# depends on raylib. Has no knowledge of RobotStateMachine, RobotRuntime,
+# or RobotController - it only ever reads VirtualWorld's plain data.
+add_library(robot_visual STATIC
+    src/visual/VisualRobot.cpp
+    src/visual/Renderer3D.cpp
+)
+
+target_link_libraries(robot_visual PUBLIC
+    robot_visual_world
+    raylib
+)
+
+# --- RobotSimulator3D: the interactive 3D visual simulator executable ---
+# Deliberately separate from RobotSimulator (the CLI) - RobotSimulator
+# never links robot_visual or raylib. Phase 13M is visualization
+# foundation only: the robot is drawn stationary, with no
+# RobotStateMachine/RobotRuntime/RobotController construction here yet.
+add_executable(RobotSimulator3D
+    src/visual/main3d.cpp
+)
+
+target_link_libraries(RobotSimulator3D PRIVATE
+    robot_visual
+)
+
 # --- Tests (GoogleTest via FetchContent, pinned to a stable tagged release) ---
 enable_testing()
 
@@ -655,6 +715,22 @@ target_compile_definitions(ApplicationTests PRIVATE
 
 gtest_discover_tests(ApplicationTests)
 
+# --- VirtualWorldTests: deterministic initial demo-scene data (Phase
+# 13M) - robot pose, base platform, and obstacle list. Links only
+# robot_visual_world, never robot_visual/raylib, so this target never
+# creates a window - genuinely headless, per the project's testing
+# convention of never requiring a graphical display.
+add_executable(VirtualWorldTests
+    tests/visual/VirtualWorldTests.cpp
+)
+
+target_link_libraries(VirtualWorldTests PRIVATE
+    robot_visual_world
+    GTest::gtest_main
+)
+
+gtest_discover_tests(VirtualWorldTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -665,13 +741,14 @@ if (MSVC)
         robot_runtime_runner robot_sensor_script robot_scripted_runtime
         robot_command_script robot_command_events robot_polling_composite
         robot_real_hardware robot_serial_transport
-        RobotSimulator RobotSimulatorTests ScenarioSourceTests
+        robot_visual_world robot_visual
+        RobotSimulator RobotSimulator3D RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
         RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
         ApplicationTests SensorScriptTests ScriptedLiveRuntimeRunnerTests
         CommandScriptTests ScriptedCommandEventSourceTests
         CompositePollingEventSourceTests RealRobotHardwareTests
-        SerialRobotTransportTests
+        SerialRobotTransportTests VirtualWorldTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()
