@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <vector>
 
 namespace robot::visual
@@ -32,11 +33,16 @@ struct RobotPose
 };
 
 // An axis-aligned box obstacle: position is its center, size is its full
-// width/height/depth along X/Y/Z respectively.
+// width/height/depth along X/Y/Z respectively. `enabled` (Phase 13O) governs
+// both rendering (Renderer3D skips a disabled obstacle) and sensing
+// (VirtualDistanceSensor ignores a disabled obstacle) - defaults to true so
+// every existing call site that does not mention it behaves exactly as
+// before.
 struct BoxObstacle
 {
     Vec3 position;
     Vec3 size;
+    bool enabled = true;
 };
 
 // The docking/base platform - a flat box marker for Phase 13M, with no
@@ -55,6 +61,12 @@ struct BasePlatform
 class VirtualWorld
 {
 public:
+    // Index of the one demo obstacle deliberately positioned directly in the
+    // robot's initial forward path (see VirtualWorld.cpp) - RobotSimulator3D's
+    // "O" key toggles this specific obstacle enabled/disabled to demonstrate
+    // ObstacleDetected/ObstacleCleared deterministically (Phase 13O).
+    static constexpr std::size_t kBlockingObstacleIndex = 3;
+
     // Constructs the fixed Phase 13M demo scene: identical every time,
     // deliberately - no randomness, no configuration file.
     VirtualWorld();
@@ -79,6 +91,26 @@ public:
     // VirtualRobotHardwareTests.cpp), and so a future turning phase has a
     // ready mutation point.
     void setRobotHeading(float headingDegrees);
+
+    // Moves obstacle `index` to `position`, leaving its size and enabled
+    // flag unchanged. Returns false (no-op) for an out-of-range index.
+    // Exists, alongside setObstacleEnabled() below, purely so
+    // VirtualDistanceSensor's ray/AABB geometry can be exercised against
+    // deterministic, controlled obstacle placements (see
+    // VirtualDistanceSensorTests.cpp) without inventing a second,
+    // disconnected obstacle representation just for tests - the same
+    // rationale as setRobotPosition()/setRobotHeading() (Phase 13N). No
+    // production caller moves an obstacle after construction as of Phase
+    // 13O; RobotSimulator3D's "O" key only ever calls setObstacleEnabled().
+    bool setObstaclePosition(std::size_t index, const Vec3& position);
+
+    // Enables or disables obstacle `index` - see BoxObstacle::enabled.
+    // Returns false (no-op) for an out-of-range index.
+    bool setObstacleEnabled(std::size_t index, bool enabled);
+
+    // True when obstacle `index` is currently enabled. Returns false for an
+    // out-of-range index.
+    bool obstacleEnabled(std::size_t index) const;
 
 private:
     RobotPose robotPose_;

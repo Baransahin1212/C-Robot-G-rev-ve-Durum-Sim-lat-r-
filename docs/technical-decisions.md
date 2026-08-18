@@ -1412,6 +1412,208 @@ headless, proving the full
 `FSM -> RobotController -> VirtualRobotHardware -> VirtualWorld` chain
 end to end without opening a window.
 
+## Phase 13O: virtual distance sensor / obstacle detection
+
+Closes the remaining gap Phase 13N's section explicitly left open ("no
+obstacle sensor exists in `VirtualRobotHardware`"): the 3D simulator now
+detects obstacle geometry and feeds that detection through the existing
+production event/FSM/controller path, unmodified:
+
+```text
+VirtualWorld obstacle geometry (BoxObstacle.enabled, position, size)
+      |
+      v
+VirtualDistanceSensor              (new, Phase 13O - raylib-free, headless)
+      |
+      v
+VirtualRobotHardware::obstacleDetected()   (now geometry-backed)
+      |
+      v
+HardwareEventSource                (unchanged)
+      |
+      v
+ObstacleDetected / ObstacleCleared
+      |
+      v
+CompositePollingEventSource        (unchanged, command-before-sensor priority)
+      |
+      v
+RobotRuntime -> RobotStateMachine -> RobotController   (all unchanged)
+      |
+      v
+VirtualRobotHardware command (Stopped / MoveForward)
+      |
+      v
+VirtualRobotHardware::update(dt) -> VirtualWorld robot pose -> Renderer3D
+```
+
+**`VirtualDistanceSensor` is a pure `VirtualWorld` geometry query, with no
+FSM/Event/`IRobotHardware` knowledge of its own.** It takes a
+`const VirtualWorld&` and answers exactly two questions:
+`distanceToNearestObstacle()` (an `std::optional<float>`, never infinity or
+a negative sentinel) and `obstacleDetected()` (that distance, if any,
+`<= kDetectionDistance`). It never mutates `VirtualWorld`, never decides an
+FSM transition, and never constructs an `Event` - the sensor/decision
+separation this project has followed since the very first `IEventSource`
+design (see "Sensor/decision separation" above) applies here exactly the
+same way: `VirtualDistanceSensor` senses, `VirtualRobotHardware` exposes
+that sense through `IRobotHardware::obstacleDetected()`, and
+`HardwareEventSource` (completely unmodified) is the only place a sensor
+reading becomes an `Event`.
+
+**Ray/AABB intersection is a 2D (X/Z) slab test, not raylib's
+`GetRayCollisionBox`.** Obstacles only need their X/Z footprint considered
+for Phase 13O (Y/height is irrelevant to a ground-level forward sensor), so
+`VirtualDistanceSensor.cpp` implements the classic slab algorithm directly:
+narrow `[tMin, tMax]` against each axis' pair of planes, treating a
+near-zero direction component (`|component| < 1e-6`) as exactly parallel to
+that axis rather than dividing by it (avoids NaN/Inf from a tiny non-zero
+float - e.g. heading 90° produces `cos(90°)` as a small float residual, not
+exactly `0.0`, purely from the degrees-to-radians conversion). A final
+`tMax < 0` check discards intersections entirely behind the sensor; a
+negative `tMin` with non-negative `tMax` (sensor origin already inside an
+obstacle - not expected in the demo scene, but handled deterministically
+rather than left undefined) clamps to a touching distance of `0`, not a
+negative one. No raylib collision helper is used anywhere in this file, so
+it stays genuinely headless and unit-testable (`VirtualDistanceSensorTests.cpp`,
+18 tests, no window).
+
+**One shared `forwardDirection()` helper, not three independent heading
+implementations.** Phase 13N's `VirtualRobotHardware::update()` originally
+inlined its own `sin`/`cos` heading-to-direction math. Phase 13O needed the
+exact same convention twice more - the sensor's ray direction, and (in
+`main3d.cpp`) the sensor-ray visualization's direction - and the task brief
+was explicit that these must never be independently guessed. Rather than
+copy the math a third time, `VisualMath.hpp` (new, header-only, raylib-free)
+extracts `forwardDirection(const RobotPose&)`, and
+`VirtualRobotHardware::update()` was refactored to call it too, so there is
+now exactly one heading convention in the codebase, proven against
+`VisualRobot.cpp`'s actual `rlRotatef()` call, used identically by movement,
+sensing, and rendering.
+
+**The sensor origin is the robot's front, not its center - computed from
+the same `RobotDimensions` the renderer already uses.**
+`VirtualDistanceSensor::sensorOrigin()` returns
+`pose.position + forwardDirection(pose) * (RobotDimensions::kBodyLength / 2)`.
+`RobotDimensions` lives in `VisualRobot.hpp`, which has zero raylib
+`#include`s of its own (only `VisualRobot.cpp` includes `raylib.h`/`rlgl.h`),
+so `VirtualDistanceSensor.cpp` can reuse it directly as a shared source of
+truth for the robot's physical size without linking `robot_visual` or
+introducing a second, duplicated `kBodyLength` constant anywhere.
+
+**`VirtualWorld` gained two small obstacle mutators,
+`setObstaclePosition()`/`setObstacleEnabled()`, following the exact
+precedent Phase 13N already set with `setRobotPosition()`/
+`setRobotHeading()`.** Both exist for the same reason: without them, there
+would be no way to exercise `VirtualDistanceSensor`'s ray/AABB geometry
+against controlled, deterministic obstacle placements in
+`VirtualDistanceSensorTests.cpp` (multiple-obstacles, side, behind,
+beyond-range, tangent/boundary cases) without inventing a second,
+disconnected obstacle representation just for tests. `BoxObstacle` gained
+one new field, `enabled` (default `true`, so every existing call site is
+unaffected), which both `Renderer3D` (skips drawing a disabled obstacle) and
+`VirtualDistanceSensor` (skips sensing one) respect identically -
+`enabled` is a single source of truth for "this obstacle currently exists
+in the world," not two independent flags that could drift apart.
+`VirtualWorld::kBlockingObstacleIndex` (a `static constexpr std::size_t`,
+value `3`) names the one demo obstacle `RobotSimulator3D`'s `O` key
+toggles, so main3d.cpp never hard-codes a bare index.
+
+**The demo obstacle layout needed exactly one small, deliberate
+adjustment.** Of the four Phase 13M demo obstacles, none sat on the robot's
+actual heading-0 forward ray (constant X = -3.0) - the closest was 1 unit
+off-axis. Rather than redesign the scene, the fourth obstacle's position
+moved from `(-2.0, 0.4, 3.0)` to `(-3.0, 0.4, 4.3)` - X now matches the
+robot's start X exactly (so the ray, which never changes X at heading 0,
+runs straight through its footprint), and Z was chosen so the sensor's
+first in-range reading (2.3 units, since the sensor origin starts at
+Z = 1.4 and the obstacle's near face is at Z = 3.7) is comfortably above
+`kDetectionDistance` (1.0) - the robot visibly travels for over a second at
+its 1.0 unit/s forward speed before detection fires, and stops with roughly
+a full unit of clearance in front of the obstacle (well over its own 0.8
+body length), so ordinary frame timing can never visually overlap it. Size
+was left unchanged. This is the only geometry change in this phase; no
+other obstacle moved.
+
+**`HardwareEventSource`, `CompositePollingEventSource`, `RobotStateMachine`,
+`RobotController`, and `RobotRuntime` all have zero diff in this phase** -
+confirmed via `git diff --stat` before merging, the same verification
+discipline every prior phase in this document has used.
+`main3d.cpp` now constructs `HardwareEventSource` (over the same
+`VirtualRobotHardware` instance `RobotController` drives) and
+`CompositePollingEventSource` (combining it with `DemoCommandSource`,
+command-before-sensor priority, unmodified from Phase 13J) - exactly the
+same live-event composition `Application::runLiveSimulation()` already uses
+for the CLI's `--live` mode, just assembled by hand in `main3d.cpp` instead
+of by `robot_app`. main3d.cpp never constructs an `Event` or calls
+`RobotStateMachine::processEvent()` itself; `ObstacleDetected`/
+`ObstacleCleared` only ever originate from `HardwareEventSource` sampling
+`VirtualRobotHardware::obstacleDetected()`.
+
+**Frame update order is deliberate: input, then `runtime.step()`, then
+`hardware.update(dt)`, then telemetry, then render.** If
+`VirtualDistanceSensor` newly reports a hit within threshold,
+`runtime.step()` is where `HardwareEventSource` samples it, the FSM accepts
+`Moving -> WaitingForObstacleClear`, and `RobotController` calls
+`hardware.stop()` - all *before* `hardware.update(dt)` runs later that same
+frame, so the robot never takes one extra frame's worth of movement past
+the moment detection fires. (It can still overshoot the exact 1.0-unit
+threshold by at most one frame's travel distance - a few hundredths of a
+world unit at 60 FPS - because the sensor is polled once per step rather
+than continuously; the obstacle's placement leaves roughly a full unit of
+margin specifically so this is never visible.) Telemetry (a
+`VisualTelemetry` struct) is collected only after both steps, so the HUD/
+sensor-ray always reflect the same position `hardware.update()` just
+produced this frame, not a stale pre-update reading.
+
+**`O` only ever changes world geometry - it never emits an `Event`
+directly.** `main3d.cpp`'s `KEY_O` handler calls
+`world.setObstacleEnabled(VirtualWorld::kBlockingObstacleIndex, !enabled)`
+and nothing else. The next `runtime.step()` is what actually notices the
+change, through the same real `HardwareEventSource` edge-triggered sampling
+every other sensor condition in this codebase already goes through -
+disabling the obstacle produces a true→false edge (`ObstacleCleared`)
+exactly like a real sensor clearing, not a simulator-specific shortcut.
+
+**`SPACE`'s pause semantics are unchanged from Phase 13N and still only
+gate `hardware.update(dt)`.** `runtime.step()` (and therefore
+`HardwareEventSource` sampling) keeps running every frame regardless of
+pause state - pausing freezes the robot's position, not FSM/event
+processing. This was already true in Phase 13N; Phase 13O didn't need to
+touch it, only to confirm obstacle detection still behaves correctly against
+a paused robot (a stationary sensor origin just keeps producing the same
+reading every sample, which the edge-trigger logic already handles as a
+non-event).
+
+**`Renderer3D` still doesn't know about `IRobotHardware`, `RobotRuntime`,
+`RobotStateMachine`, `HardwareEventSource`, or `VirtualDistanceSensor` -
+`main3d.cpp` now hands it one `VisualTelemetry` struct instead of two loose
+string parameters.** `VisualTelemetry` bundles the already-formatted state/
+command text (Phase 13N's approach, unchanged in spirit) with the sensor's
+origin, direction, hit distance, detected flag, and maximum range - all
+plain data (`Vec3`, `std::optional<float>`, `bool`, `float`), computed once
+in `main3d.cpp` from a `VirtualDistanceSensor` instance it owns for display
+purposes (separate from the one inside `VirtualRobotHardware`, but reading
+the same `VirtualWorld` and running the identical, shared geometry code, so
+both always agree). This keeps `robot_visual` a sibling of
+`robot_visual_simulation`, never layered on it, while still letting the
+rendered sensor ray's origin/heading/length come from the *actual* sensor
+calculation rather than a renderer-side approximation - satisfying "the
+sensor visual must match the sensor math" without `Renderer3D` duplicating
+any geometry constant.
+
+**Still no collision solver.** The sensor/FSM stop the demo robot before it
+reaches the blocking obstacle, but `VirtualRobotHardware::update()`'s
+movement math remains exactly what Phase 13N left it: it moves the robot
+whenever the command is `MoveForward`, with no awareness of obstacle
+geometry at all. Nothing prevents geometric overlap if a future phase drives
+the robot into an obstacle some other way (a different heading, a moved
+obstacle, `ReturnToBase` navigation once implemented) - there is still no
+collision response, sliding, or penetration correction, and none is added in
+this phase. Differential-drive physics and autonomous steering/pathfinding
+remain out of scope as well; obstacle removal is deliberately manual (`O`)
+for this phase, not any kind of automatic avoidance.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

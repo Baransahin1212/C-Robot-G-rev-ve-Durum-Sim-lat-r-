@@ -406,21 +406,27 @@ target_link_libraries(robot_visual PUBLIC
     raylib
 )
 
-# --- robot_visual_simulation: VirtualRobotHardware, the FSM-driven
-# actuator/sensor boundary for the visual simulator (Phase 13N) ---
+# --- robot_visual_simulation: VirtualRobotHardware + VirtualDistanceSensor,
+# the FSM-driven actuator/sensor boundary for the visual simulator (Phase
+# 13N/13O) ---
 # Depends on robot_visual_world (VirtualWorld), robot_hardware
 # (IRobotHardware), robot_controller (linked transitively via
 # robot_runtime, but named explicitly for clarity), and robot_runtime
 # (RobotRuntime/IPollingEventSource) - the same real FSM/runtime/
 # controller stack the CLI uses, never a raylib-aware substitute.
-# Deliberately independent of robot_visual: VirtualRobotHardware has no
-# raylib dependency of its own, matching SimulatedRobotHardware/
-# RealRobotHardware's own boundaries. robot_visual and
-# robot_visual_simulation are sibling targets under RobotSimulator3D,
-# neither depending on the other - only raylib-drawing code needs raylib,
-# and only FSM-driving code needs the robot core/runtime stack.
+# VirtualDistanceSensor (Phase 13O) is a pure VirtualWorld-geometry query
+# with no FSM/Event knowledge of its own - it lives here (not
+# robot_visual_world) because it is conceptually part of the virtual
+# hardware's sensor boundary, exactly like VirtualRobotHardware itself.
+# Deliberately independent of robot_visual: neither has a raylib dependency
+# of its own, matching SimulatedRobotHardware/RealRobotHardware's own
+# boundaries. robot_visual and robot_visual_simulation are sibling targets
+# under RobotSimulator3D, neither depending on the other - only
+# raylib-drawing code needs raylib, and only FSM-driving code needs the
+# robot core/runtime stack.
 add_library(robot_visual_simulation STATIC
     src/visual/VirtualRobotHardware.cpp
+    src/visual/VirtualDistanceSensor.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -437,7 +443,14 @@ target_link_libraries(robot_visual_simulation PUBLIC
 # 13N, main3d.cpp constructs the real RobotStateMachine/RobotController/
 # RobotRuntime (via robot_visual_simulation) to drive the on-screen robot
 # through VirtualRobotHardware; robot_visual (raylib) remains purely the
-# drawing layer, reading only VirtualWorld's plain data.
+# drawing layer, reading only VirtualWorld's plain data. As of Phase 13O,
+# main3d.cpp also constructs the real HardwareEventSource and
+# CompositePollingEventSource - the same live-event composition
+# Application::runLiveSimulation() uses for the CLI's --live mode - so
+# obstacle detection flows through the unmodified production event chain;
+# hence the direct robot_hardware_events/robot_polling_composite link below
+# (robot_visual_simulation itself does not need them - only main3d.cpp's
+# translation unit does).
 add_executable(RobotSimulator3D
     src/visual/main3d.cpp
 )
@@ -445,6 +458,8 @@ add_executable(RobotSimulator3D
 target_link_libraries(RobotSimulator3D PRIVATE
     robot_visual
     robot_visual_simulation
+    robot_hardware_events
+    robot_polling_composite
 )
 
 # --- Tests (GoogleTest via FetchContent, pinned to a stable tagged release) ---
@@ -763,9 +778,14 @@ gtest_discover_tests(VirtualWorldTests)
 # behavior (Phase 13N) - command tracking, deterministic forward movement,
 # the heading/front-marker direction convention, world-bounds clamping,
 # and one focused RobotStateMachine/RobotController/VirtualRobotHardware/
-# VirtualWorld integration test. Links robot_visual_simulation (which
-# transitively provides robot_controller/robot_core/robot_runtime) plus
-# robot_controller/robot_core explicitly, since the test file includes
+# VirtualWorld integration test. As of Phase 13O, also covers
+# geometry-backed obstacleDetected()/obstacleDistance() and full
+# closed-loop ObstacleDetected/ObstacleCleared tests through the real
+# HardwareEventSource/CompositePollingEventSource - hence the added
+# robot_hardware_events/robot_polling_composite links below. Links
+# robot_visual_simulation (which transitively provides
+# robot_controller/robot_core/robot_runtime) plus robot_controller/
+# robot_core explicitly, since the test file includes
 # RobotController.hpp/RobotStateMachine.hpp directly. Never links
 # robot_visual/raylib - genuinely headless, no window is ever created by
 # this target.
@@ -777,10 +797,32 @@ target_link_libraries(VirtualRobotHardwareTests PRIVATE
     robot_visual_simulation
     robot_controller
     robot_core
+    robot_hardware_events
+    robot_polling_composite
     GTest::gtest_main
 )
 
 gtest_discover_tests(VirtualRobotHardwareTests)
+
+# --- VirtualDistanceSensorTests: deterministic ray/AABB forward-sensor
+# geometry (Phase 13O) - heading convention, sensor origin at the robot's
+# front, range/threshold behavior, disabled-obstacle handling, and
+# parallel/tangent/boundary ray edge cases. Uses VirtualWorld's
+# setObstaclePosition()/setObstacleEnabled() test-support mutators to build
+# controlled obstacle placements, never a second/disconnected obstacle
+# representation. Links robot_visual_simulation only - never
+# robot_visual/raylib - genuinely headless, no window is ever created by
+# this target.
+add_executable(VirtualDistanceSensorTests
+    tests/visual/VirtualDistanceSensorTests.cpp
+)
+
+target_link_libraries(VirtualDistanceSensorTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(VirtualDistanceSensorTests)
 
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
@@ -800,6 +842,7 @@ if (MSVC)
         CommandScriptTests ScriptedCommandEventSourceTests
         CompositePollingEventSourceTests RealRobotHardwareTests
         SerialRobotTransportTests VirtualWorldTests VirtualRobotHardwareTests
+        VirtualDistanceSensorTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

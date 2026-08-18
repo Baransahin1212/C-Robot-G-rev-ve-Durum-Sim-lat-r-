@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string_view>
 
 #include "raylib.h"
@@ -8,6 +9,28 @@
 
 namespace robot::visual
 {
+
+// Plain, raylib-free display/telemetry values passed into renderFrame() -
+// main3d converts the real RobotState/VirtualDriveCommand/
+// VirtualDistanceSensor readings into this struct so Renderer3D never needs
+// to depend on RobotStateMachine, RobotController, IRobotHardware,
+// HardwareEventSource, or VirtualDistanceSensor directly (Phase 13N/13O) -
+// it stays a sibling target to robot_visual_simulation, not layered on it.
+// sensorOrigin/sensorDirection/obstacleDistance/sensorMaximumRange come
+// straight from a VirtualDistanceSensor instance main3d owns, so the
+// rendered sensor ray's origin, heading, and length always match the actual
+// sensor calculation exactly - Renderer3D never re-derives this geometry
+// itself.
+struct VisualTelemetry
+{
+    std::string_view stateText;
+    std::string_view commandText;
+    Vec3 sensorOrigin;
+    Vec3 sensorDirection;
+    std::optional<float> obstacleDistance;
+    bool obstacleDetected = false;
+    float sensorMaximumRange = 0.0F;
+};
 
 // Owns the Camera3D and draws one complete frame - ground, grid,
 // obstacles, base platform, robot, and a 2D HUD overlay - for a given
@@ -32,18 +55,18 @@ public:
     // left exactly as it was on the previous frame - main3d decides
     // `updateCamera` based on whether mouse capture (DisableCursor()) is
     // currently active, so the camera never drifts while the cursor has
-    // been released for normal desktop use. `stateText`/`commandText` are
-    // shown verbatim in the HUD (e.g. "Moving"/"MoveForward") - the
+    // been released for normal desktop use. `telemetry` carries the
+    // already-formatted state/command text plus sensor readings - the
     // caller (main3d) is responsible for converting the real
-    // RobotState/VirtualDriveCommand to text, so this class never needs
-    // to know either type. Call exactly once per iteration of the main
-    // render loop, between InitWindow() and CloseWindow().
-    void renderFrame(const VirtualWorld& world, bool updateCamera, std::string_view stateText,
-                      std::string_view commandText);
+    // RobotState/VirtualDriveCommand/VirtualDistanceSensor values, so this
+    // class never needs to know any of those types. Call exactly once per
+    // iteration of the main render loop, between InitWindow() and
+    // CloseWindow().
+    void renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry);
 
 private:
-    void drawScene(const VirtualWorld& world) const;
-    void drawHud(const VirtualWorld& world, std::string_view stateText, std::string_view commandText) const;
+    void drawScene(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
+    void drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
 
     Camera3D camera_;
 };

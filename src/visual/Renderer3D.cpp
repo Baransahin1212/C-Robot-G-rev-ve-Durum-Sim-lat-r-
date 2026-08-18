@@ -26,6 +26,16 @@ constexpr Color kObstacleOutlineColor = MAROON;
 constexpr Color kBaseColor = Color{80, 140, 220, 255};
 constexpr Color kBaseOutlineColor = DARKBLUE;
 
+// Sensor ray colors (Phase 13O): red once the reading is within
+// VirtualDistanceSensor::kDetectionDistance (obstacleDetected() true), amber
+// for a hit that is merely within sensor range but not yet close enough to
+// stop the robot, green when nothing is within range at all - a visually
+// clear distinction between "clear", "seen", and "stopping" without
+// requiring the HUD text to be read.
+constexpr Color kSensorRayDetectedColor = RED;
+constexpr Color kSensorRayHitColor = Color{255, 180, 0, 255};
+constexpr Color kSensorRayClearColor = LIME;
+
 // HUD readability panel: a semi-transparent dark rectangle behind the
 // top-left text so it stays legible against any part of the scene behind
 // it, regardless of the ground/sky color at that point.
@@ -57,8 +67,7 @@ Renderer3D::Renderer3D()
     camera_.projection = CAMERA_PERSPECTIVE;
 }
 
-void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, std::string_view stateText,
-                              std::string_view commandText)
+void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry)
 {
     if (updateCamera)
     {
@@ -69,21 +78,25 @@ void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, std::
     ClearBackground(RAYWHITE);
 
     BeginMode3D(camera_);
-    drawScene(world);
+    drawScene(world, telemetry);
     EndMode3D();
 
-    drawHud(world, stateText, commandText);
+    drawHud(world, telemetry);
 
     EndDrawing();
 }
 
-void Renderer3D::drawScene(const VirtualWorld& world) const
+void Renderer3D::drawScene(const VirtualWorld& world, const VisualTelemetry& telemetry) const
 {
     DrawPlane(Vector3{0.0F, 0.0F, 0.0F}, Vector2{kGroundHalfExtent * 2.0F, kGroundHalfExtent * 2.0F}, kGroundColor);
     DrawGrid(kGridSlices, kGridSpacing);
 
     for (const BoxObstacle& obstacle : world.obstacles())
     {
+        if (!obstacle.enabled)
+        {
+            continue;
+        }
         const Vector3 position = toRaylibVector3(obstacle.position);
         DrawCube(position, obstacle.size.x, obstacle.size.y, obstacle.size.z, kObstacleColor);
         DrawCubeWires(position, obstacle.size.x, obstacle.size.y, obstacle.size.z, kObstacleOutlineColor);
@@ -95,18 +108,34 @@ void Renderer3D::drawScene(const VirtualWorld& world) const
     DrawCubeWires(basePosition, base.size.x, base.size.y, base.size.z, kBaseOutlineColor);
 
     drawVisualRobot(world.robotPose());
+
+    // Sensor ray (Phase 13O): origin/direction/length come straight from
+    // `telemetry`, which main3d fills from the same VirtualDistanceSensor
+    // instance driving obstacleDetected()/obstacleDistance() - never
+    // recomputed here, so the drawn ray always matches the actual sensor
+    // reading exactly.
+    const float rayLength = telemetry.obstacleDistance.value_or(telemetry.sensorMaximumRange);
+    const Vector3 rayStart = toRaylibVector3(telemetry.sensorOrigin);
+    const Vector3 rayEnd = Vector3{telemetry.sensorOrigin.x + (telemetry.sensorDirection.x * rayLength),
+                                    telemetry.sensorOrigin.y + (telemetry.sensorDirection.y * rayLength),
+                                    telemetry.sensorOrigin.z + (telemetry.sensorDirection.z * rayLength)};
+    const Color rayColor = telemetry.obstacleDetected
+                                ? kSensorRayDetectedColor
+                                : (telemetry.obstacleDistance.has_value() ? kSensorRayHitColor : kSensorRayClearColor);
+    DrawLine3D(rayStart, rayEnd, rayColor);
 }
 
-void Renderer3D::drawHud(const VirtualWorld& world, std::string_view stateText, std::string_view commandText) const
+void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const
 {
     const RobotPose& pose = world.robotPose();
 
     char stateLine[80];
-    std::snprintf(stateLine, sizeof(stateLine), "State: %.*s", static_cast<int>(stateText.size()), stateText.data());
+    std::snprintf(stateLine, sizeof(stateLine), "State: %.*s", static_cast<int>(telemetry.stateText.size()),
+                   telemetry.stateText.data());
 
     char commandLine[80];
-    std::snprintf(commandLine, sizeof(commandLine), "Command: %.*s", static_cast<int>(commandText.size()),
-                   commandText.data());
+    std::snprintf(commandLine, sizeof(commandLine), "Command: %.*s", static_cast<int>(telemetry.commandText.size()),
+                   telemetry.commandText.data());
 
     char positionLine[64];
     std::snprintf(positionLine, sizeof(positionLine), "Position: X %.2f  Z %.2f", pose.position.x, pose.position.z);
@@ -116,6 +145,21 @@ void Renderer3D::drawHud(const VirtualWorld& world, std::string_view stateText, 
 
     char obstaclesLine[64];
     std::snprintf(obstaclesLine, sizeof(obstaclesLine), "Obstacles: %d", static_cast<int>(world.obstacles().size()));
+
+    char obstacleDistanceLine[64];
+    if (telemetry.obstacleDistance.has_value())
+    {
+        std::snprintf(obstacleDistanceLine, sizeof(obstacleDistanceLine), "Obstacle distance: %.2f",
+                       *telemetry.obstacleDistance);
+    }
+    else
+    {
+        std::snprintf(obstacleDistanceLine, sizeof(obstacleDistanceLine), "Obstacle distance: No hit");
+    }
+
+    char obstacleDetectedLine[64];
+    std::snprintf(obstacleDetectedLine, sizeof(obstacleDetectedLine), "Obstacle detected: %s",
+                   telemetry.obstacleDetected ? "YES" : "NO");
 
     // A small table of {text, fontSize, color} rather than hand-tracked Y
     // offsets per line - adding/removing a HUD line only ever touches this
@@ -127,7 +171,10 @@ void Renderer3D::drawHud(const VirtualWorld& world, std::string_view stateText, 
         {positionLine, 18, kHudTextColor},
         {headingLine, 18, kHudTextColor},
         {obstaclesLine, 18, kHudTextColor},
-        {"TAB: capture/release mouse   F11: fullscreen/windowed   Mouse/WASD: camera", 16, kHudControlsColor},
+        {obstacleDistanceLine, 18, kHudTextColor},
+        {obstacleDetectedLine, 18, kHudTextColor},
+        {"TAB: capture/release mouse   F11: fullscreen/windowed   SPACE: pause   O: toggle obstacle   Mouse/WASD: camera",
+         16, kHudControlsColor},
     };
 
     // Panel sized to fully contain the widest line so contrast holds

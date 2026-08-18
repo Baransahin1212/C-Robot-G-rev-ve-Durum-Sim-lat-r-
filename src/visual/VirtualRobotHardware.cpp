@@ -1,7 +1,8 @@
 #include "robot/visual/VirtualRobotHardware.hpp"
 
 #include <algorithm>
-#include <cmath>
+
+#include "robot/visual/VisualMath.hpp"
 
 namespace robot::visual
 {
@@ -20,8 +21,6 @@ constexpr float kMoveSpeed = 1.0F;
 // detection - obstacle boxes are not treated as collisions yet.
 constexpr float kWorldHalfExtent = 10.0F;
 
-constexpr float kPi = 3.14159265358979323846F;
-
 float clampToWorldBounds(float value)
 {
     return std::max(-kWorldHalfExtent, std::min(kWorldHalfExtent, value));
@@ -31,6 +30,7 @@ float clampToWorldBounds(float value)
 
 VirtualRobotHardware::VirtualRobotHardware(VirtualWorld& world)
     : world_(world)
+    , sensor_(world)
 {
 }
 
@@ -41,7 +41,7 @@ int VirtualRobotHardware::batteryLevelPercent() const
 
 bool VirtualRobotHardware::obstacleDetected() const
 {
-    return false;
+    return sensor_.obstacleDetected();
 }
 
 bool VirtualRobotHardware::emergencyStopPressed() const
@@ -69,6 +69,11 @@ VirtualDriveCommand VirtualRobotHardware::currentCommand() const noexcept
     return command_;
 }
 
+std::optional<float> VirtualRobotHardware::obstacleDistance() const
+{
+    return sensor_.distanceToNearestObstacle();
+}
+
 void VirtualRobotHardware::update(float deltaSeconds)
 {
     if (command_ != VirtualDriveCommand::MoveForward)
@@ -78,20 +83,19 @@ void VirtualRobotHardware::update(float deltaSeconds)
 
     const RobotPose& pose = world_.robotPose();
     const float distance = kMoveSpeed * deltaSeconds;
-    const float headingRadians = pose.headingDegrees * (kPi / 180.0F);
 
-    // Matches VisualRobot.cpp's actual rlRotatef(headingDegrees, 0, 1, 0)
-    // convention exactly (right-hand rotation around +Y): heading 0 faces
-    // +Z, and increasing heading rotates the front marker from +Z toward
-    // +X. Movement must follow the same (sin, cos) mapping the renderer
-    // already uses, not an assumed one - see
+    // forwardDirection() is the one shared heading convention (VisualMath.hpp)
+    // used identically by movement here, VirtualDistanceSensor, and
+    // Renderer3D's sensor-ray visualization - matches VisualRobot.cpp's
+    // actual rlRotatef(headingDegrees, 0, 1, 0) convention (right-hand
+    // rotation around +Y): heading 0 faces +Z. See
     // HeadingZeroMovesInFrontMarkerDirection/
-    // HeadingNinetyMovesInCorrectDirection in
-    // VirtualRobotHardwareTests.cpp, which prove this against that same
-    // convention.
+    // HeadingNinetyMovesInCorrectDirection in VirtualRobotHardwareTests.cpp,
+    // which prove this against that same convention.
+    const Vec3 forward = forwardDirection(pose);
     Vec3 newPosition = pose.position;
-    newPosition.x = clampToWorldBounds(newPosition.x + (std::sin(headingRadians) * distance));
-    newPosition.z = clampToWorldBounds(newPosition.z + (std::cos(headingRadians) * distance));
+    newPosition.x = clampToWorldBounds(newPosition.x + (forward.x * distance));
+    newPosition.z = clampToWorldBounds(newPosition.z + (forward.z * distance));
 
     world_.setRobotPosition(newPosition);
 }

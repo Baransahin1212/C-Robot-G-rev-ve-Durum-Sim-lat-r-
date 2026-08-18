@@ -1,11 +1,14 @@
 #include "raylib.h"
 
+#include "robot/CompositePollingEventSource.hpp"
+#include "robot/HardwareEventSource.hpp"
 #include "robot/RobotController.hpp"
 #include "robot/RobotRuntime.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/DemoCommandSource.hpp"
 #include "robot/visual/Renderer3D.hpp"
+#include "robot/visual/VirtualDistanceSensor.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
@@ -16,15 +19,21 @@ constexpr int kWindowHeight = 720;
 constexpr int kTargetFps = 60;
 } // namespace
 
-// Thin application-lifecycle composition root for the 3D visual
-// simulator: owns the raylib window, fullscreen/mouse-capture state, and
-// the render loop only. As of Phase 13N, the on-screen robot is driven by
-// the real, unmodified RobotStateMachine/RobotController/RobotRuntime -
-// see docs/technical-decisions.md. DemoCommandSource delivers exactly
-// ScenarioLoaded then StartMission once each, so the FSM reaches Moving
-// through its real transition rules, not by main3d forcing state
-// directly; RobotController then drives VirtualRobotHardware exactly as
-// it would drive SimulatedRobotHardware/RealRobotHardware.
+// Thin application-lifecycle composition root for the 3D visual simulator:
+// owns the raylib window, fullscreen/mouse-capture state, and the render
+// loop only. As of Phase 13N, the on-screen robot is driven by the real,
+// unmodified RobotStateMachine/RobotController/RobotRuntime; as of Phase
+// 13O, obstacle stop/resume is driven by the real, unmodified
+// HardwareEventSource reading VirtualRobotHardware's geometry-backed
+// obstacleDetected() - see docs/technical-decisions.md. DemoCommandSource
+// delivers exactly ScenarioLoaded then StartMission once each, so the FSM
+// reaches Moving through its real transition rules; CompositePollingEventSource
+// then combines that finite command source with the always-live
+// HardwareEventSource (command-before-sensor priority, unmodified from Phase
+// 13J), exactly the same composition Application::runLiveSimulation() uses
+// for the CLI's --live mode. main3d never injects ObstacleDetected/
+// ObstacleCleared directly - both only ever come from HardwareEventSource
+// reading VirtualRobotHardware's real sensor state.
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -37,11 +46,20 @@ int main()
 
     robot::visual::VirtualWorld world;
     robot::visual::VirtualRobotHardware hardware(world);
+    robot::HardwareEventSource hardwareEventSource(hardware);
+    robot::visual::DemoCommandSource commandSource;
+    robot::CompositePollingEventSource compositeSource(commandSource, hardwareEventSource);
     robot::RobotStateMachine stateMachine;
     robot::RobotController controller(hardware);
-    robot::visual::DemoCommandSource commandSource;
-    robot::RobotRuntime runtime(commandSource, stateMachine, controller);
+    robot::RobotRuntime runtime(compositeSource, stateMachine, controller);
     robot::visual::Renderer3D renderer;
+
+    // Display-only sensor handle (Phase 13O): reads the exact same
+    // VirtualWorld state VirtualRobotHardware's own internal sensor does, so
+    // the HUD/ray-visualization telemetry it produces is always identical to
+    // what actually drove obstacleDetected() this frame. It never influences
+    // FSM/hardware behavior - it only feeds Renderer3D's VisualTelemetry.
+    robot::visual::VirtualDistanceSensor sensor(world);
 
     // Camera mouse capture starts enabled, so the mouse immediately
     // drives the camera without an extra keypress; DisableCursor() also
@@ -49,9 +67,10 @@ int main()
     bool cameraCaptured = true;
     DisableCursor();
 
-    // Optional (Phase 13N): pausing only ever skips the world-movement
-    // tick below - it never skips runtime.step(), and it does not affect
-    // TAB/F11 behavior at all.
+    // SPACE pauses/resumes world movement only (VirtualRobotHardware::update()
+    // below) - it never skips runtime.step(), so event polling (including
+    // hardware obstacle sensing) continues normally while paused, and it
+    // never fakes an FSM transition.
     bool worldPaused = false;
 
     while (!WindowShouldClose())
@@ -79,10 +98,25 @@ int main()
             worldPaused = !worldPaused;
         }
 
-        // Exactly one RobotRuntime::step() per rendered frame - the
-        // render loop itself is the scheduler (see RobotRuntime's own
-        // docs); once DemoCommandSource is exhausted, NoEvent every frame
-        // is the expected, correct outcome.
+        if (IsKeyPressed(KEY_O))
+        {
+            // O only ever changes world geometry - it never emits
+            // ObstacleCleared/ObstacleDetected itself. The next runtime.step()
+            // below has HardwareEventSource sample this new geometry through
+            // VirtualRobotHardware::obstacleDetected() and emit the real
+            // edge-triggered event, exactly like any other sensor change.
+            const bool currentlyEnabled =
+                world.obstacleEnabled(robot::visual::VirtualWorld::kBlockingObstacleIndex);
+            world.setObstacleEnabled(robot::visual::VirtualWorld::kBlockingObstacleIndex, !currentlyEnabled);
+        }
+
+        // Exactly one RobotRuntime::step() per rendered frame - the render
+        // loop itself is the scheduler (see RobotRuntime's own docs). If
+        // VirtualRobotHardware::obstacleDetected() has newly become true,
+        // this is where HardwareEventSource surfaces ObstacleDetected and
+        // RobotController stops the hardware - before update() below ever
+        // runs this frame, so the robot never moves an extra frame past
+        // detection.
         runtime.step();
 
         if (!worldPaused)
@@ -90,8 +124,16 @@ int main()
             hardware.update(GetFrameTime());
         }
 
-        renderer.renderFrame(world, cameraCaptured, robot::toString(stateMachine.currentState()),
-                              robot::visual::toString(hardware.currentCommand()));
+        robot::visual::VisualTelemetry telemetry{};
+        telemetry.stateText = robot::toString(stateMachine.currentState());
+        telemetry.commandText = robot::visual::toString(hardware.currentCommand());
+        telemetry.sensorOrigin = sensor.sensorOrigin();
+        telemetry.sensorDirection = sensor.sensorDirection();
+        telemetry.obstacleDistance = sensor.distanceToNearestObstacle();
+        telemetry.obstacleDetected = sensor.obstacleDetected();
+        telemetry.sensorMaximumRange = robot::visual::VirtualDistanceSensor::kMaximumRange;
+
+        renderer.renderFrame(world, cameraCaptured, telemetry);
     }
 
     CloseWindow();

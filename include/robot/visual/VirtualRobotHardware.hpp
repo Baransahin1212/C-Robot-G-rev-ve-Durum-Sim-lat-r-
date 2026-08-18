@@ -1,8 +1,10 @@
 #pragma once
 
+#include <optional>
 #include <string_view>
 
 #include "robot/IRobotHardware.hpp"
+#include "robot/visual/VirtualDistanceSensor.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
 namespace robot::visual
@@ -40,9 +42,14 @@ constexpr std::string_view toString(VirtualDriveCommand command) noexcept
 // returnToBase() calls only ever record the current VirtualDriveCommand
 // here - actual VirtualWorld robot-pose movement happens later, once per
 // rendered frame, inside update(), the only place this class ever mutates
-// VirtualWorld. Sensor reads are fixed/safe for this phase (full battery,
-// no obstacle, no emergency stop) - no obstacle sensing, collision, or
-// battery drain exists yet; see docs/technical-decisions.md (Phase 13N).
+// VirtualWorld. As of Phase 13O, obstacleDetected() is backed by a real
+// VirtualDistanceSensor reading VirtualWorld's obstacle geometry - battery
+// and emergency-stop reads remain fixed/safe (full battery, no emergency
+// stop); no battery drain or emergency-stop simulation exists yet.
+// VirtualRobotHardware only ever exposes sensor readings; it never decides
+// FSM transitions or produces Event values itself - that boundary belongs to
+// HardwareEventSource, unmodified. See docs/technical-decisions.md (Phase
+// 13N/13O).
 //
 // VirtualRobotHardware has no raylib dependency of its own - it depends
 // only on IRobotHardware and VirtualWorld's plain data, exactly like
@@ -68,6 +75,12 @@ public:
     // IRobotHardware.
     VirtualDriveCommand currentCommand() const noexcept;
 
+    // Current forward-sensor reading, in world units - nullopt when no
+    // enabled obstacle is within VirtualDistanceSensor::kMaximumRange.
+    // Visual-simulator-only telemetry getter (HUD/rendering), not part of
+    // IRobotHardware - mirrors currentCommand()'s role (Phase 13O).
+    std::optional<float> obstacleDistance() const;
+
     // Advances VirtualWorld's robot pose by one simulated tick of
     // `deltaSeconds`: moves the robot forward along its current heading
     // at a fixed speed when the current command is MoveForward, and does
@@ -81,6 +94,7 @@ public:
 
 private:
     VirtualWorld& world_;
+    VirtualDistanceSensor sensor_;
     VirtualDriveCommand command_ = VirtualDriveCommand::Stopped;
 };
 
