@@ -1,0 +1,2 @@
+0 home_reached
+1 reset

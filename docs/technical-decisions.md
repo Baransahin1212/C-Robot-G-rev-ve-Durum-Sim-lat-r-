@@ -722,6 +722,170 @@ of those types appears in `ScriptedLiveRuntimeRunner.hpp`'s public API.
 static-library link-propagation reason documented in the Phase 13H section
 above.
 
+## Phase 13J: live mission control / command input
+
+Live mode (Phase 13H) starts in `Idle`, and `HardwareEventSource` only ever
+observes `IRobotHardware` sensor state - it has no way to raise
+mission-lifecycle events like `ScenarioLoaded` or `StartMission`, because
+those are not sensor readings. Scripted sensor injection (Phase 13I) does
+not solve this either, and must not: faking `ScenarioLoaded` through a
+sensor mutation would make `SimulatedRobotHardware`/`HardwareEventSource`
+lie about what they represent. This phase adds a second, independent
+scripted input path - for commands, not sensors - that converges on the
+same `RobotRuntime`:
+
+```text
+CommandScript
+    v
+ScriptedCommandEventSource  --\
+                                >-- CompositePollingEventSource -- RobotRuntime -- RobotStateMachine
+SensorScript -> SimulatedRobotHardware -- HardwareEventSource --/
+```
+
+**No new `EventType` was introduced.** `RobotStateMachine`/`Event.hpp` are
+untouched. `CommandScript` maps its five supported command names 1:1 onto
+*existing* `EventType` values that are mission-lifecycle/operator events,
+not sensor readings: `scenario_loaded` -> `ScenarioLoaded`,
+`start_mission` -> `StartMission`, `mission_completed` ->
+`MissionCompleted`, `home_reached` -> `HomeReached`, `reset` -> `Reset`.
+The task brief's illustrative names (`abort_mission`, `return_to_base`,
+`resume`) do not correspond to any `EventType` this codebase defines, so
+they were deliberately not implemented - inventing new `EventType` values
+to support them was explicitly out of scope for this phase.
+`ObstacleDetected`/`ObstacleCleared`/`BatteryCritical`/`EmergencyStop`/
+`InvalidSensorData` remain sensor-only and are rejected as unknown
+commands if given to `CommandScript` - the two vocabularies are
+disjoint by construction, not by convention.
+
+**`CommandScript` mirrors `SensorScript`/`JsonScenarioSource`'s eager-parse
+philosophy** exactly: same `"<cycle> <command>"` line format, same
+blank-line/`#`-comment handling, same 1-based `"command script line N: ..."`
+error messages, the same independent, duplicated `ParseCycle()` helper (for
+the same decoupling reason as `SensorScript.cpp`'s own copy), and the same
+stable-sort-by-cycle for deterministic same-cycle file ordering.
+
+**`ScriptedCommandEventSource` implements only `IPollingEventSource`, not
+`IEventSource`** - a command script is inherently scheduled against live
+runtime cycles via `setCurrentCycle()`, which only makes sense under
+`IPollingEventSource`'s "nullopt means nothing new this cycle, ask again
+later" contract (Phase 13F), not `IEventSource`'s "nullopt means
+exhausted for good". It knows nothing about `IRobotHardware`,
+`SimulatedRobotHardware`, or sensor state - only `CommandScriptEntry`
+values and the cycle number it was last told about.
+
+**Eligibility semantics: earliest-cycle-reached, pending-until-consumed.**
+`ScriptedCommandEventSource::pollEvent()` looks only at its next
+unconsumed entry (entries are pre-sorted by cycle): if that entry's cycle
+is `<= currentCycle_`, it is eligible and is returned (and consumed)
+immediately; otherwise `pollEvent()` returns `nullopt` without touching
+anything. Because `currentCycle_` only advances (the caller - see below -
+drives it monotonically) and the unconsumed-entry pointer only advances on
+actual consumption, an eligible entry that isn't polled this cycle is
+still the *next* thing returned on a later cycle - it is never skipped or
+replayed. This is the same "scheduled cycle = earliest eligible cycle,
+remains pending until consumed" semantics the task brief requires, and it
+falls out naturally from reusing the already-sorted `entries()` order
+rather than needing a separate "still pending" data structure.
+
+**`CompositePollingEventSource`: command-before-sensor, at most one event
+per call.** `RobotRuntime` accepts exactly one `IPollingEventSource`, so
+combining a command source and `HardwareEventSource` requires an adapter
+implementing that same interface. `pollEvent()` tries the command source
+first and returns immediately if it has an event - `hardwareSource_` is
+never even polled that call, so `HardwareEventSource`'s own edge-detection
+sampling is skipped entirely on a cycle where a command wins (its
+"previous sample" comparison state is simply unchanged, ready to detect
+the real edge whenever it is finally polled - see the priority example
+below). Command priority exists because early-mission commands
+(`ScenarioLoaded` at `Idle`, `StartMission` at `Ready`) are the only way
+to reach `Moving` at all, and should not be starved by a same-cycle sensor
+edge from a state that would just reject it anyway.
+
+**Priority example (worked through the actual FSM table).** Suppose at
+cycle 5 a command script schedules `mission_completed` and a sensor script
+schedules `battery 15` (both eligible/applied at cycle 5), with the FSM
+in `Moving`. `CompositePollingEventSource::pollEvent()` returns the
+command event; `RobotStateMachine::processEvent(MissionCompleted)` from
+`Moving` transitions to `Completed` (an existing, unmodified rule) -
+*not* `ReturningHome`, which is what the sensor's `BatteryCritical` event
+would have caused had it been processed instead. The battery edge is not
+lost - `HardwareEventSource` simply has not sampled it yet, since
+`hardwareSource_.pollEvent()` was never called this cycle - but by the
+time it is (cycle 6), the FSM is already in the terminal `Completed`
+state, so that edge is correctly rejected rather than accepted, exactly
+as the existing FSM table dictates for a terminal state. Verified in
+`ScriptedLiveRuntimeRunnerTests.cpp`'s
+`CommandAndSensorSameCycleUseDocumentedPriority` test.
+
+**One common cycle-orchestration point, not two.** `RobotRuntime` still
+knows nothing about cycle numbers (per Phase 13F's design, unchanged).
+`ScriptedLiveRuntimeRunner` (already the sensor-script cycle owner from
+Phase 13I) is extended - not duplicated - to also call
+`commandSource.setCurrentCycle(cycle)` immediately before `runtime.step()`
+in the same loop iteration that applies `SensorScript` mutations, so
+"apply sensor mutation" and "make command entries for this cycle
+eligible" happen in the same place, in the same order, for the same
+cycle, before the single `runtime.step()` call for that cycle. Three
+constructors cover the three independent-axis combinations (sensor-only,
+unchanged from Phase 13I; sensor+command; command-only) rather than a
+single constructor taking optional/nullable parameters, so the original
+Phase 13I 3-argument constructor - and every test that already calls it -
+needed no changes at all.
+
+**`runLiveSimulation()`'s sensor-only 3-argument overload was replaced by
+a general command+sensor overload**, `runLiveSimulation(cycleCount,
+commandScriptPath, sensorScriptPath, out, err)`, where an empty path means
+"not provided" for that axis - not four overloads for every combination
+(sensor-only/command-only/both could not coexist as separate overloads
+taking `(std::size_t, const std::string&, ...)` anyway, since C++ cannot
+overload on parameter name alone). This is safe because no test calls
+`runLiveSimulation()` directly - `ApplicationTests.cpp` only drives
+`runApplication()`/`runSimulation()` - so no existing test needed to
+change; only `runApplication()`'s dispatch was updated to call the general
+overload whenever at least one script path is non-empty, otherwise the
+original no-script overload.
+
+**CLI ordering is fixed and validated, not a general parser.**
+`--live --cycles <N> [--command-script <file>] [--sensor-script <file>]`
+is the only accepted shape beyond plain `--live --cycles <N>` - exactly
+one of five token-count/flag-position combinations is valid (3, 5 with
+`--sensor-script`, 5 with `--command-script`, or 7 with `--command-script`
+then `--sensor-script`); everything else, including the two flags in the
+opposite order, falls through to `InvalidLiveArguments`/
+`kExitUsageError`. A general option parser was judged unnecessary
+ceremony for two optional, order-fixed flags.
+
+**Script errors use the scenario-file exit code, not a usage error** -
+same reasoning as Phase 13I's `--sensor-script`. A `--command-script` file
+that cannot be opened or contains a malformed line throws
+`CommandScriptParseError`, caught in `Application.cpp` and reported via
+`kExitScenarioError` with an `"Error loading command script: ..."`
+prefix, distinct from `"Error loading sensor script: ..."` so the two
+failure sources are never ambiguous in the output.
+
+**CMake dependency shape.** `robot_command_script` depends only on
+`robot_domain`. `robot_command_events` depends on `robot_domain` and
+`robot_command_script`. `robot_polling_composite` depends only on
+`robot_domain` - it is deliberately independent of both
+`robot_command_events` and `robot_hardware_events`, since
+`CompositePollingEventSource` only ever calls `IPollingEventSource::pollEvent()`
+on whatever two sources it is given. `robot_scripted_runtime` gained
+`robot_command_events` `PUBLIC` (the type appears in
+`ScriptedLiveRuntimeRunner.hpp`'s new constructors). `robot_app` gained
+all three new libraries `PUBLIC`, for the same static-library
+link-propagation reason documented in the Phase 13H section.
+
+**Nothing in the already-tested live pipeline changed.**
+`RobotStateMachine`, `RobotRuntime`, `HardwareEventSource`,
+`RobotController`, and `Simulator` have no diff in this phase - confirmed
+via `git diff --stat` before merging. Only `ScriptedLiveRuntimeRunner`
+changed (extended with new constructors and an `if (commandSource_ !=
+nullptr)` branch in its existing loop, not a rewrite), because it was
+already this codebase's designated simulator-specific cycle-orchestration
+seam from Phase 13I - introducing a second, competing orchestrator instead
+would have duplicated the cycle loop the task brief explicitly said to
+avoid duplicating.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

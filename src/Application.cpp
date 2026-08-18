@@ -6,6 +6,8 @@
 #include <optional>
 #include <stdexcept>
 
+#include "robot/CommandScript.hpp"
+#include "robot/CompositePollingEventSource.hpp"
 #include "robot/HardwareEventSource.hpp"
 #include "robot/JsonScenarioSource.hpp"
 #include "robot/LiveRuntimeRunner.hpp"
@@ -13,6 +15,7 @@
 #include "robot/RobotRuntime.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/ScriptedCommandEventSource.hpp"
 #include "robot/ScriptedLiveRuntimeRunner.hpp"
 #include "robot/SensorScript.hpp"
 #include "robot/SimulatedRobotHardware.hpp"
@@ -92,26 +95,41 @@ ParsedArguments parseArguments(const std::vector<std::string>& args)
     {
         if (args.size() < 3 || args[1] != "--cycles")
         {
-            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}};
+            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}, {}};
         }
 
         const std::optional<std::size_t> cycleCount = parseCycleCount(args[2]);
         if (!cycleCount.has_value())
         {
-            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}};
+            return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}, {}};
         }
 
         if (args.size() == 3)
         {
-            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, {}};
+            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, {}, {}};
         }
 
+        // Fixed ordering beyond --live --cycles <N>:
+        //   [--command-script <file>] [--sensor-script <file>]
+        // Either, both (in that order), or neither may be present -
+        // --sensor-script before --command-script, or any other ordering,
+        // is rejected rather than silently accepted.
         if (args.size() == 5 && args[3] == "--sensor-script")
         {
-            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, args[4]};
+            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, args[4], {}};
         }
 
-        return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}};
+        if (args.size() == 5 && args[3] == "--command-script")
+        {
+            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, {}, args[4]};
+        }
+
+        if (args.size() == 7 && args[3] == "--command-script" && args[5] == "--sensor-script")
+        {
+            return ParsedArguments{ArgumentAction::RunLive, {}, *cycleCount, args[6], args[4]};
+        }
+
+        return ParsedArguments{ArgumentAction::InvalidLiveArguments, {}, {}, {}, {}};
     }
 
     if (args.size() > 1)
@@ -128,16 +146,23 @@ void printUsage(std::ostream& out)
         << "Usage:\n"
         << "  RobotSimulator <scenario-file>\n"
         << "  RobotSimulator --live --cycles <N>\n"
+        << "  RobotSimulator --live --cycles <N> --command-script <file>\n"
         << "  RobotSimulator --live --cycles <N> --sensor-script <file>\n"
+        << "  RobotSimulator --live --cycles <N> --command-script <file> --sensor-script <file>\n"
         << "  RobotSimulator --help\n\n"
         << "Scenario mode runs a finite JSON scenario end-to-end.\n"
         << "Live mode runs N deterministic polling cycles against\n"
         << "simulated hardware. --sensor-script optionally replays\n"
-        << "deterministic sensor changes at specific cycles.\n\n"
+        << "deterministic sensor changes at specific cycles.\n"
+        << "--command-script optionally replays deterministic mission/\n"
+        << "operator commands (e.g. start_mission) at specific cycles;\n"
+        << "when both are given, --command-script must come first.\n\n"
         << "Examples:\n"
         << "  RobotSimulator scenarios/normal_mission.json\n"
         << "  RobotSimulator --live --cycles 100\n"
-        << "  RobotSimulator --live --cycles 100 --sensor-script sensors.txt\n";
+        << "  RobotSimulator --live --cycles 100 --sensor-script sensors.txt\n"
+        << "  RobotSimulator --live --cycles 100 --command-script commands.txt\n"
+        << "  RobotSimulator --live --cycles 100 --command-script commands.txt --sensor-script sensors.txt\n";
 }
 
 int runSimulation(const std::string& scenarioPath,
@@ -232,31 +257,85 @@ int runLiveSimulation(std::size_t cycleCount, std::ostream& out, std::ostream& e
 }
 
 int runLiveSimulation(std::size_t cycleCount,
+                       const std::string& commandScriptPath,
                        const std::string& sensorScriptPath,
                        std::ostream& out,
                        std::ostream& err)
 {
-    std::optional<SensorScript> script;
-    try
+    std::optional<CommandScript> commandScript;
+    if (!commandScriptPath.empty())
     {
-        script.emplace(sensorScriptPath);
+        try
+        {
+            commandScript.emplace(commandScriptPath);
+        }
+        catch (const CommandScriptParseError& e)
+        {
+            err << "Error loading command script: " << e.what() << "\n";
+            return kExitScenarioError;
+        }
     }
-    catch (const SensorScriptParseError& e)
+
+    std::optional<SensorScript> sensorScript;
+    if (!sensorScriptPath.empty())
     {
-        err << "Error loading sensor script: " << e.what() << "\n";
-        return kExitScenarioError;
+        try
+        {
+            sensorScript.emplace(sensorScriptPath);
+        }
+        catch (const SensorScriptParseError& e)
+        {
+            err << "Error loading sensor script: " << e.what() << "\n";
+            return kExitScenarioError;
+        }
     }
 
     SimulatedRobotHardware hardware;
-    HardwareEventSource eventSource(hardware);
+    HardwareEventSource hardwareSource(hardware);
     RobotStateMachine stateMachine;
     RobotController controller(hardware);
-    RobotRuntime runtime(eventSource, stateMachine, controller);
-    ScriptedLiveRuntimeRunner runner(runtime, hardware, *script);
 
-    const RuntimeRunSummary summary = runner.runCycles(cycleCount);
+    RuntimeRunSummary summary;
 
-    out << "Sensor script: " << sensorScriptPath << "\n";
+    if (commandScript.has_value())
+    {
+        // Command events take priority over sensor events within a cycle
+        // - see CompositePollingEventSource. Both commandSource and
+        // compositeSource must outlive the RobotRuntime built over them,
+        // so all three are declared before it in this scope.
+        ScriptedCommandEventSource commandSource(*commandScript);
+        CompositePollingEventSource compositeSource(commandSource, hardwareSource);
+        RobotRuntime runtime(compositeSource, stateMachine, controller);
+
+        if (sensorScript.has_value())
+        {
+            ScriptedLiveRuntimeRunner runner(runtime, hardware, *sensorScript, commandSource);
+            summary = runner.runCycles(cycleCount);
+        }
+        else
+        {
+            ScriptedLiveRuntimeRunner runner(runtime, hardware, commandSource);
+            summary = runner.runCycles(cycleCount);
+        }
+    }
+    else
+    {
+        // No command script: caller guarantees sensorScriptPath is
+        // non-empty when this overload is used at all (otherwise the
+        // no-script overload above is used instead).
+        RobotRuntime runtime(hardwareSource, stateMachine, controller);
+        ScriptedLiveRuntimeRunner runner(runtime, hardware, *sensorScript);
+        summary = runner.runCycles(cycleCount);
+    }
+
+    if (!commandScriptPath.empty())
+    {
+        out << "Command script: " << commandScriptPath << "\n";
+    }
+    if (!sensorScriptPath.empty())
+    {
+        out << "Sensor script: " << sensorScriptPath << "\n";
+    }
     printLiveSummary(out, summary, stateMachine.currentState());
     return kExitSuccess;
 }
@@ -294,11 +373,12 @@ int runApplication(const std::vector<std::string>& args,
             return runSimulation(parsed.scenarioPath, logsDir, reportsDir, out, err);
 
         case ArgumentAction::RunLive:
-            if (parsed.sensorScriptPath.empty())
+            if (parsed.commandScriptPath.empty() && parsed.sensorScriptPath.empty())
             {
                 return runLiveSimulation(parsed.liveCycleCount, out, err);
             }
-            return runLiveSimulation(parsed.liveCycleCount, parsed.sensorScriptPath, out, err);
+            return runLiveSimulation(
+                parsed.liveCycleCount, parsed.commandScriptPath, parsed.sensorScriptPath, out, err);
     }
 
     return kExitUsageError;

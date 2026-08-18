@@ -1,0 +1,3 @@
+# Example sensor script (Phase 13J)
+4 obstacle true
+7 obstacle false

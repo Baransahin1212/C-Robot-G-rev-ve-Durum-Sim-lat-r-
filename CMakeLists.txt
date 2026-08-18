@@ -144,6 +144,62 @@ target_link_libraries(robot_scripted_runtime PUBLIC
     robot_sensor_script
 )
 
+# --- robot_command_script: CommandScript, deterministic mission-command
+# script parsing (Phase 13J) ---
+# Depends only on robot_domain (for the include directory and EventType,
+# from Event.hpp). Deliberately independent of robot_sensor_script/
+# robot_hardware/robot_app: it only ever parses a script file into
+# CommandScriptEntry values (cycle + one of the existing EventType values
+# that represent mission-lifecycle/operator commands), with no knowledge of
+# sensors or cycle execution.
+add_library(robot_command_script STATIC
+    src/CommandScript.cpp
+)
+
+target_link_libraries(robot_command_script PUBLIC
+    robot_domain
+)
+
+# --- robot_command_events: ScriptedCommandEventSource, turns a
+# CommandScript's entries into an IPollingEventSource (Phase 13J) ---
+# Depends on robot_domain (IPollingEventSource/Event) and
+# robot_command_script (CommandScript). Deliberately independent of
+# robot_hardware/robot_runtime: it never reads IRobotHardware and knows
+# nothing about RobotRuntime - it only turns eligible CommandScriptEntry
+# values into Event values on the cycle schedule it is externally driven
+# with (setCurrentCycle()).
+add_library(robot_command_events STATIC
+    src/ScriptedCommandEventSource.cpp
+)
+
+target_link_libraries(robot_command_events PUBLIC
+    robot_domain
+    robot_command_script
+)
+
+# --- robot_polling_composite: CompositePollingEventSource, combines two
+# IPollingEventSource instances (command-priority-first) into the one
+# RobotRuntime accepts (Phase 13J) ---
+# Depends only on robot_domain (IPollingEventSource/Event). Deliberately
+# independent of robot_command_events/robot_hardware_events: it only ever
+# calls pollEvent() on the two IPollingEventSource references it was given,
+# with no knowledge of CommandScript, SensorScript, or IRobotHardware.
+add_library(robot_polling_composite STATIC
+    src/CompositePollingEventSource.cpp
+)
+
+target_link_libraries(robot_polling_composite PUBLIC
+    robot_domain
+)
+
+# Phase 13J: ScriptedLiveRuntimeRunner gained constructors that accept a
+# ScriptedCommandEventSource&, so robot_scripted_runtime now additionally
+# needs robot_command_events PUBLIC (the type appears in
+# ScriptedLiveRuntimeRunner.hpp's public API).
+target_link_libraries(robot_scripted_runtime PUBLIC
+    robot_command_events
+)
+
 # --- nlohmann/json, pinned to a stable tagged release (not main/master) ---
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 
@@ -224,6 +280,14 @@ target_link_libraries(robot_app PUBLIC
 target_link_libraries(robot_app PUBLIC
     robot_sensor_script
     robot_scripted_runtime
+)
+
+# Phase 13J: --command-script support. Same PUBLIC/STATIC-library
+# propagation reasoning as immediately above.
+target_link_libraries(robot_app PUBLIC
+    robot_command_script
+    robot_command_events
+    robot_polling_composite
 )
 
 # --- RobotSimulator: the command-line application ---
@@ -376,10 +440,62 @@ target_compile_definitions(SensorScriptTests PRIVATE
 
 gtest_discover_tests(SensorScriptTests)
 
+# --- CommandScriptTests: command script text-format parsing/validation
+# (Phase 13J) - format, ordering, and error-message behavior in isolation
+# from any runtime execution.
+add_executable(CommandScriptTests
+    tests/CommandScriptTests.cpp
+)
+
+target_link_libraries(CommandScriptTests PRIVATE
+    robot_command_script
+    GTest::gtest_main
+)
+
+target_compile_definitions(CommandScriptTests PRIVATE
+    TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/"
+)
+
+gtest_discover_tests(CommandScriptTests)
+
+# --- ScriptedCommandEventSourceTests: cycle-eligibility/pending/consumption
+# semantics for turning a CommandScript into an IPollingEventSource
+# (Phase 13J).
+add_executable(ScriptedCommandEventSourceTests
+    tests/ScriptedCommandEventSourceTests.cpp
+)
+
+target_link_libraries(ScriptedCommandEventSourceTests PRIVATE
+    robot_command_events
+    GTest::gtest_main
+)
+
+target_compile_definitions(ScriptedCommandEventSourceTests PRIVATE
+    TEST_OUTPUT_DIR="${CMAKE_BINARY_DIR}/test_output/"
+)
+
+gtest_discover_tests(ScriptedCommandEventSourceTests)
+
+# --- CompositePollingEventSourceTests: command-before-sensor priority and
+# at-most-one-event-per-poll behavior (Phase 13J), using small test-only
+# IPollingEventSource fakes.
+add_executable(CompositePollingEventSourceTests
+    tests/CompositePollingEventSourceTests.cpp
+)
+
+target_link_libraries(CompositePollingEventSourceTests PRIVATE
+    robot_polling_composite
+    GTest::gtest_main
+)
+
+gtest_discover_tests(CompositePollingEventSourceTests)
+
 # --- ScriptedLiveRuntimeRunnerTests: cycle-based sensor-script injection
-# (Phase 13I) - mutate-before-step ordering, same-cycle file ordering, and
-# integration with the real RobotRuntime/HardwareEventSource/
-# RobotStateMachine/SimulatedRobotHardware pipeline.
+# (Phase 13I), plus (Phase 13J) command-script cycle-notification and
+# full live-mission integration tests combining CommandScript/SensorScript/
+# ScriptedCommandEventSource/HardwareEventSource/CompositePollingEventSource
+# with the real RobotRuntime/RobotStateMachine/RobotController/
+# SimulatedRobotHardware pipeline.
 add_executable(ScriptedLiveRuntimeRunnerTests
     tests/ScriptedLiveRuntimeRunnerTests.cpp
 )
@@ -387,6 +503,7 @@ add_executable(ScriptedLiveRuntimeRunnerTests
 target_link_libraries(ScriptedLiveRuntimeRunnerTests PRIVATE
     robot_scripted_runtime
     robot_hardware_events
+    robot_polling_composite
     GTest::gtest_main
 )
 
@@ -447,10 +564,13 @@ if (MSVC)
         robot_core robot_scenario robot_logging robot_reporting robot_app
         robot_hardware robot_controller robot_hardware_events robot_runtime
         robot_runtime_runner robot_sensor_script robot_scripted_runtime
+        robot_command_script robot_command_events robot_polling_composite
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
         RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
         ApplicationTests SensorScriptTests ScriptedLiveRuntimeRunnerTests
+        CommandScriptTests ScriptedCommandEventSourceTests
+        CompositePollingEventSourceTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

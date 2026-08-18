@@ -575,3 +575,97 @@ TEST(ApplicationTest, ExistingScenarioModeStillWorksUnchanged)
     EXPECT_NE(outcome.stdOut.find("Successful transitions: 3"), std::string::npos);
     EXPECT_NE(outcome.stdOut.find("Rejected transitions: 0"), std::string::npos);
 }
+
+// --- CLI live mission control / command input (Phase 13J) ---
+//
+// These tests drive runApplication() with --command-script (alone and
+// combined with --sensor-script), proving Application wires
+// CommandScript -> ScriptedCommandEventSource -> CompositePollingEventSource
+// into the live path while --live/--sensor-script-only/scenario mode all
+// remain exactly as they were in Phase 13H/13I. mission_commands.txt
+// (scenario_loaded@0, start_mission@1, mission_completed@12) and
+// obstacle_sensor.txt (obstacle true@4, obstacle false@7) together
+// reproduce this phase's documented 15-cycle live-mission walkthrough.
+
+// EE: --live --cycles 15 --command-script <valid script> reaches Moving
+// and then Completed purely through scripted commands - no sensor script
+// needed for the mission-lifecycle events themselves.
+TEST(ApplicationTest, LiveModeAcceptsCommandScript)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "15", "--command-script", FixturePath("mission_commands.txt")},
+        "live_with_command_script");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_NE(outcome.stdOut.find("Command script: "), std::string::npos);
+    EXPECT_EQ(outcome.stdOut.find("Sensor script:"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Cycles executed: 15"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Accepted transitions: 3"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Rejected transitions: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Final state: Completed"), std::string::npos);
+}
+
+// FF: --command-script and --sensor-script together reproduce this
+// phase's documented full mission walkthrough exactly (see section 12 /
+// docs/technical-decisions.md Phase 13J).
+TEST(ApplicationTest, LiveModeAcceptsCommandAndSensorScripts)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "15", "--command-script", FixturePath("mission_commands.txt"), "--sensor-script",
+         FixturePath("obstacle_sensor.txt")},
+        "live_with_command_and_sensor_scripts");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitSuccess);
+    EXPECT_NE(outcome.stdOut.find("Command script: "), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Sensor script: "), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Cycles executed: 15"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Accepted transitions: 5"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Rejected transitions: 0"), std::string::npos);
+    EXPECT_NE(outcome.stdOut.find("Final state: Completed"), std::string::npos);
+}
+
+// GG: --command-script with no file value.
+TEST(ApplicationTest, MissingCommandScriptPathRejected)
+{
+    // Act
+    const RunOutcome outcome =
+        Invoke({"--live", "--cycles", "15", "--command-script"}, "live_missing_command_script_value");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitUsageError);
+    EXPECT_NE(outcome.stdErr.find("Usage"), std::string::npos);
+}
+
+// HH: CLI syntax is valid, but the command script file does not exist -
+// this must not be reported as a generic usage error.
+TEST(ApplicationTest, MissingCommandScriptFileReturnsExecutionError)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "5", "--command-script", FixturePath("does_not_exist.txt")},
+        "live_missing_command_script_file");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitScenarioError);
+    EXPECT_NE(outcome.stdErr.find("Error loading command script"), std::string::npos);
+}
+
+// II: CLI syntax is valid, but the command script content is malformed -
+// same non-usage-error treatment, with a message useful enough to locate
+// the bad line.
+TEST(ApplicationTest, MalformedCommandScriptReturnsUsefulError)
+{
+    // Act
+    const RunOutcome outcome = Invoke(
+        {"--live", "--cycles", "5", "--command-script", FixturePath("invalid_command_name.txt")},
+        "live_malformed_command_script");
+
+    // Assert
+    EXPECT_EQ(outcome.exitCode, kExitScenarioError);
+    EXPECT_NE(outcome.stdErr.find("Error loading command script"), std::string::npos);
+    EXPECT_NE(outcome.stdErr.find("line 1"), std::string::npos);
+}

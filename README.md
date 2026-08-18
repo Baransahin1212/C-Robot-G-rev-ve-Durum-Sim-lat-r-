@@ -89,7 +89,9 @@ grows).
 ```text
 RobotSimulator <scenario-file>
 RobotSimulator --live --cycles <N>
+RobotSimulator --live --cycles <N> --command-script <file>
 RobotSimulator --live --cycles <N> --sensor-script <file>
+RobotSimulator --live --cycles <N> --command-script <file> --sensor-script <file>
 RobotSimulator --help
 RobotSimulator -h
 ```
@@ -103,10 +105,10 @@ polling cycles through the live runtime pipeline
 (`SimulatedRobotHardware -> HardwareEventSource -> RobotRuntime ->
 LiveRuntimeRunner`) - see [Architecture](#architecture) below. `N` must be
 a non-negative integer that fully matches the value passed. Without a
-sensor script, live mode uses `SimulatedRobotHardware`'s default, safe
-sensor values (battery 100, no obstacle, no emergency stop) unchanged for
-the whole run, so it naturally produces `N` `NoEvent` cycles and stays in
-`Idle`.
+command or sensor script, live mode uses `SimulatedRobotHardware`'s
+default, safe sensor values (battery 100, no obstacle, no emergency stop)
+unchanged for the whole run, and no mission-lifecycle command ever arrives,
+so it naturally produces `N` `NoEvent` cycles and stays in `Idle`.
 
 **Scripted sensor injection** (`--live --cycles <N> --sensor-script
 <file>`) additionally replays a deterministic script of sensor changes at
@@ -116,6 +118,18 @@ SimulatedRobotHardware`, still feeding the same unmodified
 [Sensor script format](#sensor-script-format) below and
 `docs/technical-decisions.md` (Phase 13I) for the full separation
 rationale.
+
+**Scripted command input** (`--live --cycles <N> --command-script <file>`)
+separately replays a deterministic script of mission-lifecycle/operator
+commands (`scenario_loaded`, `start_mission`, `mission_completed`,
+`home_reached`, `reset`) at specific cycles - the events live mode has no
+other way to raise, since `HardwareEventSource` only ever observes sensor
+state and never fabricates mission lifecycle events. See [Command script
+format](#command-script-format) below and `docs/technical-decisions.md`
+(Phase 13J). `--command-script` and `--sensor-script` are independent and
+may be combined; when both are given, `--command-script` must come first
+(`--live --cycles <N> --command-script <file> --sensor-script <file>`) -
+any other ordering is a usage error.
 
 ### Sensor script format
 
@@ -156,6 +170,55 @@ One entry per non-empty, non-comment line:
   obstacle/battery/emergency events - see `docs/technical-decisions.md`).
 - Live mode without `--sensor-script` is unaffected and behaves exactly as
   in Phase 13H.
+
+### Command script format
+
+One entry per non-empty, non-comment line:
+
+```text
+<cycle> <command>
+```
+
+```text
+0 scenario_loaded
+1 start_mission
+12 mission_completed
+```
+
+Supported command names, each mapped 1:1 to an existing `EventType` - no
+new event vocabulary is introduced:
+
+| Command name | `EventType` |
+|---|---|
+| `scenario_loaded` | `ScenarioLoaded` |
+| `start_mission` | `StartMission` |
+| `mission_completed` | `MissionCompleted` |
+| `home_reached` | `HomeReached` |
+| `reset` | `Reset` |
+
+Sensor-derived events (`ObstacleDetected`, `ObstacleCleared`,
+`BatteryCritical`, `EmergencyStop`, `InvalidSensorData`) are **not**
+accepted here - those remain `SensorScript`/`HardwareEventSource`'s
+exclusive responsibility (see above), and appear as unknown commands if
+used in a command script.
+
+- **Cycles are zero-based**, same as sensor scripts.
+- An entry becomes *eligible* once its scheduled cycle is reached, and
+  raises its `Event` on the runtime step for the **first** cycle at or
+  after that point where it is actually polled - if `RobotRuntime::step()`
+  processes a different event that same cycle (or a same-cycle command
+  ahead of it), the entry remains pending and is delivered on a later
+  cycle. It is never dropped.
+- Entries sharing the same cycle are delivered in **file order**.
+- Lines are not required to already be sorted by cycle - the parser sorts
+  them internally.
+- Blank lines are ignored; lines whose first non-whitespace character is
+  `#` are comments and are ignored.
+- When both `--command-script` and `--sensor-script` are used together, a
+  command event scheduled for the same cycle as a sensor edge is always
+  delivered to the FSM **first** - see `docs/technical-decisions.md`
+  (Phase 13J) for the full priority rationale.
+- Live mode without `--command-script` is unaffected.
 
 Windows Debug example, run from the project root:
 
@@ -209,13 +272,53 @@ Rejected transitions: 4
 Final state: Idle
 ```
 
+Live mission example, combining `--command-script` and `--sensor-script`
+(using the `mission_commands.txt`/`obstacle_sensor.txt` fixtures under
+`tests/fixtures/`, which contain exactly the two scripts below):
+
+```powershell
+.\build\Debug\RobotSimulator.exe --live --cycles 15 --command-script mission_commands.txt --sensor-script obstacle_sensor.txt
+```
+
+```text
+# mission_commands.txt
+0 scenario_loaded
+1 start_mission
+12 mission_completed
+```
+
+```text
+# obstacle_sensor.txt
+4 obstacle true
+7 obstacle false
+```
+
+```text
+Command script: mission_commands.txt
+Sensor script: obstacle_sensor.txt
+Live runtime completed
+Cycles executed: 15
+No-event cycles: 10
+Accepted transitions: 5
+Rejected transitions: 0
+Final state: Completed
+```
+
+Concretely, this run's five accepted transitions are: `ScenarioLoaded`
+(`Idle -> Ready`, cycle 0), `StartMission` (`Ready -> Moving`, cycle 1),
+`ObstacleDetected` (`Moving -> WaitingForObstacleClear`, cycle 4),
+`ObstacleCleared` (`WaitingForObstacleClear -> Moving`, cycle 7), and
+`MissionCompleted` (`Moving -> Completed`, cycle 12) - the exact,
+unmodified FSM transition table in action, driven entirely by the two
+independent scripts.
+
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | The simulation executed successfully — **regardless of mission outcome**. `Aborted`, `EmergencyStopped`, `Error`, and a scenario containing rejected transitions are all legitimate simulation *results*, not application failures. |
-| `1` | Invalid command line (missing or too many arguments, or malformed `--live`/`--sensor-script` syntax). |
-| `2` | The scenario file could not be loaded (not found, malformed JSON, or fails schema validation), or a `--sensor-script` file could not be opened or contained a malformed line. |
+| `1` | Invalid command line (missing or too many arguments, or malformed `--live`/`--sensor-script`/`--command-script` syntax, including `--sensor-script` given before `--command-script`). |
+| `2` | The scenario file could not be loaded (not found, malformed JSON, or fails schema validation), or a `--sensor-script`/`--command-script` file could not be opened or contained a malformed line. |
 | `3` | An output file (log or report) could not be created or written. |
 
 ### Generated runtime outputs
@@ -317,11 +420,14 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `robot_runtime` | `RobotRuntime`, the live one-cycle-per-`step()` counterpart to `Simulator` (see `docs/technical-decisions.md`), wired into the CLI's `--live` mode via `robot_app`. Depends on `robot_domain`, `robot_core`, and `robot_controller`. |
 | `robot_runtime_runner` | `LiveRuntimeRunner`, a deterministic finite scheduler that calls `RobotRuntime::step()` an exact number of times and tallies the results. No timing policy yet. Depends only on `robot_runtime`. |
 | `robot_sensor_script` | `SensorScript`, the deterministic sensor-injection script parser (Phase 13I). Parses `<cycle> <sensor> <value>` text files into sorted `SensorScriptEntry` values. Depends only on `robot_domain` (for its include directory - it uses no domain types). |
-| `robot_scripted_runtime` | `ScriptedLiveRuntimeRunner` (Phase 13I), a simulator-only adapter that applies `SensorScript` mutations to `SimulatedRobotHardware` immediately before each `RobotRuntime::step()`. Reuses `RuntimeRunSummary` from `robot_runtime_runner`. Depends on `robot_runtime`, `robot_runtime_runner`, `robot_hardware`, and `robot_sensor_script`. |
+| `robot_scripted_runtime` | `ScriptedLiveRuntimeRunner` (Phase 13I/13J), a simulator-only adapter that, once per cycle, applies `SensorScript` mutations to `SimulatedRobotHardware` and/or advances a `ScriptedCommandEventSource`'s current cycle, immediately before each `RobotRuntime::step()`. Reuses `RuntimeRunSummary` from `robot_runtime_runner`. Depends on `robot_runtime`, `robot_runtime_runner`, `robot_hardware`, `robot_sensor_script`, and `robot_command_events`. |
+| `robot_command_script` | `CommandScript`, the deterministic mission-command script parser (Phase 13J). Parses `<cycle> <command>` text files into sorted `CommandScriptEntry` values, each mapped to an existing `EventType`. Depends only on `robot_domain` (for `EventType`/the include directory). |
+| `robot_command_events` | `ScriptedCommandEventSource` (Phase 13J), an `IPollingEventSource` that turns a `CommandScript`'s eligible-and-unconsumed entries into `Event`s on an externally-driven cycle schedule (`setCurrentCycle()`). Depends on `robot_domain` and `robot_command_script`. |
+| `robot_polling_composite` | `CompositePollingEventSource` (Phase 13J), combines a command `IPollingEventSource` and a sensor `IPollingEventSource` into the one `RobotRuntime` accepts, with command-before-sensor priority. Depends only on `robot_domain`. |
 | `robot_scenario` | `JsonScenarioSource` — converts a scenario JSON file into `Event` objects. Depends on `robot_domain` and, privately, on nlohmann/json. |
 | `robot_logging` | `StreamSimulationLogger`, the concrete `ISimulationLogger` implementation that writes to any `std::ostream`. |
 | `robot_reporting` | `MissionOutcome` mapping and `StreamReportWriter`, which turn a `SimulationResult` into a human-readable report. Depends on `robot_core` for `SimulationResult`. |
-| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation`/`runLiveSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Constructs the default `SimulatedRobotHardware`/`RobotController` for the CLI's scenario path, the live pipeline (`HardwareEventSource`/`RobotRuntime`/`LiveRuntimeRunner`) for `--live`, and additionally `SensorScript`/`ScriptedLiveRuntimeRunner` for `--live --sensor-script`. Depends on all of the above. |
+| `robot_app` | CLI argument parsing and the `runApplication`/`runSimulation`/`runLiveSimulation` composition logic, kept separate from `main.cpp` so it's directly unit-testable without a subprocess. Constructs the default `SimulatedRobotHardware`/`RobotController` for the CLI's scenario path, the live pipeline (`HardwareEventSource`/`RobotRuntime`/`LiveRuntimeRunner`) for `--live`, `SensorScript`/`ScriptedLiveRuntimeRunner` for `--sensor-script`, and additionally `CommandScript`/`ScriptedCommandEventSource`/`CompositePollingEventSource` for `--command-script`. Depends on all of the above. |
 | `RobotSimulator` | The executable — `src/main.cpp` is a ~10-line composition root that calls into `robot_app`. |
 
 Dependencies flow one way only: `RobotStateMachine` never depends on

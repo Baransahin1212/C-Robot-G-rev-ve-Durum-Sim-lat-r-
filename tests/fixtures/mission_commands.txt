@@ -1,0 +1,4 @@
+# Example command script (Phase 13J)
+0 scenario_loaded
+1 start_mission
+12 mission_completed

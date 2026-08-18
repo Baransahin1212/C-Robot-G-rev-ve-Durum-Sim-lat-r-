@@ -1,0 +1,4 @@
+# this is a comment
+0 scenario_loaded
+# another comment
+1 start_mission
