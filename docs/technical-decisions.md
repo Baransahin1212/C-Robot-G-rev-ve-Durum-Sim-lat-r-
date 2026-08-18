@@ -999,6 +999,133 @@ depends on `robot_hardware` (`IRobotHardware`) and `robot_transport`
 in `RealRobotHardware.hpp`'s public API. Neither target is linked into
 `robot_app`.
 
+## Phase 13L: serial transport abstraction
+
+Adds a platform-independent line transport layer underneath
+`IRobotTransport`, extending the boundary from Phase 13K one step further
+without implementing an actual OS serial port yet:
+
+```text
+RobotController / HardwareEventSource
+              |
+              v
+        IRobotHardware        (Phase 13A - unchanged)
+              |
+              v
+      RealRobotHardware        (Phase 13K - unchanged this phase)
+              |
+              v
+       IRobotTransport         (Phase 13K - unchanged this phase)
+              |
+              v
+     SerialRobotTransport      (Phase 13L - new)
+              |
+              v
+         ISerialPort           (Phase 13L - new)
+              |
+              v
+   (not implemented) future Windows COM-port / Linux
+   /dev/tty* ISerialPort
+```
+
+**Neither `RealRobotHardware` nor `IRobotTransport` needed any change.**
+Both already existed as exactly the seam this phase needed:
+`RealRobotHardware` only ever calls `IRobotTransport::sendCommand()`/
+`query()`, and has no idea whether the concrete `IRobotTransport` behind
+that reference is the Phase 13K test fake or `SerialRobotTransport` - so
+plugging in a new `IRobotTransport` implementation required touching
+neither file. Verified directly: `git diff --stat` shows zero diff for
+both in this phase, and `SerialRobotTransportTests.cpp` re-runs the same
+kind of battery/obstacle/e-stop/actuator assertions
+`RealRobotHardwareTests.cpp` already makes, just with `RealRobotHardware`
+now wired to a `SerialRobotTransport` instead of the Phase 13K
+`RecordingRobotTransport`.
+
+**Two responsibilities, two classes, one clean split.**
+`SerialRobotTransport`'s *entire* job is line framing: append `'\n'` to
+whatever command/request string it is handed, and (for queries) return
+`ISerialPort::readLine()`'s result unchanged. It never looks at message
+content beyond that - it does not know `MOVE_FORWARD` from `GET_BATTERY`
+from any other string, and it has no notion of a `BATTERY`/`OBSTACLE`/
+`ESTOP` response shape. `RealRobotHardware` keeps 100% of the semantic
+parsing responsibility it already had (Phase 13K) - `SerialRobotTransport`
+being interposed underneath it changes nothing about what
+`ExtractValueToken()`/`ParseBatteryValue()`/`ParseBooleanValue()` do
+because those functions never depend on framing at all. This mirrors the
+project's existing sensor/command separation philosophy (SensorScript vs.
+CommandScript, Phase 13I/13J): each layer owns exactly one concern.
+
+**`ISerialPort::readLine()`'s line-terminator contract is a deliberate,
+documented choice, not an accident.** `readLine()` returns a line with any
+terminator (`'\n'` or `'\r\n'`) already stripped - `SerialRobotTransport`
+performs no trimming of its own, confirmed by
+`ResponseWhitespaceIsNotNormalized` (a response of `" BATTERY 78 "` comes
+back exactly as `" BATTERY 78 "`, leading/trailing spaces included - only
+the terminator is a `readLine()` implementation's concern, not arbitrary
+whitespace). This keeps the terminator-stripping logic in exactly one
+place - whatever future concrete `ISerialPort` actually parses raw serial
+bytes - rather than duplicating "did the far end use `\n` or `\r\n`?"
+guesswork into `SerialRobotTransport` too. `RealRobotHardware`'s existing
+strict, no-partial-parsing rules (Phase 13K) are what ultimately reject
+any payload issue that slips through, exactly as before.
+
+**Errors are not caught, wrapped, or converted at this layer.** If
+`ISerialPort::write()` or `readLine()` throws, `SerialRobotTransport` lets
+the exception propagate completely unchanged - no new exception type was
+introduced for this phase, since there is nothing serial-specific to add
+to the message an `ISerialPort` implementation would already provide. An
+empty string returned by `readLine()` (rather than a thrown exception) is
+likewise passed through unchanged, exactly like Phase 13K's
+`RecordingRobotTransport` returning `""` for an unconfigured request -
+`RealRobotHardware`'s `RobotTransportError` is still what ultimately
+rejects it, one layer up, unmodified.
+
+**`ISerialPort` stays deliberately low-level - no configuration
+surface yet.** It exposes exactly `write(const std::string&)` and
+`readLine() -> std::string`; no device path, baud rate, parity, data/stop
+bits, flow control, or timeout appears anywhere in this interface. Those
+are construction-time concerns for a *concrete* `ISerialPort`
+implementation (a future `WindowsSerialPort`/`PosixSerialPort` or
+similar), not the abstraction itself - exactly as `IRobotTransport` in
+Phase 13K deliberately carried no robot-domain vocabulary, `ISerialPort`
+here deliberately carries no serial-configuration vocabulary. Introducing
+either now, before a concrete implementation exists to justify a specific
+shape, would be speculative design.
+
+**Test-only `RecordingSerialPort`, not a production fake.** Per the task
+brief and matching Phase 13K's `RecordingRobotTransport` precedent,
+`RecordingSerialPort` lives entirely inside
+`tests/SerialRobotTransportTests.cpp` - no `FakeSerialPort` production
+type was added anywhere under `include/`/`src/`. It records every
+`write()` call verbatim (including the appended `'\n'`) and returns a
+per-call configured line from a FIFO queue (empty string once exhausted),
+plus an interleaved `callOrder` log for the one test
+(`QueryPerformsWriteBeforeRead`) that needs to assert relative ordering
+rather than just final state.
+
+**The `HardwareEventSource` integration test required the exact real
+sensor-read order, not a guess.** `HardwareEventSource::sampleAndEnqueueEdges()`
+(unchanged, Phase 13E) calls `emergencyStopPressed()`, then
+`batteryLevelPercent()`, then `obstacleDetected()`, in that fixed order,
+every time it takes a fresh sample - so each sample corresponds to three
+serial reads in `ESTOP`/`BATTERY`/`OBSTACLE` order. `RecordingSerialPort`
+is a dumb FIFO with no correlation between what was written and what it
+returns, so `SerialRobotTransportTests.cpp`'s end-to-end test queues its
+six response lines (two three-line samples) in that exact order - queuing
+them in query-issuance order (e.g. battery/obstacle/e-stop, matching the
+task brief's illustrative example ordering rather than the real one) would
+have silently fed the wrong response to the wrong sensor and produced a
+misleading test.
+
+**CMake dependency shape.** `robot_serial_transport` depends only on
+`robot_transport` (`IRobotTransport`). `ISerialPort.hpp` lives in this
+target's public headers rather than a fourth micro-target, since it has
+exactly one consumer (`SerialRobotTransport`) inside this same library -
+splitting it out further would be fragmentation without a decoupling
+benefit, the same judgment call already made for `IRobotTransport`
+co-existing with `RobotProtocol.hpp` inside `robot_transport` in Phase
+13K. `robot_serial_transport` is not linked into `robot_app`.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

@@ -406,7 +406,7 @@ Phase 13A-13D hardware-abstraction rationale. The accumulated
 `SimulationResult` is converted to a human-facing `SimulationReport` and
 written out by a `StreamReportWriter`.
 
-### Hardware transport boundary (Phase 13K)
+### Hardware transport boundary (Phase 13K/13L)
 
 `RobotController`/`HardwareEventSource` only ever depend on `IRobotHardware`
 - they cannot tell, and do not need to know, which implementation sits
@@ -427,7 +427,8 @@ RobotController / HardwareEventSource
      SimulatedRobotHardware
 
 
-Future real path (implementation boundary only - not wired into the CLI):
+Real path under construction (implementation boundary only - not wired
+into the CLI):
 
 RobotController / HardwareEventSource
               |
@@ -441,7 +442,14 @@ RobotController / HardwareEventSource
        IRobotTransport
               |
               v
-   (not implemented yet) SerialRobotTransport
+     SerialRobotTransport
+              |
+              v
+         ISerialPort
+              |
+              v
+   (not implemented yet) future platform serial
+   implementation (Windows COM port / Linux /dev/tty*)
 ```
 
 `RealRobotHardware` speaks a small, deliberately tiny text protocol over
@@ -453,15 +461,30 @@ RobotController / HardwareEventSource
 parsing is strict - a wrong prefix, a missing or extra token, a
 non-numeric or out-of-range value, or an empty response all throw
 `RobotTransportError` rather than silently substituting a fake sensor
-value.
+value. This protocol is a **logical message**, not serial bytes - it never
+mentions a line terminator.
+
+**`SerialRobotTransport` adds line framing underneath `IRobotTransport`,
+nothing else.** It implements `IRobotTransport` over a line-oriented
+`ISerialPort`, and its entire responsibility is appending `'\n'` to
+whatever command/request string it is given (`GET_BATTERY` becomes the
+serial write `GET_BATTERY\n`) and, for queries, returning
+`ISerialPort::readLine()`'s result completely unchanged - not trimmed, not
+validated. It has no knowledge of `BATTERY`/`OBSTACLE`/`ESTOP` response
+formats; that parsing remains `RealRobotHardware`'s job one layer up.
+`ISerialPort::readLine()`'s contract is to return a line **with its line
+terminator (`'\n'` or `'\r\n'`) already removed** - `SerialRobotTransport`
+does not strip anything itself, and a future concrete `ISerialPort` owns
+that removal.
 
 **No serial-port, USB, network, or other platform-specific transport is
-implemented in this phase** - `IRobotTransport` is tested only through a
-deterministic, test-only `RecordingRobotTransport` fake that lives in
-`tests/RealRobotHardwareTests.cpp` (not shipped as a production type), and
-`RobotSimulator`/`robot_app` continue to use only
-`SimulatedRobotHardware`, unchanged. See `docs/technical-decisions.md` for
-the full rationale.
+implemented yet.** `ISerialPort` is tested only through a deterministic,
+test-only `RecordingSerialPort` fake that lives in
+`tests/SerialRobotTransportTests.cpp` (not shipped as a production type,
+matching `RealRobotHardwareTests.cpp`'s own `RecordingRobotTransport`
+convention), and `RobotSimulator`/`robot_app` continue to use only
+`SimulatedRobotHardware`, unchanged - no `--real`/`--serial`/`--port` CLI
+flag exists. See `docs/technical-decisions.md` for the full rationale.
 
 ### CMake / library structure
 
@@ -474,6 +497,7 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `robot_hardware` | `IRobotHardware` abstraction and `SimulatedRobotHardware`, a deterministic in-memory implementation. Depends only on `robot_domain`. |
 | `robot_transport` | `IRobotTransport` abstraction and `RobotProtocol.hpp`'s wire-protocol constants (Phase 13K). Header-only `INTERFACE` target, matching `robot_domain`'s own pattern - `IRobotTransport` is pure virtual and `RobotProtocol.hpp` is only `constexpr` constants, so neither has a `.cpp`. Depends only on `robot_domain` for the include directory; knows no `RobotState`/`Event`/`RobotController`/`RobotRuntime` type. |
 | `robot_real_hardware` | `RealRobotHardware` (Phase 13K), an `IRobotHardware` implementation that drives `IRobotTransport`'s tiny text protocol instead of `SimulatedRobotHardware`'s in-memory state. Depends on `robot_hardware` and `robot_transport`. Not linked into `robot_app`/`RobotSimulator` - no CLI wiring yet, and no concrete transport (serial or otherwise) exists yet. |
+| `robot_serial_transport` | `ISerialPort` abstraction and `SerialRobotTransport` (Phase 13L), the line-oriented `'\n'`-framing `IRobotTransport` implementation sitting under `RealRobotHardware`. `ISerialPort` lives in this target's public headers rather than a separate target - it has exactly one consumer. Depends only on `robot_transport`. No OS-level `ISerialPort` implementation exists yet, and this target is not linked into `robot_app`/`RobotSimulator` either. |
 | `robot_controller` | `RobotController`, which maps a resulting `RobotState` to one `IRobotHardware` actuator command. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_hardware_events` | `HardwareEventSource`, an `IEventSource`/`IPollingEventSource` implementation that turns `IRobotHardware` sensor reads into `Event`s. Depends on `robot_domain` and `robot_hardware`. |
 | `robot_runtime` | `RobotRuntime`, the live one-cycle-per-`step()` counterpart to `Simulator` (see `docs/technical-decisions.md`), wired into the CLI's `--live` mode via `robot_app`. Depends on `robot_domain`, `robot_core`, and `robot_controller`. |

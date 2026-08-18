@@ -106,6 +106,27 @@ target_link_libraries(robot_real_hardware PUBLIC
     robot_transport
 )
 
+# --- robot_serial_transport: SerialRobotTransport + ISerialPort, the
+# line-oriented serial framing layer under IRobotTransport (Phase 13L) ---
+# Depends only on robot_transport (IRobotTransport). ISerialPort lives in
+# this target's public include surface (header-only, no .cpp of its own -
+# it is pure virtual) rather than a separate target, since it has exactly
+# one consumer (SerialRobotTransport) and splitting it out further would be
+# fragmentation without a decoupling benefit. Deliberately independent of
+# robot_hardware/robot_real_hardware/robot_app - SerialRobotTransport only
+# ever frames whatever command/query string IRobotTransport's contract
+# hands it (appends '\n'), with no knowledge of RobotProtocol's specific
+# strings, IRobotHardware, RobotState, Event, RobotController, or
+# RobotRuntime. No OS-level ISerialPort implementation exists yet - only a
+# test-only fake in tests/SerialRobotTransportTests.cpp.
+add_library(robot_serial_transport STATIC
+    src/SerialRobotTransport.cpp
+)
+
+target_link_libraries(robot_serial_transport PUBLIC
+    robot_transport
+)
+
 # Simulator.hpp includes RobotController.hpp so it can accept an optional
 # RobotController*, so robot_core needs robot_controller PUBLIC (its
 # headers, and anything that includes Simulator.hpp, need to resolve
@@ -478,6 +499,28 @@ target_link_libraries(RealRobotHardwareTests PRIVATE
 
 gtest_discover_tests(RealRobotHardwareTests)
 
+# --- SerialRobotTransportTests: '\n' framing, readLine passthrough
+# (including no-trim behavior), and error-propagation behavior (Phase
+# 13L), plus focused RealRobotHardware/HardwareEventSource/RobotController
+# integration tests proving the full RecordingSerialPort ->
+# SerialRobotTransport -> RealRobotHardware chain works exactly like the
+# existing RecordingRobotTransport-based RealRobotHardwareTests, with
+# HardwareEventSource/RobotController unmodified. Uses a test-only
+# RecordingSerialPort defined inside the test file, not a production fake.
+add_executable(SerialRobotTransportTests
+    tests/SerialRobotTransportTests.cpp
+)
+
+target_link_libraries(SerialRobotTransportTests PRIVATE
+    robot_serial_transport
+    robot_real_hardware
+    robot_hardware_events
+    robot_controller
+    GTest::gtest_main
+)
+
+gtest_discover_tests(SerialRobotTransportTests)
+
 # --- SensorScriptTests: sensor script text-format parsing/validation
 # (Phase 13I) - format, ordering, and error-message behavior in isolation
 # from any runtime execution.
@@ -621,13 +664,14 @@ if (MSVC)
         robot_hardware robot_controller robot_hardware_events robot_runtime
         robot_runtime_runner robot_sensor_script robot_scripted_runtime
         robot_command_script robot_command_events robot_polling_composite
-        robot_real_hardware
+        robot_real_hardware robot_serial_transport
         RobotSimulator RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
         RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
         ApplicationTests SensorScriptTests ScriptedLiveRuntimeRunnerTests
         CommandScriptTests ScriptedCommandEventSourceTests
         CompositePollingEventSourceTests RealRobotHardwareTests
+        SerialRobotTransportTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()
