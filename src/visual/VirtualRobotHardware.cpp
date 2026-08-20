@@ -8,12 +8,6 @@ namespace robot::visual
 namespace
 {
 
-// Forward wheel speed, world units per second - "approximately 1.0" per
-// the task brief, as a named constant. Both wheels receive this value on
-// moveForward(), matching Phase 13N/13O's prior straight-line speed
-// exactly when DifferentialDrive integrates equal wheel speeds.
-constexpr float kForwardWheelSpeed = 1.0F;
-
 // Half-extent of the demo world's ground plane (matches Renderer3D's own
 // ~10x10 ground/grid - see docs/technical-decisions.md, Phase 13M/13N).
 // Robot position is clamped to stay within this square so it can never
@@ -52,19 +46,19 @@ bool VirtualRobotHardware::emergencyStopPressed() const
 void VirtualRobotHardware::moveForward()
 {
     command_ = VirtualDriveCommand::MoveForward;
-    applyCurrentCommandToDrive();
+    applyEffectiveWheelSpeeds();
 }
 
 void VirtualRobotHardware::stop()
 {
     command_ = VirtualDriveCommand::Stopped;
-    applyCurrentCommandToDrive();
+    applyEffectiveWheelSpeeds();
 }
 
 void VirtualRobotHardware::returnToBase()
 {
     command_ = VirtualDriveCommand::ReturnToBase;
-    applyCurrentCommandToDrive();
+    applyEffectiveWheelSpeeds();
 }
 
 VirtualDriveCommand VirtualRobotHardware::currentCommand() const noexcept
@@ -82,21 +76,53 @@ WheelSpeeds VirtualRobotHardware::wheelSpeeds() const noexcept
     return drive_.wheelSpeeds();
 }
 
+DriveAuthority VirtualRobotHardware::driveAuthority() const noexcept
+{
+    if (manualOverrideActive_)
+    {
+        return DriveAuthority::Manual;
+    }
+    if (autonomousOverrideActive_)
+    {
+        return DriveAuthority::AutonomousAvoidance;
+    }
+    return DriveAuthority::Fsm;
+}
+
 bool VirtualRobotHardware::manualOverrideActive() const noexcept
 {
     return manualOverrideActive_;
 }
 
+bool VirtualRobotHardware::autonomousOverrideActive() const noexcept
+{
+    return autonomousOverrideActive_;
+}
+
 void VirtualRobotHardware::setManualWheelSpeeds(float left, float right) noexcept
 {
     manualOverrideActive_ = true;
-    drive_.setWheelSpeeds(left, right);
+    manualSpeeds_ = WheelSpeeds{left, right};
+    applyEffectiveWheelSpeeds();
 }
 
 void VirtualRobotHardware::clearManualWheelOverride() noexcept
 {
     manualOverrideActive_ = false;
-    applyCurrentCommandToDrive();
+    applyEffectiveWheelSpeeds();
+}
+
+void VirtualRobotHardware::setAutonomousWheelSpeeds(float left, float right) noexcept
+{
+    autonomousOverrideActive_ = true;
+    autonomousSpeeds_ = WheelSpeeds{left, right};
+    applyEffectiveWheelSpeeds();
+}
+
+void VirtualRobotHardware::clearAutonomousWheelOverride() noexcept
+{
+    autonomousOverrideActive_ = false;
+    applyEffectiveWheelSpeeds();
 }
 
 WheelSpeeds VirtualRobotHardware::wheelSpeedsForCommand(VirtualDriveCommand command) const noexcept
@@ -112,19 +138,27 @@ WheelSpeeds VirtualRobotHardware::wheelSpeedsForCommand(VirtualDriveCommand comm
     return WheelSpeeds{0.0F, 0.0F};
 }
 
-void VirtualRobotHardware::applyCurrentCommandToDrive()
+void VirtualRobotHardware::applyEffectiveWheelSpeeds() noexcept
 {
-    // A manual override, while active, owns physical wheel speeds - the
-    // FSM command above is still recorded (command_/currentCommand()), so
-    // clearManualWheelOverride() can restore it later, but it must not
-    // fight the override's wheel speeds every time RobotController calls
-    // moveForward()/stop()/returnToBase() while the override is active.
+    // Fixed priority (Phase 13Q): Manual > AutonomousAvoidance > Fsm.
+    // RobotController's moveForward()/stop()/returnToBase() calls (via
+    // command_ above) and setManualWheelSpeeds()/setAutonomousWheelSpeeds()
+    // all funnel through this one function, so drive authority is never
+    // decided by scattered ad-hoc checks elsewhere.
+    WheelSpeeds speeds;
     if (manualOverrideActive_)
     {
-        return;
+        speeds = manualSpeeds_;
+    }
+    else if (autonomousOverrideActive_)
+    {
+        speeds = autonomousSpeeds_;
+    }
+    else
+    {
+        speeds = wheelSpeedsForCommand(command_);
     }
 
-    const WheelSpeeds speeds = wheelSpeedsForCommand(command_);
     drive_.setWheelSpeeds(speeds.left, speeds.right);
 }
 

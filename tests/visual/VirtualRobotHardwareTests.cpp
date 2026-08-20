@@ -7,6 +7,7 @@
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/DemoCommandSource.hpp"
+#include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
@@ -21,6 +22,8 @@ using robot::RobotState;
 using robot::RobotStateMachine;
 using robot::RuntimeStepResult;
 using robot::visual::DemoCommandSource;
+using robot::visual::DriveAuthority;
+using robot::visual::ReactiveObstacleAvoidance;
 using robot::visual::Vec3;
 using robot::visual::VirtualDriveCommand;
 using robot::visual::VirtualRobotHardware;
@@ -919,4 +922,437 @@ TEST(VirtualRobotHardwareTest, WorldBoundsStillApplyWithCollisionGuardPresent)
     // short of the bound by a false collision.
     EXPECT_LE(world.robotPose().position.z, 10.0F);
     EXPECT_GE(world.robotPose().position.z, 9.0F);
+}
+
+// --- DriveAuthority model (Phase 13Q) ---
+//
+// Manual > AutonomousAvoidance > Fsm, fixed priority. These tests prove
+// the priority rule directly against VirtualRobotHardware's public API,
+// independent of main3d.cpp's policy for *when* to engage each override.
+
+// 36: DefaultAuthorityIsFsm
+TEST(VirtualRobotHardwareTest, DefaultAuthorityIsFsm)
+{
+    // Arrange / Act
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    EXPECT_FALSE(hardware.manualOverrideActive());
+    EXPECT_FALSE(hardware.autonomousOverrideActive());
+}
+
+// 37: FsmMoveForwardControlsWheelsWithoutOverrides
+TEST(VirtualRobotHardwareTest, FsmMoveForwardControlsWheelsWithoutOverrides)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+
+    // Act
+    hardware.moveForward();
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_GT(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// 38: AutonomousOverrideTakesAuthorityFromFsm
+TEST(VirtualRobotHardwareTest, AutonomousOverrideTakesAuthorityFromFsm)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+
+    // Act
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    EXPECT_TRUE(hardware.autonomousOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.6F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.6F);
+}
+
+// 39: ManualOverrideTakesAuthorityFromAutonomous
+TEST(VirtualRobotHardwareTest, ManualOverrideTakesAuthorityFromAutonomous)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    // Act
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+
+    // Assert: manual wins; the autonomous request is still recorded
+    // underneath (see autonomousOverrideActive()) but does not control
+    // physical wheel speeds while manual is active.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    EXPECT_TRUE(hardware.autonomousOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 1.0F);
+}
+
+// 40: ClearingManualRestoresAutonomous
+TEST(VirtualRobotHardwareTest, ClearingManualRestoresAutonomous)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // Act
+    hardware.clearManualWheelOverride();
+
+    // Assert: falls through to the still-active autonomous override, not
+    // the FSM command.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.6F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.6F);
+}
+
+// 41: ClearingAutonomousRestoresFsm
+TEST(VirtualRobotHardwareTest, ClearingAutonomousRestoresFsm)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    // Act
+    hardware.clearAutonomousWheelOverride();
+
+    // Assert: falls through to the FSM command (MoveForward), since
+    // manual was never active.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_GT(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// 42: FsmStopWhileAutonomousActiveDoesNotOverwriteAutonomousWheelSpeeds
+TEST(VirtualRobotHardwareTest, FsmStopWhileAutonomousActiveDoesNotOverwriteAutonomousWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+
+    // Act: RobotController-style call arrives while avoidance is active -
+    // this is exactly what happens when the FSM first enters
+    // WaitingForObstacleClear and calls stop().
+    hardware.stop();
+
+    // Assert: currentCommand() reflects the FSM call, but physical wheel
+    // speeds are still the autonomous override's values.
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.6F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.6F);
+}
+
+// 43: FsmMoveForwardWhileAutonomousActiveDoesNotOverwriteAutonomousWheelSpeeds
+TEST(VirtualRobotHardwareTest, FsmMoveForwardWhileAutonomousActiveDoesNotOverwriteAutonomousWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+
+    // Act: FSM briefly reports MoveForward while avoidance is still
+    // active (should not happen in the real WaitingForObstacleClear flow,
+    // but the priority rule must hold regardless of which FSM command
+    // arrives).
+    hardware.moveForward();
+
+    // Assert
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::MoveForward);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.6F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.6F);
+}
+
+// 44: ManualStillWinsAfterFsmCommandChanges
+TEST(VirtualRobotHardwareTest, ManualStillWinsAfterFsmCommandChanges)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(0.3F, -0.3F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // Act: FSM command changes underneath the active manual override.
+    hardware.moveForward();
+    hardware.stop();
+    hardware.returnToBase();
+
+    // Assert: currentCommand() reflects the latest FSM call, but physical
+    // wheel speeds are still the manual override's values throughout.
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.3F);
+    EXPECT_FLOAT_EQ(speeds.right, -0.3F);
+}
+
+// 45: ClearingAllOverridesRestoresLatestFsmCommand
+TEST(VirtualRobotHardwareTest, ClearingAllOverridesRestoresLatestFsmCommand)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+    hardware.setManualWheelSpeeds(0.2F, 0.2F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // Act: clear both overrides, manual first (matching main3d.cpp's own
+    // M-toggle-off order, though the result must not depend on order).
+    hardware.clearManualWheelOverride();
+    hardware.clearAutonomousWheelOverride();
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    EXPECT_FALSE(hardware.manualOverrideActive());
+    EXPECT_FALSE(hardware.autonomousOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_GT(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// 46: ManualPriorityIntegrationAcrossAvoidanceAndFsm
+//
+// Phase 13Q section 25: avoidance active -> manual enabled -> manual wins
+// -> manual cleared -> avoidance automatically resumes -> latest FSM
+// command was never lost throughout.
+TEST(VirtualRobotHardwareTest, ManualPriorityIntegrationAcrossAvoidanceAndFsm)
+{
+    // Arrange: FSM wants Stopped (as it does in real
+    // WaitingForObstacleClear), avoidance is actively turning.
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.stop();
+    ReactiveObstacleAvoidance avoidance;
+    const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+    hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    // Act: manual drive engages mid-turn.
+    hardware.setManualWheelSpeeds(1.0F, -1.0F);
+
+    // Assert: manual physically wins.
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, -1.0F);
+
+    // Act: manual drive disengages.
+    hardware.clearManualWheelOverride();
+
+    // Assert: avoidance speeds automatically resume, with no loss of the
+    // latest FSM command (still Stopped).
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, turnSpeeds.left);
+    EXPECT_FLOAT_EQ(speeds.right, turnSpeeds.right);
+}
+
+// --- Disabled avoidance (Phase 13Q, section 26) ---
+//
+// When the caller (main3d.cpp's `A` toggle, or here, simply never calling
+// setAutonomousWheelSpeeds()) does not engage avoidance, WaitingForObstacleClear
+// must behave exactly like Phase 13O/13P: the robot stays stopped and
+// never rotates on its own.
+TEST(VirtualRobotHardwareTest, DisabledAvoidanceLeavesRobotStoppedAndNotRotating)
+{
+    // Arrange: real closed-loop approach to the blocking obstacle, exactly
+    // like the Phase 13O regression test - avoidance is simply never
+    // engaged (as if the `A` toggle were OFF).
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    CompositePollingEventSource compositeSource(commandSource, hardwareEventSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    hardware.update(1.0F);
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::NoEvent);
+    hardware.update(1.0F);
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // -> WaitingForObstacleClear
+    ASSERT_EQ(stateMachine.currentState(), RobotState::WaitingForObstacleClear);
+    const float headingWhenStopped = world.robotPose().headingDegrees;
+    const Vec3 positionWhenStopped = world.robotPose().position;
+
+    // Act: many further updates/steps, never calling
+    // setAutonomousWheelSpeeds() at all.
+    for (int i = 0; i < 50; ++i)
+    {
+        hardware.update(0.1F);
+        EXPECT_EQ(runtime.step(), RuntimeStepResult::NoEvent);
+    }
+
+    // Assert: robot never rotated or moved - it stays put until the
+    // obstacle is cleared some other way (e.g. `O`).
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.0F);
+    EXPECT_FLOAT_EQ(world.robotPose().headingDegrees, headingWhenStopped);
+    EXPECT_FLOAT_EQ(world.robotPose().position.x, positionWhenStopped.x);
+    EXPECT_FLOAT_EQ(world.robotPose().position.z, positionWhenStopped.z);
+}
+
+// --- Full closed-loop autonomous obstacle avoidance (Phase 13Q, section
+// 23) ---
+//
+// Drives the exact same production stack RobotSimulator3D's main3d.cpp
+// composes as of Phase 13Q - VirtualWorld -> VirtualRobotHardware ->
+// HardwareEventSource -> CompositePollingEventSource -> RobotRuntime ->
+// RobotStateMachine -> RobotController, plus ReactiveObstacleAvoidance -
+// end to end, without opening a window and without ever calling
+// stateMachine.processEvent()/handleEvent() or injecting
+// ObstacleDetected/ObstacleCleared directly. Each loop iteration below
+// reproduces main3d.cpp's own Phase 13Q per-frame policy (section 9):
+// runtime.step() first, then decide/apply drive authority from the
+// POST-step FSM state and sensor reading, then hardware.update().
+TEST(VirtualRobotHardwareTest, FullAutonomousObstacleAvoidanceClosedLoopThroughRealEventChain)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    CompositePollingEventSource compositeSource(commandSource, hardwareEventSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+    ReactiveObstacleAvoidance avoidance;
+
+    // Act / Assert: reach Moving through real FSM transitions.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Moving);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::MoveForward);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+
+    // Approach the blocking obstacle - identical two-step advance to the
+    // existing Phase 13O/13P closed-loop tests.
+    hardware.update(1.0F); // z: 1.0 -> 2.0, not yet detected
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::NoEvent);
+    hardware.update(1.0F); // z: 2.0 -> 3.0, within detection threshold
+
+    // ObstacleDetected fires; FSM enters WaitingForObstacleClear;
+    // RobotController stops the hardware - the real, unmodified chain.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted);
+    ASSERT_EQ(stateMachine.currentState(), RobotState::WaitingForObstacleClear);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    const Vec3 positionWhenStopped = world.robotPose().position;
+
+    // Drive main3d.cpp's own Phase 13Q per-frame authority policy: while
+    // WaitingForObstacleClear persists and the sensor still reports
+    // detected, autonomous avoidance owns the wheels; the moment the real
+    // HardwareEventSource/FSM chain returns to Moving, release it.
+    RobotState currentState = stateMachine.currentState();
+    bool everRotated = false;
+    Vec3 positionJustBeforeResuming = positionWhenStopped;
+
+    for (int frame = 0; frame < 400 && currentState != RobotState::Moving; ++frame)
+    {
+        runtime.step();
+        currentState = stateMachine.currentState();
+
+        const bool shouldAvoid =
+            currentState == RobotState::WaitingForObstacleClear && hardware.obstacleDetected();
+        if (shouldAvoid)
+        {
+            const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+            hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+            everRotated = true;
+        }
+        else if (hardware.autonomousOverrideActive())
+        {
+            hardware.clearAutonomousWheelOverride();
+        }
+
+        if (currentState != RobotState::Moving)
+        {
+            positionJustBeforeResuming = world.robotPose().position;
+        }
+
+        hardware.update(0.05F);
+    }
+
+    // Assert: avoidance genuinely engaged, the FSM genuinely returned to
+    // Moving through the real ObstacleCleared edge (never injected
+    // directly), and normal FSM forward control resumed with the
+    // override released.
+    EXPECT_TRUE(everRotated);
+    ASSERT_EQ(currentState, RobotState::Moving);
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::MoveForward);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    EXPECT_FALSE(hardware.autonomousOverrideActive());
+
+    // The robot's center stayed essentially fixed throughout the turn -
+    // pure in-place rotation, no drift.
+    EXPECT_NEAR(positionJustBeforeResuming.x, positionWhenStopped.x, 0.05F);
+    EXPECT_NEAR(positionJustBeforeResuming.z, positionWhenStopped.z, 0.05F);
+
+    // Heading changed - this is reactive avoidance, not a return to the
+    // original +Z heading.
+    EXPECT_NE(world.robotPose().headingDegrees, 0.0F);
+
+    // Wheel speeds are normal equal-positive FSM speeds again.
+    const WheelSpeeds finalWheelSpeeds = hardware.wheelSpeeds();
+    EXPECT_GT(finalWheelSpeeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(finalWheelSpeeds.left, finalWheelSpeeds.right);
+
+    // No repeated event spam once Moving is reached (Phase 13Q, section
+    // 24) - HardwareEventSource's existing edge-trigger semantics,
+    // unmodified.
+    for (int i = 0; i < 5; ++i)
+    {
+        EXPECT_EQ(runtime.step(), RuntimeStepResult::NoEvent);
+        EXPECT_EQ(stateMachine.currentState(), RobotState::Moving);
+    }
+
+    // The robot actually moves forward again, along its new heading - not
+    // frozen in place. It is NOT asserted to travel far: this V1 policy
+    // only turns enough to clear the forward SENSOR's (coarser)
+    // detection threshold, not necessarily enough for the (tighter,
+    // circular) Phase 13P collision guard to allow unlimited further
+    // travel on the very next heading - a few frames of genuine progress
+    // followed by the collision guard capping it again is expected,
+    // deterministic V1 behavior for this demo obstacle's geometry, not a
+    // bug (see docs/technical-decisions.md, Phase 13Q, "limitations").
+    for (int i = 0; i < 20; ++i)
+    {
+        hardware.update(0.05F);
+    }
+    const Vec3 finalPosition = world.robotPose().position;
+    const float movedDistance = std::sqrt(((finalPosition.x - positionJustBeforeResuming.x) *
+                                            (finalPosition.x - positionJustBeforeResuming.x)) +
+                                           ((finalPosition.z - positionJustBeforeResuming.z) *
+                                            (finalPosition.z - positionJustBeforeResuming.z)));
+    EXPECT_GT(movedDistance, 0.1F);
 }

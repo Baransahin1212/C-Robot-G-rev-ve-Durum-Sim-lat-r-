@@ -434,12 +434,18 @@ target_link_libraries(robot_visual PUBLIC
 # the pure X/UP/DOWN/LEFT/RIGHT -> WheelSpeeds decision function behind
 # RobotSimulator3D's manual drive mode, kept here so it is unit-testable
 # without raylib even though its only caller is main3d.cpp.
+# ReactiveObstacleAvoidance (Phase 13Q) is the deterministic, stateless,
+# raylib-free "what wheel speeds does an avoidance turn use" policy behind
+# RobotSimulator3D's autonomous obstacle avoidance - it has no FSM/sensor
+# knowledge of its own; the decision of *when* to apply its wheel speeds
+# lives in main3d.cpp, exactly like ManualDriveInput's decision function.
 add_library(robot_visual_simulation STATIC
     src/visual/VirtualRobotHardware.cpp
     src/visual/VirtualDistanceSensor.cpp
     src/visual/DifferentialDrive.cpp
     src/visual/RobotCollision.cpp
     src/visual/ManualDriveInput.cpp
+    src/visual/ReactiveObstacleAvoidance.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -885,6 +891,23 @@ target_link_libraries(ManualDriveInputTests PRIVATE
 
 gtest_discover_tests(ManualDriveInputTests)
 
+# --- ReactiveObstacleAvoidanceTests: deterministic turn wheel speeds
+# behind RobotSimulator3D's reactive obstacle-avoidance policy (Phase
+# 13Q) - opposite-sign wheels, zero linear velocity, the real
+# DifferentialDrive turning convention, and turn-speed magnitude.  Links
+# only robot_visual_simulation - never robot_visual/raylib - genuinely
+# headless, no window is ever created by this target.
+add_executable(ReactiveObstacleAvoidanceTests
+    tests/visual/ReactiveObstacleAvoidanceTests.cpp
+)
+
+target_link_libraries(ReactiveObstacleAvoidanceTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(ReactiveObstacleAvoidanceTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -904,7 +927,7 @@ if (MSVC)
         CompositePollingEventSourceTests RealRobotHardwareTests
         SerialRobotTransportTests VirtualWorldTests VirtualRobotHardwareTests
         VirtualDistanceSensorTests DifferentialDriveTests
-        RobotCollisionTests ManualDriveInputTests
+        RobotCollisionTests ManualDriveInputTests ReactiveObstacleAvoidanceTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

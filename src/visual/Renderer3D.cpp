@@ -167,9 +167,12 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     char rightWheelLine[64];
     std::snprintf(rightWheelLine, sizeof(rightWheelLine), "Right wheel: %.2f", telemetry.rightWheelSpeed);
 
-    char driveModeLine[64];
-    std::snprintf(driveModeLine, sizeof(driveModeLine), "Drive mode: %.*s",
-                   static_cast<int>(telemetry.driveModeText.size()), telemetry.driveModeText.data());
+    char driveAuthorityLine[64];
+    std::snprintf(driveAuthorityLine, sizeof(driveAuthorityLine), "Drive authority: %.*s",
+                   static_cast<int>(telemetry.driveAuthorityText.size()), telemetry.driveAuthorityText.data());
+
+    char avoidanceLine[64];
+    std::snprintf(avoidanceLine, sizeof(avoidanceLine), "Avoidance: %s", telemetry.avoidanceEnabled ? "ON" : "OFF");
 
     char collisionLine[64];
     std::snprintf(collisionLine, sizeof(collisionLine), "Collision: %s", telemetry.collidedLastUpdate ? "YES" : "NO");
@@ -181,6 +184,8 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {"Robot Simulator 3D", 20, kHudTitleColor},
         {stateLine, 18, kHudTextColor},
         {commandLine, 18, kHudTextColor},
+        {driveAuthorityLine, 18, kHudTextColor},
+        {avoidanceLine, 18, kHudTextColor},
         {positionLine, 18, kHudTextColor},
         {headingLine, 18, kHudTextColor},
         {obstaclesLine, 18, kHudTextColor},
@@ -188,11 +193,11 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {obstacleDetectedLine, 18, kHudTextColor},
         {leftWheelLine, 18, kHudTextColor},
         {rightWheelLine, 18, kHudTextColor},
-        {driveModeLine, 18, kHudTextColor},
         {collisionLine, 18, kHudTextColor},
         {"TAB: capture/release mouse   F11: fullscreen/windowed   SPACE: pause   O: toggle obstacle   Mouse/WASD: camera",
          16, kHudControlsColor},
         {"M: manual drive mode   Arrows: manual forward/reverse/turn   X: stop manual wheels", 16, kHudControlsColor},
+        {"A: toggle autonomous obstacle avoidance", 16, kHudControlsColor},
     };
 
     // Panel sized to fully contain the widest line so contrast holds

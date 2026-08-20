@@ -8,6 +8,7 @@
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/DemoCommandSource.hpp"
 #include "robot/visual/ManualDriveInput.hpp"
+#include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
@@ -45,7 +46,10 @@ constexpr float kManualWheelSpeed = 1.0F;
 // movement is differential-drive kinematics (VirtualRobotHardware now owns
 // a DifferentialDrive), and this file adds an M-toggled manual wheel
 // override purely for interactively proving turning - see the
-// manualDriveMode block below and docs/technical-decisions.md.
+// manualDriveMode block below and docs/technical-decisions.md. As of
+// Phase 13Q, an A-toggled reactive obstacle-avoidance policy sits between
+// manual and the FSM in drive authority - see the avoidanceEnabled block
+// below.
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -65,6 +69,14 @@ int main()
     robot::RobotController controller(hardware);
     robot::RobotRuntime runtime(compositeSource, stateMachine, controller);
     robot::visual::Renderer3D renderer;
+
+    // Reactive obstacle-avoidance policy (Phase 13Q) - stateless/
+    // deterministic, only ever answers "what wheel speeds does an
+    // avoidance turn use." The decision of *whether* to apply it each
+    // frame lives entirely here in main3d.cpp (see avoidanceEnabled
+    // below) - ReactiveObstacleAvoidance itself has no FSM/sensor
+    // knowledge.
+    robot::visual::ReactiveObstacleAvoidance avoidance;
 
     // Display-only sensor handle (Phase 13O): reads the exact same
     // VirtualWorld state VirtualRobotHardware's own internal sensor does, so
@@ -91,8 +103,7 @@ int main()
     // knowledge this exists; runtime.step() keeps polling FSM events every
     // frame regardless, but while manualDriveMode is true, the arrow-key
     // wheel speeds set below win for physical movement (see
-    // VirtualRobotHardware::setManualWheelSpeeds()/
-    // applyCurrentCommandToDrive()).
+    // VirtualRobotHardware::setManualWheelSpeeds()/driveAuthority()).
     //
     // Arrow keys were chosen over WASD to avoid CAMERA_FREE's WASD
     // panning - but raylib's UpdateCamera() (rcamera.h) ALSO reads
@@ -108,6 +119,16 @@ int main()
     // - the camera holds still, and arrow keys/mouse only ever drive the
     // robot until `M` is pressed again.
     bool manualDriveMode = false;
+
+    // Reactive obstacle-avoidance enable/disable (Phase 13Q) - ON by
+    // default so RobotSimulator3D demonstrates autonomous behavior
+    // immediately; `A` toggles it. When OFF, WaitingForObstacleClear
+    // behaves exactly like Phase 13O/13P: the robot stays stopped until
+    // the obstacle is cleared some other way (e.g. `O`). This flag only
+    // decides whether the policy below is ever engaged - it has no effect
+    // on manual mode, which always takes priority regardless of this
+    // setting (see VirtualRobotHardware::driveAuthority()).
+    bool avoidanceEnabled = true;
 
     while (!WindowShouldClose())
     {
@@ -152,12 +173,38 @@ int main()
             if (!manualDriveMode)
             {
                 // Immediately restore the wheel speeds corresponding to
-                // whatever VirtualDriveCommand RobotController last issued
-                // - see VirtualRobotHardware::clearManualWheelOverride().
+                // whatever drive authority ranks highest once manual ends
+                // - the still-active autonomous-avoidance override if one
+                // is pending, otherwise the latest VirtualDriveCommand -
+                // see VirtualRobotHardware::clearManualWheelOverride().
                 hardware.clearManualWheelOverride();
             }
         }
 
+        if (IsKeyPressed(KEY_A))
+        {
+            // Only toggles whether the policy below is ever engaged; it
+            // never itself starts/stops a turn - see the avoidanceEnabled
+            // declaration above.
+            avoidanceEnabled = !avoidanceEnabled;
+        }
+
+        // Exactly one RobotRuntime::step() per rendered frame - the render
+        // loop itself is the scheduler (see RobotRuntime's own docs). If
+        // VirtualRobotHardware::obstacleDetected() has newly become true,
+        // this is where HardwareEventSource surfaces ObstacleDetected and
+        // RobotController stops the hardware - before update() below ever
+        // runs this frame, so the robot never moves an extra frame past
+        // detection.
+        runtime.step();
+
+        // Determine and apply drive authority (Phase 13Q) - manual first,
+        // autonomous avoidance second, FSM otherwise (see
+        // VirtualRobotHardware::driveAuthority()). This runs AFTER
+        // runtime.step() specifically so the avoidance decision below sees
+        // this frame's up-to-date FSM state (e.g. a WaitingForObstacleClear
+        // transition that just happened this same frame) - see
+        // docs/technical-decisions.md (Phase 13Q, frame order).
         if (manualDriveMode)
         {
             // Recomputed from scratch every frame from currently-held
@@ -174,6 +221,12 @@ int main()
             // silently override X's zero and the robot would resume
             // moving). Combining UP/DOWN with LEFT/RIGHT produces an arc
             // turn; holding only LEFT/RIGHT rotates in place.
+            //
+            // While manual mode is active, any pending autonomous-
+            // avoidance override is deliberately left untouched below (the
+            // policy is simply not evaluated) - it automatically resumes
+            // the instant clearManualWheelOverride() runs above, without
+            // needing to be re-requested.
             const robot::visual::WheelSpeeds manualSpeeds = robot::visual::computeManualWheelSpeeds(
                 IsKeyDown(KEY_UP), IsKeyDown(KEY_DOWN), IsKeyDown(KEY_LEFT), IsKeyDown(KEY_RIGHT), IsKeyDown(KEY_X),
                 kManualWheelSpeed);
@@ -184,15 +237,34 @@ int main()
             // presented as if it came from the FSM.
             hardware.setManualWheelSpeeds(manualSpeeds.left, manualSpeeds.right);
         }
+        else
+        {
+            // Simple V1 reactive-avoidance policy (Phase 13Q, section 7):
+            // engage only while avoidance is enabled, the FSM is actually
+            // WaitingForObstacleClear, and the forward sensor still
+            // reports the obstacle. The moment any of those stops holding
+            // true - including the real ObstacleCleared edge returning the
+            // FSM to Moving above - the override is released and control
+            // falls back to whatever RobotController/the FSM currently
+            // wants. This never calls stateMachine.processEvent()/
+            // handleEvent() or injects ObstacleDetected/ObstacleCleared
+            // itself - HardwareEventSource observes the sensor's real
+            // true -> false edge naturally, once the turn below has
+            // rotated the sensor ray far enough away from the obstacle.
+            const bool shouldAvoidObstacle = avoidanceEnabled &&
+                                              stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
+                                              hardware.obstacleDetected();
 
-        // Exactly one RobotRuntime::step() per rendered frame - the render
-        // loop itself is the scheduler (see RobotRuntime's own docs). If
-        // VirtualRobotHardware::obstacleDetected() has newly become true,
-        // this is where HardwareEventSource surfaces ObstacleDetected and
-        // RobotController stops the hardware - before update() below ever
-        // runs this frame, so the robot never moves an extra frame past
-        // detection.
-        runtime.step();
+            if (shouldAvoidObstacle)
+            {
+                const robot::visual::WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+                hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+            }
+            else if (hardware.autonomousOverrideActive())
+            {
+                hardware.clearAutonomousWheelOverride();
+            }
+        }
 
         if (!worldPaused)
         {
@@ -210,8 +282,9 @@ int main()
         const robot::visual::WheelSpeeds wheelSpeeds = hardware.wheelSpeeds();
         telemetry.leftWheelSpeed = wheelSpeeds.left;
         telemetry.rightWheelSpeed = wheelSpeeds.right;
-        telemetry.driveModeText = hardware.manualOverrideActive() ? "MANUAL" : "FSM";
+        telemetry.driveAuthorityText = robot::visual::toString(hardware.driveAuthority());
         telemetry.collidedLastUpdate = hardware.collidedLastUpdate();
+        telemetry.avoidanceEnabled = avoidanceEnabled;
 
         // Camera updates (mouse-look and CAMERA_FREE's own arrow-key
         // pitch/yaw) are suppressed while manual drive mode is active -

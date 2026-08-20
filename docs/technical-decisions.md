@@ -1853,6 +1853,222 @@ operation, which is exactly why
 `FullClosedLoopObstacleDetectionAndClearThroughRealEventChain` (unchanged)
 still passes.
 
+## Phase 13Q: reactive obstacle avoidance
+
+Closes the gap Phase 13N's original section (and Phase 13P's README text)
+both explicitly left open: "autonomous obstacle avoidance/steering is not
+implemented." `RobotSimulator3D` now turns itself away from an obstacle
+and continues, entirely through the real event chain, with zero new FSM
+states or transitions.
+
+**This is REACTIVE avoidance, not navigation.** Explicitly not
+pathfinding, not A*, not waypoint planning, not SLAM/mapping. The entire
+V1 policy is "turn in place until the forward sensor clears, then
+continue" - it may permanently change the robot's heading with no attempt
+to return to its original trajectory. Goal-directed recovery/path planning
+is out of scope for this phase.
+
+### Control authority: three sources, one fixed priority
+
+Before this phase, only two things could ever want the wheels (FSM/
+`RobotController` and Phase 13P's manual override). This phase adds a
+third: autonomous avoidance. Rather than scattered ad-hoc `if` statements
+picking a winner in different places, `VirtualRobotHardware` now exposes
+one explicit, testable concept:
+
+```cpp
+enum class DriveAuthority { Fsm, AutonomousAvoidance, Manual };
+```
+
+with a single fixed priority, `Manual > AutonomousAvoidance > Fsm`,
+implemented in exactly one place - a private `applyEffectiveWheelSpeeds()`
+that every wheel-affecting entry point (`moveForward()`/`stop()`/
+`returnToBase()`, `setManualWheelSpeeds()`/`clearManualWheelOverride()`,
+`setAutonomousWheelSpeeds()`/`clearAutonomousWheelOverride()`) funnels
+through:
+
+```cpp
+void VirtualRobotHardware::applyEffectiveWheelSpeeds() noexcept
+{
+    WheelSpeeds speeds;
+    if (manualOverrideActive_)          speeds = manualSpeeds_;
+    else if (autonomousOverrideActive_) speeds = autonomousSpeeds_;
+    else                                speeds = wheelSpeedsForCommand(command_);
+    drive_.setWheelSpeeds(speeds.left, speeds.right);
+}
+```
+
+**Three deliberately distinct concepts, tested and documented as such**
+(the brief's section 16 called out exactly this naming risk):
+
+| Getter | Answers |
+|---|---|
+| `currentCommand()` | What `RobotController`/the FSM *wants* (unchanged Phase 13N concept) |
+| `driveAuthority()` | Who currently owns the physical wheels right now |
+| `wheelSpeeds()` | What `DifferentialDrive` is actually executing |
+
+This is why, mid-avoidance-turn, the HUD routinely shows `Command:
+Stopped` (`RobotController` still wants the robot stopped - Phase 13O's
+`WaitingForObstacleClear -> stop()` mapping is completely unmodified)
+next to `Drive authority: AUTONOMOUS` with opposite-sign wheel speeds -
+proof that the visual autonomous-locomotion layer, not the FSM, is
+temporarily driving the wheels, exactly as the brief's section 15
+required. Both overrides are tracked independently
+(`manualOverrideActive_`/`manualSpeeds_`,
+`autonomousOverrideActive_`/`autonomousSpeeds_`) and never destroyed by an
+unrelated actor: an FSM command arriving while an override is active still
+updates `command_`/`currentCommand()`, but `applyEffectiveWheelSpeeds()`
+only lets it reach the physical wheels once neither override is active.
+Clearing manual falls through to autonomous if one is still pending,
+otherwise to the FSM command; clearing autonomous falls through to the FSM
+command only if manual is not active (manual still wins either way) -
+proven directly by `ClearingManualRestoresAutonomous`/
+`ClearingAutonomousRestoresFsm`/`ManualStillWinsAfterFsmCommandChanges`/
+`ClearingAllOverridesRestoresLatestFsmCommand`.
+
+**A pending avoidance request is never lost while manual is active.**
+`main3d.cpp` simply does not evaluate the avoidance policy at all while
+`manualDriveMode` is true - it neither sets nor clears the autonomous
+override during that time. So if avoidance was active when `M` was
+pressed, `autonomousOverrideActive_`/`autonomousSpeeds_` sit untouched
+underneath the (higher-priority) manual override; the moment
+`clearManualWheelOverride()` runs (on `M` again),
+`applyEffectiveWheelSpeeds()` immediately falls through to the still-valid
+autonomous speeds - no extra frame of delay, no re-request needed. See
+`ManualPriorityIntegrationAcrossAvoidanceAndFsm`.
+
+### `ReactiveObstacleAvoidance`: what, not when
+
+```text
+robot_visual_simulation
+    VirtualRobotHardware               (extended: DriveAuthority model)
+    VirtualDistanceSensor              (unchanged, Phase 13O)
+    DifferentialDrive                  (unchanged, Phase 13P)
+    RobotCollision                     (unchanged, Phase 13P)
+    ManualDriveInput                   (unchanged, Phase 13P)
+    ReactiveObstacleAvoidance          (new, Phase 13Q - raylib-free, headless, stateless)
+```
+
+`ReactiveObstacleAvoidance::avoidanceWheelSpeeds()` always returns the same
+fixed pair, `{-kTurnWheelSpeed, +kTurnWheelSpeed}` with
+`kTurnWheelSpeed = 0.6F` (deliberately smaller than
+`VirtualRobotHardware::kForwardWheelSpeed` = `1.0F`, so a turn reads as a
+distinct maneuver) - it has no FSM, `Event`, `IRobotHardware`,
+`VirtualDistanceSensor`, or `VirtualWorld` knowledge whatsoever, exactly
+like `ManualDriveInput`'s decision function stays separate from
+`main3d.cpp`'s raylib polling. The *when* - avoidance enabled, FSM state is
+`WaitingForObstacleClear`, sensor still reports detected - lives entirely
+in `main3d.cpp`, never inside this class:
+
+```cpp
+const bool shouldAvoidObstacle = avoidanceEnabled &&
+    stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
+    hardware.obstacleDetected();
+
+if (shouldAvoidObstacle)
+{
+    const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+    hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+}
+else if (hardware.autonomousOverrideActive())
+{
+    hardware.clearAutonomousWheelOverride();
+}
+```
+
+**Turn direction is deterministic, verified against the real
+`DifferentialDrive` convention, not assumed.**
+`left = -kTurnWheelSpeed, right = +kTurnWheelSpeed` gives
+`omega = (vRight - vLeft) / wheelTrack > 0`, which - per
+`DifferentialDriveTests.cpp`'s own `TurningDirectionMatchesConvention` -
+increases `headingDegrees` (rotates the front marker from +Z toward +X,
+this project's one heading convention). V1 always turns this one
+direction; no obstacle-side clearance probing, no randomness, per the
+brief's explicit preference for simplicity over cleverness in this phase.
+
+### Frame order: authority decided *after* `runtime.step()`
+
+```text
+1. input: TAB/F11/SPACE/O/M/A (single-press toggles only)
+2. runtime.step()                                    <- exactly once
+3. determine + apply drive authority (manual, else avoidance, else Fsm)
+4. hardware.update(dt), unless SPACE-paused
+5. telemetry
+6. render
+```
+
+Step 3 must run *after* step 2, not before (unlike Phase 13P's manual-only
+version, where the ordering didn't matter): the avoidance decision reads
+`stateMachine.currentState()`, and that state can change *this same
+frame* inside `runtime.step()` - a robot approaching the obstacle can
+enter `WaitingForObstacleClear` and start turning within the very same
+frame, with no extra frame of lag (matching the brief's section 10: "Frame
+N: FSM enters WaitingForObstacleClear, avoidance override starts, robot
+rotates"). Symmetrically, the instant `HardwareEventSource` observes the
+sensor's real `true -> false` edge and the FSM returns to `Moving` inside
+some later frame's `runtime.step()`, that same frame's step 3 immediately
+clears the autonomous override (since `shouldAvoidObstacle` is now false)
+*before* step 4 moves the robot - so there is no frame where a stale
+avoidance turn and the new `Moving` state coexist in the committed pose.
+
+**`SPACE` pause semantics are unchanged and orthogonal to authority.**
+Pausing only skips step 4 (`hardware.update()`); steps 2-3 (event
+polling, drive-authority determination) keep running exactly as before.
+So wheel telemetry can legitimately show avoidance's opposite-sign speeds
+while paused - it faithfully reflects who currently has authority - but
+the pose genuinely does not change until unpaused.
+
+### Autonomous turning still goes through the Phase 13P collision guard
+
+`setAutonomousWheelSpeeds()` never bypasses `VirtualRobotHardware::update()`'s
+existing collision check - avoidance wheel speeds flow through the exact
+same `DifferentialDrive -> proposed pose -> RobotCollision -> commit/reject`
+path manual driving does. Because the collision footprint is a circle
+(rotation-independent), pure in-place avoidance turning is never blocked
+by it - proven directly by extending the existing
+`InPlaceRotationDoesNotTranslateIntoObstacle`-style reasoning to the
+avoidance path in the closed-loop integration test below.
+
+**Real limitation discovered while writing the closed-loop test (not a
+bug - documented, expected V1 behavior):** this policy only turns enough
+to clear the forward *sensor's* detection threshold
+(`VirtualDistanceSensor::kDetectionDistance`, 1.0 world units from the
+sensor origin) - it has no notion of the *collision guard's* tighter
+circular radius (0.5 world units from the robot's center) and does not
+attempt to guarantee unlimited onward travel is safe once it stops
+turning. For this project's specific demo obstacle geometry, resuming
+`MoveForward` immediately after one avoidance turn clears the sensor can
+still run the robot's collision circle back into the very same obstacle
+from its new heading within a few frames, at which point the collision
+guard (not the FSM/sensor) is what actually caps further progress in that
+direction - the robot does not re-enter `WaitingForObstacleClear` in this
+case, since the *sensor* genuinely does not redetect (only the tighter
+collision circle does). This is why
+`FullAutonomousObstacleAvoidanceClosedLoopThroughRealEventChain` asserts
+only that *some* genuine forward progress happens after the override
+releases, not that the robot travels arbitrarily far - composing two
+independently-reasonable, independently-tested safety margins (a
+1.0-unit sensor threshold and a 0.5-unit collision radius) does not
+automatically guarantee they agree on "clear enough to keep going" for
+every possible obstacle geometry and turn angle. A future phase could
+close this gap (e.g. by turning until *both* the sensor and a forward
+collision projection are clear), but doing so is deliberately out of
+scope here - V1's brief is explicit that this is reactive avoidance, not
+optimal/complete avoidance.
+
+### What was NOT touched
+
+No new `RobotState` values, no new FSM transitions, no `TurnLeft`/
+`TurnRight` (or any other) addition to `IRobotHardware`, no change to
+`RobotController`'s `RobotState -> IRobotHardware` mapping, no change to
+`HardwareEventSource`'s edge-trigger semantics or safety-priority
+ordering, no change to `CompositePollingEventSource`'s command-before-
+sensor priority. `stateMachine.processEvent()`/`handleEvent()` is never
+called from any Phase 13Q code, and `ObstacleDetected`/`ObstacleCleared`
+are never constructed/injected directly - both still only ever come from
+`HardwareEventSource` reading `VirtualRobotHardware`'s real sensor state,
+exactly as in Phase 13O.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe
