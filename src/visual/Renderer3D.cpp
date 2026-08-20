@@ -161,6 +161,19 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     std::snprintf(obstacleDetectedLine, sizeof(obstacleDetectedLine), "Obstacle detected: %s",
                    telemetry.obstacleDetected ? "YES" : "NO");
 
+    char leftWheelLine[64];
+    std::snprintf(leftWheelLine, sizeof(leftWheelLine), "Left wheel:  %.2f", telemetry.leftWheelSpeed);
+
+    char rightWheelLine[64];
+    std::snprintf(rightWheelLine, sizeof(rightWheelLine), "Right wheel: %.2f", telemetry.rightWheelSpeed);
+
+    char driveModeLine[64];
+    std::snprintf(driveModeLine, sizeof(driveModeLine), "Drive mode: %.*s",
+                   static_cast<int>(telemetry.driveModeText.size()), telemetry.driveModeText.data());
+
+    char collisionLine[64];
+    std::snprintf(collisionLine, sizeof(collisionLine), "Collision: %s", telemetry.collidedLastUpdate ? "YES" : "NO");
+
     // A small table of {text, fontSize, color} rather than hand-tracked Y
     // offsets per line - adding/removing a HUD line only ever touches this
     // array, and panel sizing/text drawing below stay generic.
@@ -173,8 +186,13 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {obstaclesLine, 18, kHudTextColor},
         {obstacleDistanceLine, 18, kHudTextColor},
         {obstacleDetectedLine, 18, kHudTextColor},
+        {leftWheelLine, 18, kHudTextColor},
+        {rightWheelLine, 18, kHudTextColor},
+        {driveModeLine, 18, kHudTextColor},
+        {collisionLine, 18, kHudTextColor},
         {"TAB: capture/release mouse   F11: fullscreen/windowed   SPACE: pause   O: toggle obstacle   Mouse/WASD: camera",
          16, kHudControlsColor},
+        {"M: manual drive mode   Arrows: manual forward/reverse/turn   X: stop manual wheels", 16, kHudControlsColor},
     };
 
     // Panel sized to fully contain the widest line so contrast holds

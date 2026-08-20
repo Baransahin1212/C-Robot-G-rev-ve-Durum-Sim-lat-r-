@@ -423,10 +423,23 @@ target_link_libraries(robot_visual PUBLIC
 # boundaries. robot_visual and robot_visual_simulation are sibling targets
 # under RobotSimulator3D, neither depending on the other - only
 # raylib-drawing code needs raylib, and only FSM-driving code needs the
-# robot core/runtime stack.
+# robot core/runtime stack. DifferentialDrive (Phase 13P) is the raylib-free
+# kinematic model VirtualRobotHardware now delegates movement to - it lives
+# here rather than robot_visual_world since it has no VirtualWorld
+# mutation/query behavior of its own, only RobotPose in/out. RobotCollision
+# (Phase 13P) is the raylib-free circle-vs-AABB obstacle collision query
+# VirtualRobotHardware::update() validates a proposed pose against before
+# committing it - a read-only query over VirtualWorld's existing obstacle
+# data, exactly like VirtualDistanceSensor. ManualDriveInput (Phase 13P) is
+# the pure X/UP/DOWN/LEFT/RIGHT -> WheelSpeeds decision function behind
+# RobotSimulator3D's manual drive mode, kept here so it is unit-testable
+# without raylib even though its only caller is main3d.cpp.
 add_library(robot_visual_simulation STATIC
     src/visual/VirtualRobotHardware.cpp
     src/visual/VirtualDistanceSensor.cpp
+    src/visual/DifferentialDrive.cpp
+    src/visual/RobotCollision.cpp
+    src/visual/ManualDriveInput.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -824,6 +837,54 @@ target_link_libraries(VirtualDistanceSensorTests PRIVATE
 
 gtest_discover_tests(VirtualDistanceSensorTests)
 
+# --- DifferentialDriveTests: differential-drive kinematics (Phase 13P) -
+# wheel-speed commands, straight/backward/in-place/arc motion, the heading
+# convention, delta-time scaling, and heading wraparound. Links only
+# robot_visual_simulation - never robot_visual/raylib - genuinely headless,
+# no window is ever created by this target.
+add_executable(DifferentialDriveTests
+    tests/visual/DifferentialDriveTests.cpp
+)
+
+target_link_libraries(DifferentialDriveTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(DifferentialDriveTests)
+
+# --- RobotCollisionTests: circle-vs-AABB obstacle collision query (Phase
+# 13P) - enabled/disabled obstacles, side/far obstacles, and toggling.
+# Links only robot_visual_simulation - never robot_visual/raylib -
+# genuinely headless, no window is ever created by this target.
+add_executable(RobotCollisionTests
+    tests/visual/RobotCollisionTests.cpp
+)
+
+target_link_libraries(RobotCollisionTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(RobotCollisionTests)
+
+# --- ManualDriveInputTests: pure X/UP/DOWN/LEFT/RIGHT wheel-speed decision
+# logic behind RobotSimulator3D's manual drive mode (Phase 13P) - X's
+# highest priority, additive directional keys, opposite-key cancellation.
+# No raylib keyboard state is faked; this tests the plain-boolean decision
+# function main3d.cpp calls with real IsKeyDown() results. Links only
+# robot_visual_simulation - never robot_visual/raylib.
+add_executable(ManualDriveInputTests
+    tests/visual/ManualDriveInputTests.cpp
+)
+
+target_link_libraries(ManualDriveInputTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(ManualDriveInputTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -842,7 +903,8 @@ if (MSVC)
         CommandScriptTests ScriptedCommandEventSourceTests
         CompositePollingEventSourceTests RealRobotHardwareTests
         SerialRobotTransportTests VirtualWorldTests VirtualRobotHardwareTests
-        VirtualDistanceSensorTests
+        VirtualDistanceSensorTests DifferentialDriveTests
+        RobotCollisionTests ManualDriveInputTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

@@ -30,6 +30,23 @@ struct VisualTelemetry
     std::optional<float> obstacleDistance;
     bool obstacleDetected = false;
     float sensorMaximumRange = 0.0F;
+
+    // Phase 13P: the wheel speeds actually driving movement this frame
+    // (manual override or FSM command, whichever is active - see
+    // VirtualRobotHardware::wheelSpeeds()), plus a display label for which
+    // one currently owns them ("FSM" or "MANUAL" - see
+    // VirtualRobotHardware::manualOverrideActive()). Renderer3D only ever
+    // displays these; it has no wheel-speed/manual-override logic of its
+    // own.
+    float leftWheelSpeed = 0.0F;
+    float rightWheelSpeed = 0.0F;
+    std::string_view driveModeText;
+
+    // Phase 13P: true when VirtualRobotHardware::update() most recently
+    // rejected a proposed position due to obstacle collision (see
+    // RobotCollision.hpp) - debug telemetry only, so the collision guard's
+    // effect is visible in the HUD without needing console spam.
+    bool collidedLastUpdate = false;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,

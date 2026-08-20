@@ -7,6 +7,7 @@
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/DemoCommandSource.hpp"
+#include "robot/visual/ManualDriveInput.hpp"
 #include "robot/visual/Renderer3D.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
@@ -17,6 +18,13 @@ namespace
 constexpr int kWindowWidth = 1280;
 constexpr int kWindowHeight = 720;
 constexpr int kTargetFps = 60;
+
+// Manual-drive-mode wheel speed (Phase 13P) - visual-simulator-only debug
+// control, not related to VirtualRobotHardware's own kForwardWheelSpeed.
+// One shared magnitude for forward/reverse/turn, matching the
+// deterministic UP/DOWN/LEFT/RIGHT behavior table in
+// docs/technical-decisions.md (Phase 13P) exactly.
+constexpr float kManualWheelSpeed = 1.0F;
 } // namespace
 
 // Thin application-lifecycle composition root for the 3D visual simulator:
@@ -33,7 +41,11 @@ constexpr int kTargetFps = 60;
 // 13J), exactly the same composition Application::runLiveSimulation() uses
 // for the CLI's --live mode. main3d never injects ObstacleDetected/
 // ObstacleCleared directly - both only ever come from HardwareEventSource
-// reading VirtualRobotHardware's real sensor state.
+// reading VirtualRobotHardware's real sensor state. As of Phase 13P,
+// movement is differential-drive kinematics (VirtualRobotHardware now owns
+// a DifferentialDrive), and this file adds an M-toggled manual wheel
+// override purely for interactively proving turning - see the
+// manualDriveMode block below and docs/technical-decisions.md.
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -73,6 +85,30 @@ int main()
     // never fakes an FSM transition.
     bool worldPaused = false;
 
+    // Manual drive mode (Phase 13P) - a visual-simulator-only debug
+    // override, entirely local to main3d.cpp. IRobotHardware,
+    // RobotController, RobotRuntime, and RobotStateMachine have no
+    // knowledge this exists; runtime.step() keeps polling FSM events every
+    // frame regardless, but while manualDriveMode is true, the arrow-key
+    // wheel speeds set below win for physical movement (see
+    // VirtualRobotHardware::setManualWheelSpeeds()/
+    // applyCurrentCommandToDrive()).
+    //
+    // Arrow keys were chosen over WASD to avoid CAMERA_FREE's WASD
+    // panning - but raylib's UpdateCamera() (rcamera.h) ALSO reads
+    // KEY_UP/KEY_DOWN/KEY_LEFT/KEY_RIGHT for camera pitch/yaw in every
+    // non-custom/orbital mode, including CAMERA_FREE, on top of its
+    // continuous unbounded mouse-look while the cursor is captured. Left
+    // enabled, every manual-drive keypress (and any stray mouse motion)
+    // would simultaneously rotate the camera view out from under the
+    // robot - the wheel speeds/pose would still be correct (see
+    // DifferentialDriveTests/VirtualRobotHardwareTests), but the robot
+    // could appear not to move at all. So camera updates are suppressed
+    // entirely while manual drive mode is active (see updateCamera below)
+    // - the camera holds still, and arrow keys/mouse only ever drive the
+    // robot until `M` is pressed again.
+    bool manualDriveMode = false;
+
     while (!WindowShouldClose())
     {
         if (IsKeyPressed(KEY_TAB))
@@ -110,6 +146,45 @@ int main()
             world.setObstacleEnabled(robot::visual::VirtualWorld::kBlockingObstacleIndex, !currentlyEnabled);
         }
 
+        if (IsKeyPressed(KEY_M))
+        {
+            manualDriveMode = !manualDriveMode;
+            if (!manualDriveMode)
+            {
+                // Immediately restore the wheel speeds corresponding to
+                // whatever VirtualDriveCommand RobotController last issued
+                // - see VirtualRobotHardware::clearManualWheelOverride().
+                hardware.clearManualWheelOverride();
+            }
+        }
+
+        if (manualDriveMode)
+        {
+            // Recomputed from scratch every frame from currently-held
+            // keys via computeManualWheelSpeeds() (ManualDriveInput.hpp) -
+            // so releasing every key naturally yields zero wheel speeds
+            // with no separate "key up" handling, and a previous manual
+            // command can never remain latched. X uses IsKeyDown() (held,
+            // not just the press edge) and has the highest priority inside
+            // that pure function - it is evaluated first and, while true,
+            // fully overrides every directional key that frame, instead of
+            // only zeroing wheel speeds for the single frame X transitions
+            // down (that one-frame-only behavior was the bug: any
+            // directional key still held on the very next frame would
+            // silently override X's zero and the robot would resume
+            // moving). Combining UP/DOWN with LEFT/RIGHT produces an arc
+            // turn; holding only LEFT/RIGHT rotates in place.
+            const robot::visual::WheelSpeeds manualSpeeds = robot::visual::computeManualWheelSpeeds(
+                IsKeyDown(KEY_UP), IsKeyDown(KEY_DOWN), IsKeyDown(KEY_LEFT), IsKeyDown(KEY_RIGHT), IsKeyDown(KEY_X),
+                kManualWheelSpeed);
+
+            // This is main3d.cpp's manual-drive-mode input feeding
+            // VirtualRobotHardware's visual-only override API - never a
+            // fake RobotController/IRobotHardware call, and never
+            // presented as if it came from the FSM.
+            hardware.setManualWheelSpeeds(manualSpeeds.left, manualSpeeds.right);
+        }
+
         // Exactly one RobotRuntime::step() per rendered frame - the render
         // loop itself is the scheduler (see RobotRuntime's own docs). If
         // VirtualRobotHardware::obstacleDetected() has newly become true,
@@ -132,8 +207,18 @@ int main()
         telemetry.obstacleDistance = sensor.distanceToNearestObstacle();
         telemetry.obstacleDetected = sensor.obstacleDetected();
         telemetry.sensorMaximumRange = robot::visual::VirtualDistanceSensor::kMaximumRange;
+        const robot::visual::WheelSpeeds wheelSpeeds = hardware.wheelSpeeds();
+        telemetry.leftWheelSpeed = wheelSpeeds.left;
+        telemetry.rightWheelSpeed = wheelSpeeds.right;
+        telemetry.driveModeText = hardware.manualOverrideActive() ? "MANUAL" : "FSM";
+        telemetry.collidedLastUpdate = hardware.collidedLastUpdate();
 
-        renderer.renderFrame(world, cameraCaptured, telemetry);
+        // Camera updates (mouse-look and CAMERA_FREE's own arrow-key
+        // pitch/yaw) are suppressed while manual drive mode is active -
+        // see the manualDriveMode comment above. cameraCaptured still
+        // governs cursor capture/release via TAB independently of this.
+        const bool updateCamera = cameraCaptured && !manualDriveMode;
+        renderer.renderFrame(world, updateCamera, telemetry);
     }
 
     CloseWindow();

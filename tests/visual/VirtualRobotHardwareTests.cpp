@@ -25,6 +25,18 @@ using robot::visual::Vec3;
 using robot::visual::VirtualDriveCommand;
 using robot::visual::VirtualRobotHardware;
 using robot::visual::VirtualWorld;
+using robot::visual::WheelSpeeds;
+
+// Disables every default demo obstacle so a test can place/enable exactly
+// one controlled obstacle of its own - same convention
+// VirtualDistanceSensorTests.cpp already uses.
+void disableAllObstacles(VirtualWorld& world)
+{
+    for (std::size_t i = 0; i < world.obstacles().size(); ++i)
+    {
+        world.setObstacleEnabled(i, false);
+    }
+}
 
 } // namespace
 
@@ -487,4 +499,424 @@ TEST(VirtualRobotHardwareTest, RepeatedObstacleDetectedDoesNotSpamEvents)
         EXPECT_EQ(runtime.step(), RuntimeStepResult::NoEvent);
         EXPECT_EQ(stateMachine.currentState(), RobotState::WaitingForObstacleClear);
     }
+}
+
+// --- DifferentialDrive wheel-speed integration (Phase 13P) ---
+//
+// VirtualRobotHardware now maps each IRobotHardware actuator command to
+// wheel speeds on an owned DifferentialDrive instead of computing
+// straight-line movement itself - these tests prove that mapping, the
+// manual override, and that update()'s straight-line speed is unchanged
+// from Phase 13N/13O's ~1.0 world unit/second.
+
+// 19: MoveForwardSetsEqualPositiveWheelSpeeds
+TEST(VirtualRobotHardwareTest, MoveForwardSetsEqualPositiveWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+
+    // Act
+    hardware.moveForward();
+
+    // Assert
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_GT(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// 20: StopSetsZeroWheelSpeeds
+TEST(VirtualRobotHardwareTest, StopSetsZeroWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+
+    // Act
+    hardware.stop();
+
+    // Assert
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.0F);
+}
+
+// 21: ReturnToBaseLeavesBothWheelSpeedsZero
+TEST(VirtualRobotHardwareTest, ReturnToBaseLeavesBothWheelSpeedsZero)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+
+    // Act
+    hardware.returnToBase();
+
+    // Assert: navigation is not implemented yet - treated the same as
+    // Stopped, zero wheel speeds.
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.0F);
+}
+
+// 22: UpdateDelegatesMovementThroughDifferentialDriveAtApproximatelyOneUnitPerSecond
+TEST(VirtualRobotHardwareTest, UpdateDelegatesMovementThroughDifferentialDriveAtApproximatelyOneUnitPerSecond)
+{
+    // Arrange: default heading 0.0F faces +Z.
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    const float initialZ = world.robotPose().position.z;
+
+    // Act
+    hardware.moveForward();
+    hardware.update(1.0F);
+
+    // Assert: straight movement remains ~1.0 world unit/second, matching
+    // Phase 13N/13O's prior speed exactly - now produced by
+    // DifferentialDrive integrating equal wheel speeds instead of
+    // VirtualRobotHardware's own inlined movement math.
+    EXPECT_NEAR(world.robotPose().position.z, initialZ + 1.0F, 0.01F);
+}
+
+// 23: ManualOverrideCanSetUnequalWheelSpeeds
+TEST(VirtualRobotHardwareTest, ManualOverrideCanSetUnequalWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward(); // FSM command in effect before the override.
+
+    // Act
+    hardware.setManualWheelSpeeds(-0.5F, 0.5F);
+
+    // Assert: manual values win over the FSM command's mapped speeds.
+    EXPECT_TRUE(hardware.manualOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.5F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.5F);
+}
+
+// 24: ManualOverrideTurningChangesHeading
+TEST(VirtualRobotHardwareTest, ManualOverrideTurningChangesHeading)
+{
+    // Arrange
+    VirtualWorld world;
+    const float initialHeading = world.robotPose().headingDegrees;
+    VirtualRobotHardware hardware(world);
+
+    // Act: in-place rotation via manual override.
+    hardware.setManualWheelSpeeds(-0.5F, 0.5F);
+    hardware.update(1.0F);
+
+    // Assert
+    EXPECT_NE(world.robotPose().headingDegrees, initialHeading);
+}
+
+// 25: ClearingManualOverrideRestoresLatestFsmMoveForwardCommand
+TEST(VirtualRobotHardwareTest, ClearingManualOverrideRestoresLatestFsmMoveForwardCommand)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+    hardware.setManualWheelSpeeds(0.0F, 0.0F);
+    ASSERT_TRUE(hardware.manualOverrideActive());
+
+    // Act
+    hardware.clearManualWheelOverride();
+
+    // Assert: restores MoveForward's equal positive wheel speeds, not
+    // whatever the override last held.
+    EXPECT_FALSE(hardware.manualOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_GT(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// 26: ClearingManualOverrideRestoresLatestFsmStoppedCommand
+TEST(VirtualRobotHardwareTest, ClearingManualOverrideRestoresLatestFsmStoppedCommand)
+{
+    // Arrange: default command is Stopped.
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(0.5F, -0.5F);
+    ASSERT_TRUE(hardware.manualOverrideActive());
+
+    // Act
+    hardware.clearManualWheelOverride();
+
+    // Assert
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.0F);
+}
+
+// 27: FsmCommandsWhileManualOverrideActiveDoNotChangePhysicalWheelSpeeds
+TEST(VirtualRobotHardwareTest, FsmCommandsWhileManualOverrideActiveDoNotChangePhysicalWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(0.2F, 0.8F);
+
+    // Act: RobotController-style calls continue to arrive while the
+    // override is active.
+    hardware.moveForward();
+    hardware.stop();
+
+    // Assert: currentCommand() reflects the latest FSM call (for restore-
+    // on-clear and HUD), but physical wheel speeds are still the manual
+    // override's values.
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.2F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 28: StoppedByObstacleResultsInZeroWheelSpeeds
+//
+// Extends FullClosedLoopObstacleDetectionAndClearThroughRealEventChain
+// above with an explicit wheelSpeeds() assertion at the moment
+// RobotController::stop() fires from real obstacle detection.
+TEST(VirtualRobotHardwareTest, StoppedByObstacleResultsInZeroWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    CompositePollingEventSource compositeSource(commandSource, hardwareEventSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+
+    // Act: same sequence as the full closed-loop regression test - reach
+    // Moving, advance close enough to trip the sensor.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::MoveForward);
+    WheelSpeeds movingSpeeds = hardware.wheelSpeeds();
+    EXPECT_GT(movingSpeeds.left, 0.0F);
+    hardware.update(1.0F);
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::NoEvent);
+    hardware.update(1.0F);
+
+    // Assert: ObstacleDetected fires, RobotController stops the hardware,
+    // and both wheel speeds are exactly zero.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted);
+    ASSERT_EQ(stateMachine.currentState(), RobotState::WaitingForObstacleClear);
+    const WheelSpeeds stoppedSpeeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(stoppedSpeeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(stoppedSpeeds.right, 0.0F);
+}
+
+// 29: SettingManualWheelSpeedsToZeroStopsFurtherMovement
+//
+// Real-testing regression (X-stop bug): confirms setManualWheelSpeeds(0,0)
+// itself - independent of any keyboard-input decision logic - actually
+// halts further movement, and that no previous manual command remains
+// latched once zero is set.
+TEST(VirtualRobotHardwareTest, SettingManualWheelSpeedsToZeroStopsFurtherMovement)
+{
+    // Arrange: moving under manual control.
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    hardware.update(1.0F);
+    const float zAfterMoving = world.robotPose().position.z;
+
+    // Act
+    hardware.setManualWheelSpeeds(0.0F, 0.0F);
+    hardware.update(1.0F);
+    hardware.update(1.0F);
+
+    // Assert: no further movement, and wheelSpeeds() reads back exactly
+    // zero, not a leftover nonzero value.
+    EXPECT_FLOAT_EQ(world.robotPose().position.z, zAfterMoving);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.0F);
+}
+
+// --- Obstacle collision guard (Phase 13P) ---
+//
+// VirtualRobotHardware::update() now validates a DifferentialDrive-
+// proposed pose against RobotCollision.hpp's circle-vs-AABB obstacle query
+// before committing it to VirtualWorld - these tests drive that through
+// the real update()/VirtualWorld stack (RobotCollisionTests.cpp covers the
+// underlying geometry query in isolation). All obstacles are heading
+// straight along the default heading-0 (+Z) direction, with the one
+// controlled obstacle at X 0 so the robot's collision circle is centered
+// exactly on its footprint.
+
+// 30: ManualForwardDriveStopsAtObstacleBoundary
+TEST(VirtualRobotHardwareTest, ManualForwardDriveStopsAtObstacleBoundary)
+{
+    // Arrange: obstacle (0.8 cube) centered at Z 3.0 -> near face Z 2.6.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 3.0F});
+    world.setObstacleEnabled(0, true);
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+
+    // Act: drive forward in small steps for far longer than needed to
+    // reach the obstacle if collision were not enforced.
+    for (int i = 0; i < 200; ++i)
+    {
+        hardware.update(0.05F);
+    }
+
+    // Assert: made real progress, but never entered the obstacle (near
+    // face 2.6 minus collision radius ~0.5 -> boundary near Z 2.1).
+    const float finalZ = world.robotPose().position.z;
+    EXPECT_GT(finalZ, 1.0F);
+    EXPECT_LT(finalZ, 2.15F);
+}
+
+// 31: ManualReverseAwayFromObstacleWorks
+TEST(VirtualRobotHardwareTest, ManualReverseAwayFromObstacleWorks)
+{
+    // Arrange: drive up to the obstacle boundary first (same setup as
+    // ManualForwardDriveStopsAtObstacleBoundary).
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 3.0F});
+    world.setObstacleEnabled(0, true);
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    for (int i = 0; i < 200; ++i)
+    {
+        hardware.update(0.05F);
+    }
+    const float zAtBoundary = world.robotPose().position.z;
+
+    // Act: reverse.
+    hardware.setManualWheelSpeeds(-1.0F, -1.0F);
+    for (int i = 0; i < 20; ++i)
+    {
+        hardware.update(0.05F);
+    }
+
+    // Assert: moved back away from the obstacle - reverse is never
+    // blocked by a collision guard that only ever rejects entering an
+    // obstacle.
+    EXPECT_LT(world.robotPose().position.z, zAtBoundary);
+}
+
+// 32: InPlaceRotationDoesNotTranslateIntoObstacle
+TEST(VirtualRobotHardwareTest, InPlaceRotationDoesNotTranslateIntoObstacle)
+{
+    // Arrange: drive up to the obstacle boundary first.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 3.0F});
+    world.setObstacleEnabled(0, true);
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    for (int i = 0; i < 200; ++i)
+    {
+        hardware.update(0.05F);
+    }
+    const float zAtBoundary = world.robotPose().position.z;
+    const float headingBefore = world.robotPose().headingDegrees;
+
+    // Act: in-place rotation right at the boundary.
+    hardware.setManualWheelSpeeds(-0.5F, 0.5F);
+    for (int i = 0; i < 20; ++i)
+    {
+        hardware.update(0.05F);
+    }
+
+    // Assert: position essentially unchanged (a circular footprint is
+    // rotation-independent, so it is never blocked), heading did change.
+    EXPECT_NEAR(world.robotPose().position.z, zAtBoundary, 0.01F);
+    EXPECT_NE(world.robotPose().headingDegrees, headingBefore);
+}
+
+// 33: DisabledObstacleDoesNotBlockMovement
+TEST(VirtualRobotHardwareTest, DisabledObstacleDoesNotBlockManualMovement)
+{
+    // Arrange: same obstacle geometry as the boundary tests, left
+    // disabled the whole time.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 3.0F});
+    // Deliberately left disabled (disableAllObstacles() above).
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+
+    // Act
+    for (int i = 0; i < 200; ++i)
+    {
+        hardware.update(0.05F);
+    }
+
+    // Assert: drove straight through where an enabled obstacle would have
+    // stopped it (~Z 2.1).
+    EXPECT_GT(world.robotPose().position.z, 4.0F);
+}
+
+// 34: ReEnabledObstacleBlocksMovement
+TEST(VirtualRobotHardwareTest, ReEnabledObstacleBlocksMovement)
+{
+    // Arrange: obstacle disabled - robot drives all the way through it and
+    // out the far side (near face 2.6, far face 3.4).
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 3.0F});
+    world.setObstacleEnabled(0, false);
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    for (int i = 0; i < 160; ++i)
+    {
+        hardware.update(0.05F);
+    }
+    ASSERT_GT(world.robotPose().position.z, 4.0F);
+
+    // Act: re-enable, then reverse back toward the obstacle from the far
+    // side.
+    world.setObstacleEnabled(0, true);
+    hardware.setManualWheelSpeeds(-1.0F, -1.0F);
+    for (int i = 0; i < 160; ++i)
+    {
+        hardware.update(0.05F);
+    }
+
+    // Assert: blocked at the (now re-enabled) far face - never re-enters
+    // the obstacle from this side either.
+    EXPECT_GT(world.robotPose().position.z, 3.4F);
+}
+
+// 35: WorldBoundsStillApplyWithCollisionGuardPresent
+TEST(VirtualRobotHardwareTest, WorldBoundsStillApplyWithCollisionGuardPresent)
+{
+    // Arrange: no obstacles in the way - only the world-bounds clamp
+    // should limit movement.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+
+    // Act: far more simulated time than needed to reach the ~10-unit
+    // world half-extent at 1.0 unit/second.
+    for (int i = 0; i < 100; ++i)
+    {
+        hardware.update(1.0F);
+    }
+
+    // Assert: clamped, not teleported off into infinity, and not stuck
+    // short of the bound by a false collision.
+    EXPECT_LE(world.robotPose().position.z, 10.0F);
+    EXPECT_GE(world.robotPose().position.z, 9.0F);
 }

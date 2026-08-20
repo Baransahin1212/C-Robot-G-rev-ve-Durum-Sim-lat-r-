@@ -1614,6 +1614,245 @@ this phase. Differential-drive physics and autonomous steering/pathfinding
 remain out of scope as well; obstacle removal is deliberately manual (`O`)
 for this phase, not any kind of automatic avoidance.
 
+## Phase 13P: differential-drive kinematics
+
+Closes the gap Phase 13N/13O's sections both explicitly left open
+("straight-line motion only... no differential drive"). `VirtualRobotHardware`
+no longer computes `x += forward.x * distance` itself - it delegates to a
+new, raylib-free `DifferentialDrive` model:
+
+```text
+robot_visual_simulation
+    VirtualRobotHardware               (unchanged role, Phase 13N/13O)
+    VirtualDistanceSensor              (unchanged, Phase 13O)
+    DifferentialDrive                  (new, Phase 13P - raylib-free, headless)
+```
+
+**Equations** (standard differential-drive kinematics):
+
+```text
+v     = (vRight + vLeft) / 2        (robot linear velocity, world units/sec)
+omega = (vRight - vLeft) / L        (robot angular velocity, rad/sec; L = wheel track)
+```
+
+using this project's one heading convention throughout (`VisualMath.hpp`'s
+`forwardDirection()`): `headingDegrees` 0 faces +Z, increasing
+`headingDegrees` rotates the front marker from +Z toward +X.
+
+**Exact arc integration, not a discrete Euler step.** For `|omega|` above a
+small epsilon, `DifferentialDrive::update()` uses the closed-form solution
+of `dx/dt = v*sin(theta(t))`, `dz/dt = v*cos(theta(t))`,
+`theta(t) = theta0 + omega*t` over one frame's `deltaSeconds`, rather than
+approximating the curve with straight-line steps. This keeps heading and
+position exactly consistent regardless of how large `deltaSeconds` is (no
+frame-rate-dependent turning-radius error), and it means in-place rotation
+(`v == 0`) produces *exactly* zero position change, not merely
+"approximately unchanged." Below the epsilon, motion falls back to the
+Phase 13N straight-line formula (`dx = sin(theta)*v*dt`,
+`dz = cos(theta)*v*dt`) directly - both formulas agree in the limit, so
+there is no discontinuity at the epsilon boundary. `headingDegrees` is
+normalized into `[0, 360)` after every `update()` call so it never grows or
+shrinks without bound across a long-running session.
+
+**Wheel track is an instance parameter, not a hidden global constant.**
+`DifferentialDrive::kDefaultWheelTrack` is derived from
+`RobotDimensions::kBodyWidth` (`VisualRobot.hpp`) - the same source of
+truth `VisualRobot.cpp` uses to place the wheels - so this phase never
+introduces an independently-guessed geometry constant, following the exact
+precedent `VirtualDistanceSensor.cpp` already set by reusing
+`RobotDimensions::kBodyLength` for its sensor-origin offset. The track is a
+constructor parameter (defaulting to `kDefaultWheelTrack`) rather than a
+`static constexpr`, specifically so `DifferentialDriveTests.cpp` can prove
+"a narrower track turns faster for the same wheel-speed differential"
+without a second class or a global mutable constant.
+
+**`VirtualRobotHardware::update()` no longer branches on `currentCommand()`
+at all.** Previously it early-returned unless the command was
+`MoveForward`; now it unconditionally copies `VirtualWorld`'s pose, runs
+`DifferentialDrive::update()`, clamps the resulting X/Z to the existing
+~10-unit world bounds (unchanged from Phase 13N - `DifferentialDrive`
+itself is deliberately world-bounds-agnostic, it only knows kinematics),
+and writes the result back through `VirtualWorld::setRobotPosition()`/
+`setRobotHeading()`. This is simpler, not just equivalent: `Stopped`/
+`ReturnToBase` naturally produce zero wheel speeds -> zero `v`/`omega` ->
+zero pose change, with no special-casing needed, and it is what lets the
+manual override (below) move the robot even while `currentCommand()` is
+`Stopped`.
+
+**Manual wheel override lives on `VirtualRobotHardware`, not a new
+type.** The phase brief allowed either "fit it into `VirtualRobotHardware`"
+or "a separate visual-only override API if ownership gets awkward" - it
+fit cleanly, following the exact precedent `currentCommand()`/
+`obstacleDistance()` already set (Phase 13N/13O): visual-simulator-only
+getters/setters that sit *beside* the `IRobotHardware` override set, never
+inside it. `setManualWheelSpeeds()`/`clearManualWheelOverride()` are not
+part of `IRobotHardware`, and `moveForward()`/`stop()`/`returnToBase()`
+still always update `currentCommand()` even while an override is active -
+only the *physical* wheel speeds `DifferentialDrive` uses are affected,
+via a private `applyCurrentCommandToDrive()` helper that no-ops while
+`manualOverrideActive_` is true. This is what makes
+`clearManualWheelOverride()`'s "restore the latest FSM command" behavior
+trivial: it just calls the same helper the FSM-facing methods already call.
+
+**`main3d.cpp` owns manual drive mode entirely; `IRobotHardware`,
+`RobotController`, `RobotRuntime`, and `RobotStateMachine` gained zero new
+code.** `M` toggles `manualDriveMode`, a `bool` local to `main()`; while
+true, `UP`/`DOWN`/`LEFT`/`RIGHT`/`X` are read every frame (recomputing
+wheel speeds from scratch, so releasing every key already yields zero -
+`X` is honored anyway for an explicit "stop" per the brief) and fed to
+`VirtualRobotHardware::setManualWheelSpeeds()` - never through
+`RobotController` or any FSM-facing call, and the HUD's "Drive mode" line
+makes it unmistakable when this is active. **Arrow keys, not `WASD`,
+deliberately** - `CAMERA_FREE`'s own keyboard movement is bound to `WASD`
+(`rcamera.h`'s `UpdateCamera()`), so arrow keys sidestep *that* conflict.
+
+**Bug found in real testing, fixed same phase: `UpdateCamera()` also reads
+arrow keys, independently of `WASD`.** The first cut of this phase assumed
+arrow keys were conflict-free and left `renderer.renderFrame()` receiving
+`cameraCaptured` as its `updateCamera` argument unconditionally - so the
+camera kept updating every frame regardless of `manualDriveMode`. Reading
+raylib 6.0's actual vendored `rcamera.h` (not just recalling its API)
+showed `UpdateCamera()` unconditionally calls `CameraPitch()`/`CameraYaw()`
+from `IsKeyDown(KEY_UP/KEY_DOWN/KEY_LEFT/KEY_RIGHT)` in every mode except
+`CAMERA_CUSTOM`/`CAMERA_ORBITAL` - including `CAMERA_FREE` - on top of its
+continuous, unbounded mouse-look while `DisableCursor()` is active (which
+`RobotSimulator3D` enables by default). So every manual-drive arrow-key
+press was simultaneously read by two independent code paths: main3d's own
+`IsKeyDown()` polling (setting the correct wheel speeds - proven correct
+by `DifferentialDriveTests`/`VirtualRobotHardwareTests`, which never
+touch raylib) *and* `UpdateCamera()`'s pitch/yaw, plus any incidental
+mouse movement. The wheel speeds and `VirtualWorld` pose were always
+right; the camera was quietly rotating/drifting at the same time, which
+could make correctly-moving wheels look like nothing was happening. Fix:
+`main3d.cpp` now computes `updateCamera = cameraCaptured &&
+!manualDriveMode` and passes that instead - camera updates (mouse-look
+and arrow-key pitch/yaw alike) are suppressed entirely for as long as
+manual drive mode is active, exactly the "Preferred: do not call
+`UpdateCamera()` with keyboard movement while manual drive is active"
+option this phase's brief already named. This is a rendering/input-layer
+fix only - `DifferentialDrive`, `VirtualRobotHardware`, and every existing
+test were untouched and still pass.
+
+**`RobotRuntime::step()` keeps running unmodified while manual mode is
+on** - obstacle detection, `ObstacleDetected`/`ObstacleCleared`, and
+`WaitingForObstacleClear` all still fire exactly as in Phase 13O. What
+changes is only that `RobotController::stop()`'s call to
+`VirtualRobotHardware::stop()` no longer reaches `DifferentialDrive` while
+an override is active (see above) - so a manually-driven robot is not
+physically halted by the FSM reaching `WaitingForObstacleClear`. This is
+intentional per the brief: manual mode's entire purpose is proving
+kinematics/turning, and it is unmistakably labeled `MANUAL` in the HUD
+whenever it could diverge from normal safety behavior.
+
+**No new FSM states, no turn events, no `IRobotHardware` methods.** Turning
+capability exists only inside `DifferentialDrive`/`VirtualRobotHardware`;
+`RobotController`'s `RobotState -> IRobotHardware` mapping
+(`applyState()`) is byte-for-byte unchanged from Phase 13N. `Moving` still
+means "equal positive wheel speeds" and `WaitingForObstacleClear` still
+means "zero wheel speeds," exactly as before - Phase 13P only changed
+*how* those wheel speeds turn into position/heading.
+
+**Still no autonomous obstacle avoidance.** Nothing steers the robot around
+an obstacle automatically - obstacle removal is still manual (`O`), and
+that scope boundary is unchanged from Phase 13N/13O. Wheel speeds also
+still change instantly on command - no acceleration/inertia/friction model
+exists, matching the brief's explicit "no physics-engine complexity"
+instruction for this phase.
+
+### Real-testing fixes: manual-mode `X` priority and an obstacle-penetration guard
+
+Human manual validation of the above surfaced two further defects, both
+fixed within this same phase (not a new one):
+
+**Bug 1 - `X` did not reliably stop the robot.** `main3d.cpp` originally
+read `X` with `IsKeyPressed()` (the single-frame press edge) and applied it
+*after* computing the directional wheel speeds, zeroing them out only for
+that one frame. On the very next frame, if a directional key was still
+physically held, `IsKeyPressed(KEY_X)` was already false, so that key's
+branch fired again and the robot resumed moving - `X` was a one-frame
+blip, not a real override. Fixed by extracting the whole decision into a
+pure, raylib-free function, `computeManualWheelSpeeds(upHeld, downHeld,
+leftHeld, rightHeld, xHeld, wheelSpeed)`
+(`include/robot/visual/ManualDriveInput.hpp` /
+`src/visual/ManualDriveInput.cpp`): `xHeld` (read via `IsKeyDown()`, i.e.
+held, not just pressed) is checked first and, while true, returns `{0,
+0}` immediately without evaluating any directional argument at all - so a
+previous command can never remain latched, and `X` has unconditional
+highest priority for as long as it is held. `main3d.cpp` now only ever
+calls this function with fresh `IsKeyDown()` results and forwards its
+result straight to `setManualWheelSpeeds()`. Splitting this out of
+`main3d.cpp` also means the decision table (X overrides everything;
+UP/DOWN/LEFT/RIGHT are additive; opposite pairs cancel) is unit-tested
+directly (`ManualDriveInputTests.cpp`) instead of only being provable
+interactively.
+
+**Bug 2 - manual mode could drive the robot through an enabled obstacle.**
+Manual mode intentionally bypasses `RobotController::stop()`'s effect on
+wheel speeds (see above) - by design, so kinematics could be proven even
+while `WaitingForObstacleClear`. But nothing stopped the *position* itself
+from entering an obstacle's geometry, since `VirtualRobotHardware::update()`
+only ever clamped to the world's outer bounds. Fixed with a small,
+deliberately simple, raylib-free collision guard - not a physics engine,
+no bounce/sliding/force response:
+
+```text
+DifferentialDrive
+    computes a proposed RobotPose (world-agnostic, as always)
+        |
+        v
+VirtualRobotHardware::update()
+    clamps proposed X/Z to the existing +-10 world bounds
+        |
+        v
+    validates the clamped proposed position against VirtualWorld's
+    enabled obstacle geometry (RobotCollision.hpp)
+        |
+        v
+    collision -> commit only the proposed heading, keep the previous
+                 position (translation rejected for this frame)
+    no collision -> commit both position and heading
+```
+
+`robotPositionCollidesWithObstacles(position, obstacles)`
+(`include/robot/visual/RobotCollision.hpp` / `src/visual/RobotCollision.cpp`)
+is a circle-vs-AABB test: the robot's collision footprint is a single
+conservative circle, `kRobotCollisionRadius = sqrt((kBodyWidth/2)^2 +
+(kBodyLength/2)^2)` (0.5 world units for this robot, derived from
+`RobotDimensions` - never hand-duplicated), which fully encloses the
+rectangular body regardless of heading - so the test is entirely
+rotation-independent and needs no orientation information. For each
+enabled obstacle, `closestX/Z = clamp(robotX/Z, min, max)` finds the
+nearest point on its AABB, and `dx^2 + dz^2 < radius^2` (with a `1e-4`
+epsilon added to the radius, so the boundary is deterministic rather than
+occasionally flickering at exact floating-point tangency) decides
+collision. Disabled obstacles never collide - re-enabling one makes it
+collide again immediately, with no special-casing needed. This lives in
+`robot_visual_simulation` as a small dedicated helper (matching
+`VirtualDistanceSensor`'s precedent) rather than as a `VirtualWorld`
+member, so `VirtualWorld` itself needed zero changes; `DifferentialDrive`
+still has no obstacle/collision knowledge whatsoever.
+
+**Why only the position is rejected, not the whole pose.** The collision
+footprint is a circle, so it does not depend on heading - a position that
+was not colliding before a pure in-place rotation is still not colliding
+after it (the proposed position is identical to the previous one, since
+`v == 0`). Committing the heading unconditionally means turning at an
+obstacle boundary is never blocked by this guard, only forward/backward
+translation into the obstacle is - confirmed by
+`InPlaceRotationDoesNotTranslateIntoObstacle`.
+
+**This guard is a last-resort physical safety net, not a replacement for
+Phase 13O's sensor.** In normal (non-manual) FSM mode,
+`VirtualDistanceSensor`/`HardwareEventSource` are completely unmodified and
+still what actually halts the robot - at `kDetectionDistance` (1.0 world
+units from the front sensor origin), which puts the obstacle face roughly
+1.4 units from the robot's center, well outside the 0.5-unit collision
+radius. The collision guard exists specifically for manual mode, where the
+sensor's stop is deliberately bypassed; it never engages during normal FSM
+operation, which is exactly why
+`FullClosedLoopObstacleDetectionAndClearThroughRealEventChain` (unchanged)
+still passes.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe
