@@ -48,6 +48,13 @@ constexpr Color kSensorRayDetectedColor = RED;
 constexpr Color kSensorRayHitColor = Color{255, 180, 0, 255};
 constexpr Color kSensorRayClearColor = LIME;
 
+// Home navigation target-direction guide (Phase 13T) - a simple ground-
+// level line from the robot toward the base while HomeNavigator is
+// actively steering (Aligning/Driving), distinct from every obstacle-
+// sensor ray color above so it reads unambiguously as "where the robot
+// is heading," not a sensor reading.
+constexpr Color kHomeGuideColor = Color{80, 220, 220, 255};
+
 // HUD readability panel: a semi-transparent dark rectangle behind the
 // top-left text so it stays legible against any part of the scene behind
 // it, regardless of the ground/sky color at that point.
@@ -158,6 +165,17 @@ void Renderer3D::drawScene(const VirtualWorld& world, const VisualTelemetry& tel
     drawObstacleRay(telemetry.sensorOrigin, telemetry.obstacleDistance, telemetry.obstacleDetected);
     drawObstacleRay(telemetry.obstacleRayRightOrigin, telemetry.obstacleRayRightDistance,
                      telemetry.obstacleRayRightDetected);
+
+    // Home navigation target-direction guide (Phase 13T) - purely a
+    // visualization of main3d.cpp's already-computed
+    // homeNavigationGuideVisible flag; this class never decides whether
+    // navigation is active.
+    if (telemetry.homeNavigationGuideVisible)
+    {
+        Vector3 guideEnd = toRaylibVector3(world.basePlatform().position);
+        guideEnd.y = world.robotPose().position.y;
+        DrawLine3D(toRaylibVector3(world.robotPose().position), guideEnd, kHomeGuideColor);
+    }
 }
 
 void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const
@@ -282,6 +300,26 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     char collisionLine[64];
     std::snprintf(collisionLine, sizeof(collisionLine), "Collision: %s", telemetry.collidedLastUpdate ? "YES" : "NO");
 
+    char returnReasonLine[64];
+    std::snprintf(returnReasonLine, sizeof(returnReasonLine), "Return reason: %.*s",
+                   static_cast<int>(telemetry.returnHomeReasonText.size()), telemetry.returnHomeReasonText.data());
+
+    char homeNavStateLine[80];
+    std::snprintf(homeNavStateLine, sizeof(homeNavStateLine), "Home nav: %.*s",
+                   static_cast<int>(telemetry.homeNavigationStateText.size()), telemetry.homeNavigationStateText.data());
+
+    char homeNavDistanceLine[64];
+    std::snprintf(homeNavDistanceLine, sizeof(homeNavDistanceLine), "Home distance: %.2f",
+                   telemetry.homeNavigationDistance);
+
+    char homeNavTargetHeadingLine[64];
+    std::snprintf(homeNavTargetHeadingLine, sizeof(homeNavTargetHeadingLine), "Home target heading: %.1f",
+                   telemetry.homeNavigationTargetHeadingDegrees);
+
+    char homeNavHeadingErrorLine[64];
+    std::snprintf(homeNavHeadingErrorLine, sizeof(homeNavHeadingErrorLine), "Home heading error: %.1f",
+                   telemetry.homeNavigationHeadingErrorDegrees);
+
     // --- Compact-mode lines (UX polish) ---
     //
     // A small, high-value operational subset - never hides an active
@@ -330,6 +368,23 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         std::snprintf(compactEdgeLine, sizeof(compactEdgeLine), "Edge: SAFE");
     }
 
+    // Phase 13T: one concise Home nav line - "-" while Inactive (the
+    // common case outside a Return Home mission), otherwise state plus
+    // remaining distance. Compact mode never expands into an engineering
+    // panel - no target heading/heading error here (see fullLines below
+    // for those).
+    char compactHomeLine[32];
+    if (telemetry.homeNavigationStateText == "Inactive")
+    {
+        std::snprintf(compactHomeLine, sizeof(compactHomeLine), "Home: -");
+    }
+    else
+    {
+        std::snprintf(compactHomeLine, sizeof(compactHomeLine), "Home: %.*s %.1fm",
+                       static_cast<int>(telemetry.homeNavigationStateText.size()),
+                       telemetry.homeNavigationStateText.data(), telemetry.homeNavigationDistance);
+    }
+
     // A small table of {text, fontSize, color} rather than hand-tracked Y
     // offsets per line - adding/removing a HUD line only ever touches this
     // array, and panel sizing/text drawing below stay generic. Which
@@ -363,10 +418,15 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {leftWheelLine, 18, kHudTextColor},
         {rightWheelLine, 18, kHudTextColor},
         {collisionLine, 18, kHudTextColor},
+        {homeNavStateLine, 18, kHudTextColor},
+        {homeNavDistanceLine, 18, kHudTextColor},
+        {homeNavTargetHeadingLine, 18, kHudTextColor},
+        {homeNavHeadingErrorLine, 18, kHudTextColor},
+        {returnReasonLine, 18, kHudTextColor},
         {"TAB: capture/release mouse   F11: fullscreen/windowed   SPACE: pause   O: toggle obstacle   Mouse/WASD: camera",
          16, kHudControlsColor},
         {"M: manual drive mode   Arrows: manual forward/reverse/turn   X: stop manual wheels", 16, kHudControlsColor},
-        {"A: toggle autonomous obstacle avoidance      H: Compact HUD", 16, kHudControlsColor},
+        {"A: toggle autonomous obstacle avoidance   R: return home   H: Compact HUD", 16, kHudControlsColor},
     };
 
     const HudLine compactLines[] = {
@@ -377,7 +437,8 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {compactAvoidanceLine, 18, kHudTextColor},
         {compactObstacleLine, 18, kHudTextColor},
         {compactEdgeLine, 18, kHudTextColor},
-        {"H: Expand HUD", 16, kHudControlsColor},
+        {compactHomeLine, 18, kHudTextColor},
+        {"R: return home   H: Expand HUD", 16, kHudControlsColor},
     };
 
     const bool compact = telemetry.hudMode == HudMode::Compact;

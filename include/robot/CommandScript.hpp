@@ -48,6 +48,7 @@ struct CommandScriptEntry
 //   scenario_loaded    -> EventType::ScenarioLoaded
 //   start_mission      -> EventType::StartMission
 //   mission_completed  -> EventType::MissionCompleted
+//   return_home        -> EventType::ReturnHomeRequested
 //   home_reached       -> EventType::HomeReached
 //   reset              -> EventType::Reset
 // This is deliberately the set of existing EventType values that are

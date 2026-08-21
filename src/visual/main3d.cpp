@@ -8,9 +8,12 @@
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/DemoCommandSource.hpp"
 #include "robot/visual/ForwardClearanceProbe.hpp"
+#include "robot/visual/HomeArrivalEventSource.hpp"
+#include "robot/visual/HomeNavigator.hpp"
 #include "robot/visual/ManualDriveInput.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
+#include "robot/visual/ReturnHomeRequestSource.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/VirtualCliffSensor.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
@@ -63,7 +66,17 @@ constexpr float kManualWheelSpeed = 1.0F;
 // TableEdgeSafetyController, driven by VirtualCliffSensor's four corner
 // readings, takes the wheels the instant the robot's footprint nears the
 // table's edge, regardless of what manual/autonomous/FSM currently want -
-// see docs/technical-decisions.md (Phase 13S).
+// see docs/technical-decisions.md (Phase 13S). As of Phase 13T, `R`
+// requests real geometric Return Home navigation: ReturnHomeRequestSource
+// turns the keypress into a ReturnHomeRequested Event (never a direct FSM
+// mutation), consumed through the real Moving + ReturnHomeRequested ->
+// ReturningHome transition; HomeNavigator then steers the robot toward
+// VirtualWorld's BasePlatform via the new Navigation drive-authority tier
+// (Safety > Manual > AutonomousAvoidance > Navigation > Fsm); and
+// HomeArrivalEventSource turns HomeNavigator's own Arrived state into a
+// HomeReached Event, consumed through the existing (unmodified)
+// ReturningHome + HomeReached -> Aborted transition - see
+// docs/technical-decisions.md (Phase 13T).
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -78,7 +91,37 @@ int main()
     robot::visual::VirtualRobotHardware hardware(world);
     robot::HardwareEventSource hardwareEventSource(hardware);
     robot::visual::DemoCommandSource commandSource;
-    robot::CompositePollingEventSource compositeSource(commandSource, hardwareEventSource);
+
+    // Phase 13T: `R` feeds a ReturnHomeRequested Event through this
+    // source (see the keyboard-input block below) - never a direct FSM
+    // mutation. HomeNavigator is raylib-free navigation logic (Aligning/
+    // Driving/Arrived toward world.basePlatform()); HomeArrivalEventSource
+    // observes ITS OWN Arrived state (edge-triggered) to produce
+    // HomeReached, exactly like HardwareEventSource observes
+    // VirtualRobotHardware's sensors - see HomeNavigator.hpp/
+    // HomeArrivalEventSource.hpp for why neither ever decides FSM
+    // transitions itself.
+    robot::visual::ReturnHomeRequestSource returnHomeRequestSource;
+    robot::visual::HomeNavigator homeNavigator;
+    robot::visual::HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
+
+    // CompositePollingEventSource only combines two sources at a time
+    // (Phase 13J, unmodified), so the four effective sources this phase
+    // needs are composed via NESTING rather than rewriting that class:
+    // an inner command-priority pair (DemoCommandSource,
+    // ReturnHomeRequestSource) and an inner hardware-priority pair
+    // (HardwareEventSource, HomeArrivalEventSource), then those two
+    // composites combined at the top level exactly as Phase 13J already
+    // did for the un-nested two-source case. This preserves
+    // command-before-sensor priority at the top level, AND ensures
+    // HardwareEventSource (emergency stop/battery/obstacle - safety-
+    // critical) always wins over HomeArrivalEventSource within the
+    // hardware branch, so a HomeReached readiness can never cause a
+    // same-frame safety/obstacle event to be lost - see
+    // docs/technical-decisions.md (Phase 13T).
+    robot::CompositePollingEventSource innerCommandSource(commandSource, returnHomeRequestSource);
+    robot::CompositePollingEventSource innerHardwareSource(hardwareEventSource, homeArrivalEventSource);
+    robot::CompositePollingEventSource compositeSource(innerCommandSource, innerHardwareSource);
     robot::RobotStateMachine stateMachine;
     robot::RobotController controller(hardware);
     robot::RobotRuntime runtime(compositeSource, stateMachine, controller);
@@ -243,6 +286,18 @@ int main()
             avoidanceEnabled = !avoidanceEnabled;
         }
 
+        if (IsKeyPressed(KEY_R))
+        {
+            // Edge-triggered (IsKeyPressed, not IsKeyDown) so holding R
+            // requests exactly one Return Home per press - never a direct
+            // RobotStateMachine mutation or a direct
+            // hardware.returnToBase() call; the request is only ever
+            // consumed through the real Moving + ReturnHomeRequested ->
+            // ReturningHome transition on a later runtime.step() (Phase
+            // 13T).
+            returnHomeRequestSource.requestReturnHome();
+        }
+
         if (IsKeyPressed(KEY_H))
         {
             // Edge-triggered (IsKeyPressed, not IsKeyDown) so holding H
@@ -296,14 +351,40 @@ int main()
         const robot::visual::CliffSensorReadings cliffReadings = cliffSensor.readings();
         tableEdgeSafety.update(cliffReadings, world.robotPose(), world.tableSurface());
 
+        // Advance HomeNavigator (Phase 13T) - runs every frame,
+        // unconditionally, enabled exactly when RobotController/the FSM's
+        // current intent is ReturnToBase (VirtualRobotHardware::
+        // currentCommand()), never decided by HomeNavigator itself. This
+        // single condition naturally covers every interruption/resumption
+        // case with no extra bookkeeping: it goes false the moment
+        // WaitingForObstacleClear's stop() runs (HomeNavigator resets to
+        // Inactive), and true again the instant ReturningHome resumes
+        // (HomeNavigator recomputes a fresh target from the new pose) -
+        // while it stays true throughout a Manual/Safety interruption
+        // (RobotController's command tracking is independent of
+        // DriveAuthority override state), so a temporarily-overridden
+        // Return Home request is never cancelled, only outranked. Reads
+        // world.robotPose()/world.basePlatform() directly - HomeNavigator
+        // never duplicates base coordinates of its own. This runs AFTER
+        // runtime.step() above, so a same-frame arrival is naturally
+        // consumed by HardwareEventSource's polling composite on the NEXT
+        // frame - an accepted, deterministic one-frame latency (see
+        // docs/technical-decisions.md, Phase 13T), never worked around by
+        // calling runtime.step() twice.
+        const bool navigationEnabled =
+            hardware.currentCommand() == robot::visual::VirtualDriveCommand::ReturnToBase;
+        const robot::visual::HomeNavigationOutput homeNavigation =
+            homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
+
         // Apply drive authority (Safety > Manual > AutonomousAvoidance >
-        // Fsm - see VirtualRobotHardware::driveAuthority()). Safety is
-        // synced first and unconditionally, exactly like the avoidance
-        // override below: even while manual mode is active, this keeps
-        // firing so a table edge reached under manual control is caught
-        // immediately - VirtualRobotHardware::applyEffectiveWheelSpeeds()
-        // is the one place final priority is actually resolved, so this
-        // code never needs to reason about ordering itself.
+        // Navigation > Fsm - see VirtualRobotHardware::driveAuthority()).
+        // Safety is synced first and unconditionally, exactly like the
+        // avoidance/navigation overrides below: even while manual mode is
+        // active, this keeps firing so a table edge reached under manual
+        // control is caught immediately -
+        // VirtualRobotHardware::applyEffectiveWheelSpeeds() is the one
+        // place final priority is actually resolved, so this code never
+        // needs to reason about ordering itself.
         if (tableEdgeSafety.active())
         {
             const robot::visual::WheelSpeeds recoverySpeeds = tableEdgeSafety.recoveryWheelSpeeds();
@@ -329,6 +410,28 @@ int main()
         else if (hardware.autonomousOverrideActive())
         {
             hardware.clearAutonomousWheelOverride();
+        }
+
+        // The navigation override is kept in sync with HomeNavigator
+        // unconditionally, even while manual/autonomous/safety currently
+        // wins physically - exactly the same always-latched-underneath
+        // pattern the safety/autonomous overrides above already use, so
+        // Return Home resumes automatically the instant a higher
+        // authority releases, with no need to be re-triggered. Only set
+        // while Aligning/Driving: Arrived/Inactive need no override,
+        // since currentCommand() == ReturnToBase's own FSM-mapped wheel
+        // speeds are already zero (see
+        // VirtualRobotHardware::wheelSpeedsForCommand()) - avoiding
+        // unnecessary override churn for an identical physical result.
+        const bool navigationDriving = homeNavigation.state == robot::visual::HomeNavigationState::Aligning ||
+                                        homeNavigation.state == robot::visual::HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(homeNavigation.wheelSpeeds.left, homeNavigation.wheelSpeeds.right);
+        }
+        else if (hardware.navigationOverrideActive())
+        {
+            hardware.clearNavigationWheelOverride();
         }
 
         if (manualDriveMode)
@@ -366,6 +469,10 @@ int main()
         robot::visual::VisualTelemetry telemetry{};
         telemetry.stateText = robot::toString(stateMachine.currentState());
         telemetry.commandText = robot::visual::toString(hardware.currentCommand());
+        // Manual-validation bugfix: optional Full-HUD-only diagnostic -
+        // Renderer3D never uses this to decide anything, it only displays
+        // it.
+        telemetry.returnHomeReasonText = robot::toString(stateMachine.returnHomeReason());
         telemetry.sensorOrigin = sensor.sensorOrigin();
         telemetry.sensorDirection = sensor.sensorDirection();
         telemetry.obstacleDistance = sensor.distanceToNearestObstacle();
@@ -407,6 +514,15 @@ int main()
         telemetry.bodyCorridorObstacleHazard = hardware.bodyCorridorObstacleHazard();
         telemetry.obstacleHazard = hardware.obstacleDetected();
         telemetry.hudMode = hudMode;
+
+        // Phase 13T: already-computed HomeNavigator telemetry - Renderer3D
+        // never has any notion of the Aligning/Driving/Arrived policy
+        // itself.
+        telemetry.homeNavigationStateText = robot::visual::toString(homeNavigation.state);
+        telemetry.homeNavigationDistance = homeNavigation.distanceToHome;
+        telemetry.homeNavigationTargetHeadingDegrees = homeNavigation.targetHeadingDegrees;
+        telemetry.homeNavigationHeadingErrorDegrees = homeNavigation.headingErrorDegrees;
+        telemetry.homeNavigationGuideVisible = navigationDriving;
 
         // Camera updates (mouse-look and CAMERA_FREE's own arrow-key
         // pitch/yaw) are suppressed while manual drive mode is active -

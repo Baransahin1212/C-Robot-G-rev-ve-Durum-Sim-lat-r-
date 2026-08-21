@@ -193,6 +193,7 @@ new event vocabulary is introduced:
 | `scenario_loaded` | `ScenarioLoaded` |
 | `start_mission` | `StartMission` |
 | `mission_completed` | `MissionCompleted` |
+| `return_home` | `ReturnHomeRequested` (Phase 13T) |
 | `home_reached` | `HomeReached` |
 | `reset` | `Reset` |
 
@@ -358,29 +359,34 @@ hard-coded demo world: a ground plane and grid, a two-wheel robot model
 base/docking platform, viewed through a perspective camera you can orbit
 with the mouse (`TAB` toggles mouse capture, drag to rotate, scroll to
 zoom - raylib's built-in `CAMERA_FREE` mode) and an on-screen HUD showing
-the robot's live FSM state/command, (Phase 13Q/13S) drive authority
-(`FSM`/`AUTONOMOUS`/`MANUAL`/`SAFETY`) and whether reactive avoidance is
-enabled, (Phase 13R) whether the avoidance latch is currently active and
-whether the forward BODY-clearance corridor is clear or blocked, (Phase
-13S) each of the four cliff sensors' SAFE/EDGE reading plus whether
-table-edge safety is currently active and its recovery state, position,
-heading, obstacle count, (Phase 13O) the forward distance sensor's live
-reading, (Phase 13P) the current left/right wheel speeds and whether the
-last movement was rejected by the obstacle-collision guard (`Collision:
-YES`/`NO`). `SPACE` pauses/resumes world movement only
-(camera and FSM stepping are unaffected). `O` toggles the one demo
-obstacle placed directly in the robot's path, enabled/disabled, to
-demonstrate obstacle clearing. `M` toggles manual drive mode (Phase 13P,
-see below); while it is on, arrow keys drive the wheels directly
-(`UP`/`DOWN` forward/reverse, `LEFT`/`RIGHT` turn) and holding `X` stops
-them immediately and takes priority over every other key, for as long as
-it is held. `A` toggles reactive obstacle avoidance (Phase 13Q, ON by
-default). `H` toggles the HUD between **Full** (the detailed engineering
-telemetry described above, the default) and **Compact** (a genuinely
-smaller panel showing only high-value operational/safety state: `State`,
-`Authority`, `Safety`, `Avoidance`, `Obstacle`, `Edge` - never hiding an
-active `SAFETY` authority, an obstacle hazard, or edge recovery). This is
-a presentation-only toggle - it has no effect on robot behavior in either
+the robot's live FSM state/command, (Phase 13Q/13S/13T) drive authority
+(`FSM`/`NAVIGATION`/`AUTONOMOUS`/`MANUAL`/`SAFETY`) and whether reactive
+avoidance is enabled, (Phase 13R) whether the avoidance latch is currently
+active and whether the forward BODY-clearance corridor is clear or
+blocked, (Phase 13S) each of the four cliff sensors' SAFE/EDGE reading
+plus whether table-edge safety is currently active and its recovery
+state, (Phase 13T) the current Return Home navigation state
+(`Inactive`/`Aligning`/`Driving`/`Arrived`), remaining distance to base,
+target heading, and live heading error, position, heading, obstacle
+count, (Phase 13O) the forward distance sensor's live reading, (Phase
+13P) the current left/right wheel speeds and whether the last movement
+was rejected by the obstacle-collision guard (`Collision: YES`/`NO`).
+`SPACE` pauses/resumes world movement only (camera and FSM stepping are
+unaffected). `O` toggles the one demo obstacle placed directly in the
+robot's path, enabled/disabled, to demonstrate obstacle clearing. `M`
+toggles manual drive mode (Phase 13P, see below); while it is on, arrow
+keys drive the wheels directly (`UP`/`DOWN` forward/reverse,
+`LEFT`/`RIGHT` turn) and holding `X` stops them immediately and takes
+priority over every other key, for as long as it is held. `A` toggles
+reactive obstacle avoidance (Phase 13Q, ON by default). `R` requests real
+geometric Return Home navigation (Phase 13T, see below) - edge-triggered,
+so holding it down requests exactly once per press. `H` toggles the HUD
+between **Full** (the detailed engineering telemetry described above, the
+default) and **Compact** (a genuinely smaller panel showing only
+high-value operational/safety state: `State`, `Authority`, `Safety`,
+`Avoidance`, `Obstacle`, `Edge`, `Home` - never hiding an active `SAFETY`
+authority, an obstacle hazard, or edge recovery). This is a
+presentation-only toggle - it has no effect on robot behavior in either
 mode; see `docs/technical-decisions.md` (UX polish) for the full Compact-
 mode field list and why. Close the window normally to exit.
 
@@ -804,6 +810,90 @@ detected` pair with `Obstacle L/C/R: CLEAR` or a detected distance, plus
 `Body corridor: CLEAR/BLOCKED`; `Renderer3D` now draws all three
 perception rays.
 
+**As of Phase 13T, Return Home is real geometric navigation, driven
+through the same event/FSM/authority architecture as everything else.**
+Pressing `R` (edge-triggered) feeds a `ReturnHomeRequested` Event through
+a new `ReturnHomeRequestSource` - never a direct `RobotStateMachine`
+mutation - consumed via one small, explicitly justified FSM addition:
+`Moving + ReturnHomeRequested -> ReturningHome` (the pre-existing
+`BatteryCritical` trigger to the same state, and the pre-existing
+`ReturningHome + ObstacleDetected -> WaitingForObstacleClear` interruption/
+resume behavior with `resumeState_`, were both audited and found to
+already exist unmodified - see `docs/technical-decisions.md`, Phase 13T,
+for the full audit). A new `HomeNavigator` (raylib-free, headless) is V1
+reactive point-to-point navigation - deliberately NOT path planning (no
+A*, Dijkstra, occupancy grid, SLAM, waypoint graph, or docking vision): it
+continuously recomputes the straight-line direction to
+`VirtualWorld::basePlatform()`'s center from the robot's current pose
+every frame (reusing `VisualMath.hpp`'s existing heading utilities, never
+duplicating base coordinates) and cycles through
+`Inactive -> Aligning -> Driving -> Arrived`, with two-threshold heading
+hysteresis (8.0F to start driving, 15.0F to fall back to aligning)
+preventing rapid oscillation, and a `0.40F` arrival radius (never exact
+coordinate equality) sized against both the base platform's own footprint
+and the robot's own collision radius. `HomeNavigator` is enabled purely by
+whether `VirtualRobotHardware::currentCommand()` currently reads
+`ReturnToBase` - it never independently decides a mission should return
+home - which naturally handles every interruption case (obstacle, safety,
+manual) with no extra bookkeeping: it resets to `Inactive` the instant an
+obstacle stops the hardware, and resumes with a freshly recomputed target
+the instant `ReturningHome` resumes, while staying logically armed
+underneath a manual or safety interruption (which never touch
+`currentCommand()`) so it resumes automatically, unchanged, the moment
+that interruption ends. Authority is extended to a fifth tier:
+
+```text
+Safety  >  Manual  >  AutonomousAvoidance  >  Navigation  >  Fsm
+```
+
+`VirtualRobotHardware` gained `setNavigationWheelSpeeds()`/
+`clearNavigationWheelOverride()`/`navigationOverrideActive()`, the same
+override shape as every other tier, ranked just above the plain `Fsm`
+command. Arrival is reported back into the FSM the same way every other
+Event enters it: a new `HomeArrivalEventSource`
+(`IPollingEventSource`) observes `HomeNavigator`'s own `Arrived` state,
+edge-triggered exactly like `HardwareEventSource`, and emits `HomeReached`
+- never a direct `stateMachine.handleEvent(HomeReached)` call - consumed
+through the `ReturningHome + HomeReached` transition (see the manual-
+validation bugfix paragraph immediately below for exactly where it leads).
+Because `CompositePollingEventSource` only ever combines two
+sources, the four effective sources this phase needs (command-priority:
+`DemoCommandSource` + `ReturnHomeRequestSource`; hardware-priority:
+`HardwareEventSource` + `HomeArrivalEventSource`) are combined by NESTING
+two instances of the unmodified class, never by rewriting it - this also
+guarantees a safety/obstacle event occurring the same frame `HomeReached`
+becomes ready can never be silently dropped. A same-frame arrival can
+naturally take one extra frame to be consumed (`HomeNavigator::update()`
+runs after `runtime.step()` each frame, matching the existing
+`hardware.update()` ordering) - an accepted, deterministic one-frame
+latency, not a bug. The HUD gained `Home nav: .../Home distance: .../Home
+target heading: .../Home heading error: ...` (Full) or a single `Home:
+<state> <distance>m` line (Compact), plus an optional cyan target-
+direction guide line while actively steering; `Drive authority` now also
+shows `NAVIGATION`.
+
+**Manual-validation bugfix: `R` can be pressed repeatedly, indefinitely.**
+Human testing found that after one successful user-requested Return Home,
+a second `R` press silently did nothing - `ReturningHome + HomeReached`
+always led to `Aborted`, a terminal state with no outgoing transitions at
+all, so `Aborted + ReturnHomeRequested` was rejected forever. The fix:
+`RobotStateMachine` now tracks *why* it entered `ReturningHome`
+(`ReturnHomeReason::MissionAbort` for the automatic `BatteryCritical`
+trigger, unchanged; `ReturnHomeReason::UserRequest` for the explicit `R`
+command) and only `MissionAbort` still leads to `Aborted` - a `UserRequest`
+arrival instead leads to `Ready`, the same reusable "loaded, idling, can
+accept a new mission or another Return Home" state `ScenarioLoaded`
+already produces, which now also accepts `ReturnHomeRequested` (so a
+second, third, or Nth `R` press all work identically). Driving away under
+`M` (manual) in between never touches `RobotState` at all - manual
+remains authority-only, exactly as every prior phase established - so the
+FSM is still sitting in `Ready` the whole time, ready to accept the next
+`R`. See `docs/technical-decisions.md` (Phase 13T) for the full audit,
+the nested-composite/latency/arrival-radius rationale, and the
+closed-loop test coverage (obstacle-during-Return-Home, table-edge-
+during-Return-Home, manual-interruption-during-Return-Home, and repeated
+user-requested Return Home after a manual interruption).
+
 **Still deliberately simple - not full robotics simulation.** The robot's
 position is clamped to a generic ~10x10 simulation-coordinate bound (a
 purely defensive numeric safety net, never expected to be reached in
@@ -811,11 +901,9 @@ practice now that the table-edge safety system keeps the robot on the
 much smaller ~12x12 table well before that) so it cannot drift away
 indefinitely (`DifferentialDrive` itself is world-bounds- and
 obstacle-agnostic - both clamping and collision-checking stay in
-`VirtualRobotHardware`); wheel speeds change instantly with no
-acceleration/inertia/friction model; and `ReturnToBase` is accepted as a
-command but not yet implemented as navigation - it currently behaves like
-`Stopped` (zero wheel speeds). See `docs/technical-decisions.md` (Phase
-13N/13O/13P/13Q) for the full rationale and the
+`VirtualRobotHardware`); and wheel speeds change instantly with no
+acceleration/inertia/friction model. See `docs/technical-decisions.md`
+(Phase 13N/13O/13P/13Q/13T) for the full rationale and the
 `robot_visual`/`robot_visual_simulation`/raylib dependency boundaries.
 
 **`RobotSimulator` never links raylib, `robot_visual`, or
@@ -1001,7 +1089,7 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `RobotSimulator` | The executable — `src/main.cpp` is a ~10-line composition root that calls into `robot_app`. |
 | `robot_visual_world` | `VirtualWorld`/`RobotPose`/`BoxObstacle`/`BasePlatform` (Phase 13M) - plain demo-scene data using this project's own `Vec3`, deliberately raylib-free. `VirtualWorld::setRobotPosition()`/`setRobotHeading()` (Phase 13N) and `setObstaclePosition()`/`setObstacleEnabled()` (Phase 13O) are its only mutation entry points. Depends only on `robot_domain` for the include directory. |
 | `robot_visual` | `VisualRobot`/`Renderer3D` (Phase 13M), the raylib-based 3D drawing layer. Depends on `robot_visual_world` and `raylib`. This is the **only** point where this project depends on raylib - the dependency points inward, never the other way, and no robot-core/domain/hardware target links it. `Renderer3D` receives a plain `VisualTelemetry` struct (state/command text plus sensor readings, Phase 13N/13O) rather than depending on any FSM/hardware/sensor type. |
-| `robot_visual_simulation` | `VirtualRobotHardware` (Phase 13N) - the `IRobotHardware` implementation that is the visual simulator's FSM-driven actuator/sensor boundary, translating `RobotController` commands into wheel speeds and, once per frame, `VirtualWorld` pose changes via `update()` - plus `VirtualDistanceSensor` (Phase 13O), the raylib-free geometry-based forward distance sensor `obstacleDetected()`/`obstacleDistance()` are backed by, and `DifferentialDrive`/`RobotCollision`/`ManualDriveInput` (Phase 13P) - the raylib-free differential-drive kinematic model `VirtualRobotHardware::update()` delegates movement to, the raylib-free circle-vs-AABB obstacle collision query that same `update()` validates a proposed pose against before committing it, and the pure X/UP/DOWN/LEFT/RIGHT wheel-speed decision function behind `RobotSimulator3D`'s manual drive mode (only caller: `main3d.cpp`), respectively, and `ReactiveObstacleAvoidance` (Phase 13Q; a stateful latch as of Phase 13R) - the raylib-free "what wheel speeds does an avoidance turn use, and is the turn still active" policy behind `RobotSimulator3D`'s reactive obstacle avoidance, with `VirtualRobotHardware::driveAuthority()`/`setAutonomousWheelSpeeds()`/`clearAutonomousWheelOverride()` implementing its fixed Manual > AutonomousAvoidance > Fsm priority, plus `ForwardClearanceProbe` (Phase 13R) - the raylib-free swept-body forward-corridor clearance query (expanded-AABB-vs-segment, reusing `RobotCollision`'s own collision radius) that drives the avoidance latch's release condition, distinct from `VirtualDistanceSensor`'s single-point-ray perception and never a substitute for `RobotCollision`'s own unconditional final penetration guard, plus `VirtualCliffSensor`/`TableEdgeSafetyController` (Phase 13S) - the raylib-free four-corner table-edge detection sensor and the small stateful V1 emergency-recovery policy (`Inactive`/`BackingAway`/`MovingForwardFromRearEdge`/`Turning`) built on it, with `VirtualRobotHardware::driveAuthority()`/`setSafetyWheelSpeeds()`/`clearSafetyWheelOverride()` now implementing the full Safety > Manual > AutonomousAvoidance > Fsm priority (Safety highest), plus a table-support fail-safe guard inside `VirtualRobotHardware::update()` distinct from `RobotCollision`'s solid-obstacle guard - a table edge is never modeled as a solid obstacle, plus `VirtualObstacleSensorArray` (manual-validation bugfix) - the raylib-free three-ray (`FrontLeft`/`FrontCenter`/`FrontRight`) body-width-aware forward obstacle-perception array `VirtualRobotHardware::obstacleDetected()` now ORs together with a second, independently-derived-lookahead `ForwardClearanceProbe` query (`isForwardCorridorClearWithinDistance()`), closing the single-center-ray blind spot a laterally-offset obstacle could otherwise slip through undetected until `RobotCollision` caught it at the last moment. Depends on `robot_visual_world`, `robot_hardware`, `robot_controller`, `robot_runtime`, and `robot_domain` - the same real FSM/controller/runtime stack the CLI uses. Deliberately has no raylib dependency, and is a sibling of `robot_visual` (neither depends on the other) under `RobotSimulator3D`. |
+| `robot_visual_simulation` | `VirtualRobotHardware` (Phase 13N) - the `IRobotHardware` implementation that is the visual simulator's FSM-driven actuator/sensor boundary, translating `RobotController` commands into wheel speeds and, once per frame, `VirtualWorld` pose changes via `update()` - plus `VirtualDistanceSensor` (Phase 13O), the raylib-free geometry-based forward distance sensor `obstacleDetected()`/`obstacleDistance()` are backed by, and `DifferentialDrive`/`RobotCollision`/`ManualDriveInput` (Phase 13P) - the raylib-free differential-drive kinematic model `VirtualRobotHardware::update()` delegates movement to, the raylib-free circle-vs-AABB obstacle collision query that same `update()` validates a proposed pose against before committing it, and the pure X/UP/DOWN/LEFT/RIGHT wheel-speed decision function behind `RobotSimulator3D`'s manual drive mode (only caller: `main3d.cpp`), respectively, and `ReactiveObstacleAvoidance` (Phase 13Q; a stateful latch as of Phase 13R) - the raylib-free "what wheel speeds does an avoidance turn use, and is the turn still active" policy behind `RobotSimulator3D`'s reactive obstacle avoidance, with `VirtualRobotHardware::driveAuthority()`/`setAutonomousWheelSpeeds()`/`clearAutonomousWheelOverride()` implementing its fixed Manual > AutonomousAvoidance > Fsm priority, plus `ForwardClearanceProbe` (Phase 13R) - the raylib-free swept-body forward-corridor clearance query (expanded-AABB-vs-segment, reusing `RobotCollision`'s own collision radius) that drives the avoidance latch's release condition, distinct from `VirtualDistanceSensor`'s single-point-ray perception and never a substitute for `RobotCollision`'s own unconditional final penetration guard, plus `VirtualCliffSensor`/`TableEdgeSafetyController` (Phase 13S) - the raylib-free four-corner table-edge detection sensor and the small stateful V1 emergency-recovery policy (`Inactive`/`BackingAway`/`MovingForwardFromRearEdge`/`Turning`) built on it, with `VirtualRobotHardware::driveAuthority()`/`setSafetyWheelSpeeds()`/`clearSafetyWheelOverride()` now implementing the full Safety > Manual > AutonomousAvoidance > Fsm priority (Safety highest), plus a table-support fail-safe guard inside `VirtualRobotHardware::update()` distinct from `RobotCollision`'s solid-obstacle guard - a table edge is never modeled as a solid obstacle, plus `VirtualObstacleSensorArray` (manual-validation bugfix) - the raylib-free three-ray (`FrontLeft`/`FrontCenter`/`FrontRight`) body-width-aware forward obstacle-perception array `VirtualRobotHardware::obstacleDetected()` now ORs together with a second, independently-derived-lookahead `ForwardClearanceProbe` query (`isForwardCorridorClearWithinDistance()`), closing the single-center-ray blind spot a laterally-offset obstacle could otherwise slip through undetected until `RobotCollision` caught it at the last moment, plus `HomeNavigator`/`HomeArrivalEventSource` (Phase 13T) - the raylib-free V1 reactive point-to-point Return Home navigation policy (`Inactive`/`Aligning`/`Driving`/`Arrived`, reusing `VisualMath.hpp`'s heading utilities against `VirtualWorld::basePlatform()`) and the edge-triggered `IPollingEventSource` that turns its own `Arrived` state into `HomeReached`, with `VirtualRobotHardware::driveAuthority()`/`setNavigationWheelSpeeds()`/`clearNavigationWheelOverride()` now implementing the full Safety > Manual > AutonomousAvoidance > Navigation > Fsm priority. Depends on `robot_visual_world`, `robot_hardware`, `robot_controller`, `robot_runtime`, and `robot_domain` - the same real FSM/controller/runtime stack the CLI uses. Deliberately has no raylib dependency, and is a sibling of `robot_visual` (neither depends on the other) under `RobotSimulator3D`. |
 | `RobotSimulator3D` | The interactive 3D visual simulator executable. Depends on `robot_visual` (rendering), `robot_visual_simulation` (FSM-driven movement/sensing), and (Phase 13O) `robot_hardware_events`/`robot_polling_composite` directly, since `main3d.cpp` constructs a real `HardwareEventSource`/`CompositePollingEventSource` - never links `robot_app`, and `RobotSimulator` never links any of these or raylib. `main3d.cpp` constructs the real `RobotStateMachine`/`RobotController`/`RobotRuntime` plus a tiny visual-only `DemoCommandSource` to reach `Moving` through real FSM transitions, and (Phase 13O) the real `HardwareEventSource` to reach `WaitingForObstacleClear`/back to `Moving` through the same real transition rules. |
 
 Dependencies flow one way only: `RobotStateMachine` never depends on

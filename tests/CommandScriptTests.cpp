@@ -54,6 +54,17 @@ TEST(CommandScriptTest, ParsesMissionCompleted)
     EXPECT_EQ(script.entries()[0].eventType, EventType::MissionCompleted);
 }
 
+// 3b: ParsesReturnHome (Phase 13T)
+TEST(CommandScriptTest, ParsesReturnHome)
+{
+    // Act
+    CommandScript script(FixturePath("command_script_return_home.txt"));
+
+    // Assert
+    ASSERT_EQ(script.entries().size(), 1u);
+    EXPECT_EQ(script.entries()[0].eventType, EventType::ReturnHomeRequested);
+}
+
 // 4: ParsesOtherSupportedCommandTypes (home_reached, reset)
 TEST(CommandScriptTest, ParsesOtherSupportedCommandTypes)
 {

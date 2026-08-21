@@ -2935,3 +2935,445 @@ demonstration/educational project. It is not a safety-certified industrial
 robot controller, has not been through any functional-safety assessment
 (e.g. IEC 61508 / ISO 13849), and must not be used as, or represent, a real
 safety system.**
+
+## Phase 13T: Return Home / base navigation
+
+Previously, `ReturnToBase` was accepted as an `IRobotHardware` command but
+behaved identically to `Stopped` - "return to base" meant "stop, and stay
+stopped." This phase makes it real geometric navigation: the robot
+physically drives to `VirtualWorld::basePlatform()` using the existing
+differential-drive kinematics, driven entirely through the existing
+Event/FSM/`DriveAuthority` architecture - never by teleporting the robot,
+setting `RobotState` directly, or injecting `HomeReached` from
+`main3d.cpp`.
+
+### Audit before any code
+
+The brief was explicit that nothing should be assumed - the FSM/Event
+vocabulary was read first, not guessed:
+
+- `EventType::HomeReached` already existed. A request/intent event
+  (`ReturnHomeRequested`) did **not** - so exactly one new `EventType` was
+  needed, not zero and not several.
+- `RobotState::ReturningHome` already existed, and
+  `RobotController::applyState(ReturningHome)` already called
+  `hardware_.returnToBase()` - the State -> hardware mapping needed no
+  change.
+- `ReturningHome + HomeReached -> Aborted` already existed (not
+  `Completed`) - used exactly as-is; not "fixed" to a different
+  destination state.
+- `ReturningHome + ObstacleDetected -> WaitingForObstacleClear`, with
+  `resumeState_ = ReturningHome`, already existed and was already covered
+  by `ReturningHomeObstacleDetectedTransitionsToWaitingForObstacleClear`/
+  `ObstacleClearedAfterReturningHomeResumesReturningHome` - so obstacle-
+  during-Return-Home interruption/resumption needed **zero** FSM changes,
+  only a new closed-loop test proving it holds while `HomeNavigator` is
+  driving (see below).
+
+### The one permitted core change
+
+Per the phase's protected-core policy, a small, explicitly justified
+FSM/Event change is permitted when the audit proves it is required. Here,
+it is: `Event.hpp` gained `EventType::ReturnHomeRequested` (between
+`MissionCompleted` and `HomeReached` - a request, not a completion), and
+`RobotStateMachine.cpp` gained exactly one new `case` inside the `Moving`
+transition switch:
+
+```text
+Moving + ReturnHomeRequested -> ReturningHome
+```
+
+not a broad transition accepted from every state - requesting Return Home
+only makes sense while actively on a mission. `RobotStateMachine.cpp`'s
+diff is 10 lines; `Event.hpp`'s is 2. Two focused unit tests were added
+(`MovingReturnHomeRequestedTransitionsToReturningHome`,
+`IdleReturnHomeRequestedIsRejected` - the latter proving the "not from
+every state" constraint holds). `RobotController` and `IRobotHardware`
+were read in full and are **byte-for-byte unchanged** (`git diff` reports
+zero lines) - the existing `ReturningHome -> returnToBase()` mapping and
+the existing `returnToBase()` pure-virtual method already covered
+everything this phase needed.
+
+### `HomeNavigator`: V1 reactive point-to-point, not path planning
+
+`include/robot/visual/HomeNavigator.hpp`/`src/visual/HomeNavigator.cpp`
+(raylib-free, headless, no FSM/Event/`IRobotHardware` knowledge) is
+deliberately simple:
+
+- **Continuous target recomputation**, not a cached target - every
+  `update()` call recomputes the straight-line direction to
+  `world.basePlatform()`'s current center from the robot's current pose.
+  This is a deliberate departure from `TableEdgeSafetyController`'s own
+  fixed-per-incident target: a table-edge recovery target is chosen once
+  and held for the duration of one recovery incident, but a Return Home
+  target should always reflect the robot's latest position (e.g. after an
+  obstacle detour), so caching it would be wrong here specifically.
+- **Explicitly NOT** A*, Dijkstra, an occupancy grid, SLAM, a waypoint
+  graph, docking vision, or dynamic route optimization - `VirtualWorld`
+  has no notion of a navigable graph, and building one is out of scope for
+  a V1. `HomeNavigator` only ever asks "which way is home, right now" and
+  steers toward it - it has no notion of the box obstacles or the table
+  surface at all (those remain `AutonomousAvoidance`'s and `Safety`'s
+  jobs, unconditionally higher-priority - see below).
+- **Reuses `VisualMath.hpp`'s existing heading utilities**
+  (`headingDegreesFromDirection`, `normalizeHeadingDegrees`,
+  `shortestSignedHeadingErrorDegrees`) rather than inventing new heading
+  math, and reads `VirtualWorld::basePlatform()` directly rather than
+  duplicating the base's coordinates anywhere.
+- **`kHomeArrivalRadius = 0.40F`** - a tolerance, never exact coordinate
+  equality. Derived from the demo `BasePlatform`'s own footprint (1.5x1.5,
+  half-width 0.75F) and the robot's own collision radius
+  (`RobotCollision::kRobotCollisionRadius`, 0.5F): comfortably inside the
+  platform's footprint (not triggering from unreasonably far away) while
+  on the same physical scale as the robot itself - "close enough that the
+  robot's body is essentially on the platform," not pixel-perfect
+  centering.
+- **Heading hysteresis with two named, distinct thresholds** -
+  `kStartDrivingHeadingToleranceDegrees = 8.0F` (`Aligning -> Driving`)
+  and `kStopDrivingHeadingToleranceDegrees = 15.0F` (`Driving ->
+  Aligning`) - deliberately asymmetric so a heading error oscillating
+  anywhere in `[8, 15)` degrees keeps whichever state was already active,
+  instead of flipping every frame a noisy reading crosses one single
+  boundary. The same two-threshold pattern `TableEdgeSafetyController`
+  already established for its own release condition.
+- **Base start condition**: on a fresh/resumed `enabled` transition
+  (`Inactive -> ...`), if the robot is already within
+  `kHomeArrivalRadius`, `update()` reports `Arrived` immediately, without
+  rotating or driving first.
+- `kNavigationForwardSpeed = 0.8F` (slightly under
+  `VirtualRobotHardware::kForwardWheelSpeed`'s 1.0F, since navigation is
+  steering toward a specific target rather than driving blind) and
+  `kNavigationTurnSpeed = 0.6F` (matches
+  `ReactiveObstacleAvoidance`/`TableEdgeSafetyController`'s own turn
+  speed, so every "autonomous-authority turning" maneuver reads
+  consistently in the HUD).
+
+### `enabled` is the entire lifecycle contract
+
+`HomeNavigator::update()` takes an `enabled` boolean, driven directly by
+`hardware.currentCommand() == VirtualDriveCommand::ReturnToBase` in
+`main3d.cpp` - never by `RobotState` directly, and `HomeNavigator` never
+decides on its own that a mission should return home. This single
+condition, with no extra bookkeeping, correctly handles every
+interruption/resumption case:
+
+- **Obstacle interruption**: `WaitingForObstacleClear`'s `stop()` call
+  changes `currentCommand()` to `Stopped`, so `enabled` goes false and
+  `HomeNavigator` resets to `Inactive`; once `ObstacleCleared` resumes
+  `ReturningHome`, `currentCommand()` becomes `ReturnToBase` again,
+  `enabled` goes true, and a fresh target is recomputed from wherever the
+  robot ended up.
+- **Manual/Safety interruption**: `currentCommand()` is untouched by
+  `DriveAuthority` overrides (it only reflects `RobotController`'s FSM-
+  driven calls), so `enabled` stays true throughout - `HomeNavigator`
+  keeps recomputing in the background even though `Manual`/`Safety`
+  physically wins the wheels, and the navigation override resumes
+  automatically, unchanged, the instant the higher authority releases -
+  exactly the same "still recorded underneath, never lost" pattern
+  `AutonomousAvoidance`'s override already established relative to
+  `Manual`.
+
+Navigation wheel speeds are only set into the override while `Aligning`/
+`Driving`; `Arrived`/`Inactive` clear it instead - `ReturnToBase`'s own
+FSM-mapped wheel speeds (`wheelSpeedsForCommand()`) are already zero, so
+this avoids unnecessary override churn for an identical physical result.
+
+### Authority: a fifth tier, `Navigation`, between `AutonomousAvoidance` and `Fsm`
+
+```text
+Safety  >  Manual  >  AutonomousAvoidance  >  Navigation  >  Fsm
+```
+
+`VirtualRobotHardware` gained `setNavigationWheelSpeeds()`/
+`clearNavigationWheelOverride()`/`navigationOverrideActive()` - the same
+override shape every other tier already uses, added to the same single
+`applyEffectiveWheelSpeeds()` priority chain (never duplicated in
+`main3d.cpp` - one arbitration source of truth, as every prior phase's
+authority addition has insisted). `Navigation` sits below
+`AutonomousAvoidance` deliberately: if the robot is navigating home and an
+obstacle appears in its path, avoidance must still win the turn (the
+robot must not run into things merely because a Return Home mission is
+active) - `Navigation` only ever competes with the plain `Fsm` command,
+which it always beats while an actual Return Home mission is in progress.
+
+### Arrival re-enters the FSM as an `Event`, not a direct call
+
+`HomeArrivalEventSource` (`IPollingEventSource`) is the arrival-side
+mirror of `HardwareEventSource`'s own edge-triggered pattern: it holds
+only a `const HomeNavigator&`, and each `pollEvent()` call compares
+`navigator_.state() == Arrived` against the previous call's reading,
+emitting `HomeReached` only on the `false -> true` edge - never on every
+poll while the robot simply remains parked at the base. It re-arms
+automatically with no manual reset: `HomeNavigator::update()` already
+resets to `Inactive` whenever `enabled` goes false (see above), which
+happens the moment `RobotController` stops requesting `ReturnToBase`
+after `HomeReached` is consumed (`ReturningHome + HomeReached ->
+Aborted`, and `RobotController::applyState(Aborted)` calls
+`hardware_.stop()`) - so a second, later Return Home mission's arrival is
+always a fresh edge.
+
+### Combining four event sources without rewriting `CompositePollingEventSource`
+
+`CompositePollingEventSource` was audited and found to combine exactly
+two `IPollingEventSource` instances - by design (see Phase 13J). Rather
+than widen it to N sources, `main3d.cpp` nests two instances of the
+unmodified class:
+
+```text
+innerCommandSource  = Composite(DemoCommandSource,   ReturnHomeRequestSource)
+innerHardwareSource = Composite(HardwareEventSource, HomeArrivalEventSource)
+compositeSource     = Composite(innerCommandSource,  innerHardwareSource)
+```
+
+This preserves command-before-sensor priority at the top level exactly as
+Phase 13J established, and - critically - guarantees `HardwareEventSource`
+(emergency stop, critical battery, obstacle: safety-critical) always wins
+over `HomeArrivalEventSource` within the hardware branch, so a
+same-frame safety/obstacle condition can never be silently lost merely
+because `HomeReached` also became ready that frame.
+`ScriptedLiveRuntimeRunner`/`Application::runLiveSimulation()` (the CLI's
+own composition) are completely untouched - this nesting is local to
+`main3d.cpp`.
+
+### `R` never bypasses the FSM
+
+`ReturnHomeRequestSource` (`include/robot/visual/ReturnHomeRequestSource.hpp`,
+header-only, mirrors `DemoCommandSource`'s own shape/simplicity) exposes
+one method, `requestReturnHome()`, called from `main3d.cpp`'s
+`IsKeyPressed(KEY_R)` check (edge-triggered - a held key still only
+requests once per press, matching `IsKeyPressed`'s own single-frame-edge
+semantics). It arms a pending flag; the next `pollEvent()` call delivers
+`ReturnHomeRequested` once and clears the flag. `main3d.cpp` never calls
+`stateMachine.processEvent()`, sets `RobotState` directly, or calls
+`hardware.returnToBase()` itself - the request only ever reaches the FSM
+through this source, exactly like every other Event in this codebase. The
+same command is independently reachable via a `return_home` `CommandScript`
+token for CLI/scripted regression, entirely separate from the keyboard
+path.
+
+### The one-frame arrival latency is accepted, not a bug
+
+`main3d.cpp`'s frame order is: input -> `runtime.step()` -> obstacle
+perception -> body clearance -> avoidance update -> cliff readings ->
+table-edge update -> `HomeNavigator::update()` -> sync overrides ->
+`hardware.update(dt)` -> telemetry -> render. Because `runtime.step()`
+(which polls `HomeArrivalEventSource`) runs *before* `HomeNavigator::update()`
+each frame, a physical arrival detected by `HomeNavigator` in frame N is
+not visible to `HomeArrivalEventSource` until frame N+1's poll - a
+one-frame latency. This exactly matches the pre-existing relationship
+between `runtime.step()` and `hardware.update()` (obstacle sensing has
+always had this same one-frame relationship to physical movement), so it
+is a consistent, deterministic, already-established property of this
+codebase's frame order - never worked around by calling
+`runtime.step()` twice in one frame, which the brief explicitly
+prohibited.
+
+### What was NOT touched
+
+`RobotController` and `IRobotHardware` are unchanged (`git diff` reports
+zero lines for both) - the pre-existing `ReturningHome -> returnToBase()`
+mapping and the pre-existing `returnToBase()` method already covered
+everything. `CompositePollingEventSource` is unchanged - combined via
+nesting, not rewritten. `Renderer3D` performs no navigation
+decision-making of its own - `homeNavigationGuideVisible` (whether to draw
+the optional target-direction guide line) is computed in `main3d.cpp` from
+the real `HomeNavigationState` enum and passed in as an already-computed
+boolean, exactly like every other `VisualTelemetry` field. `SPACE`'s pause
+semantics are unchanged - pausing still only skips `hardware.update(dt)`
+(the physical pose never moves while paused); `HomeNavigator::update()`
+still runs every frame regardless (matching how obstacle/cliff sensing
+already keeps running while paused), so its telemetry stays live but the
+robot does not physically move.
+
+## Manual-validation bugfix: repeated Return Home / return reason semantics
+
+### The defect
+
+Human validation of Phase 13T found a real lifecycle defect: after one
+successful user-requested Return Home (`R` → `ReturningHome` → arrival →
+`HomeReached`), a **second** `R` press did nothing at all - not even an
+error, just silence. Reproduced exactly:
+
+```text
+Moving -> R -> ReturningHome -> arrive at base -> HomeReached -> Aborted
+Aborted -> M (manual) -> drive away -> M off -> R -> [nothing happens]
+```
+
+### Root cause (confirmed by direct code audit before any fix)
+
+`ReturningHome + HomeReached -> Aborted` was the only transition out of
+`ReturningHome` on arrival, and **`Aborted` had zero outgoing
+transitions at all** - not merely no `ReturnHomeRequested` case, but no
+case for *any* `EventType`, not even `Reset`:
+
+```cpp
+case RobotState::Completed:
+case RobotState::Aborted:
+    // Terminal states for now; no transitions defined out of them.
+    break;
+```
+
+So `Aborted + ReturnHomeRequested` fell through to
+`TransitionResult::InvalidTransition`. `RobotRuntime::step()`'s contract
+(unchanged, confirmed by reading `RobotRuntime.cpp`) discards a rejected
+event outright - it is polled once via
+`ReturnHomeRequestSource::pollEvent()` (which had already cleared its own
+`pending_` flag the moment it returned the event) and never retried. The
+second `R` press was not queued, not ignored-and-retried, not buffered -
+it was polled, rejected, and gone forever, with no user-visible feedback
+(matching `main3d.cpp`'s general design: rejected transitions are silent
+by construction, same as every other key in this codebase).
+
+Manual driving (`M`) was confirmed to be exactly as designed - it never
+touches `RobotState` (`main3d.cpp` only ever calls
+`hardware.setManualWheelSpeeds()`/`clearManualWheelOverride()`) - so the
+FSM was still sitting in `Aborted` the entire time the user drove away
+and back. `HomeNavigator` and `HomeArrivalEventSource` were both audited
+and found to already work correctly for a second mission - see their own
+existing tests (`ReEnableAfterResetWorks`,
+`ReArmsAfterLeavingAndReturningToArrived`) - **the defect was entirely
+inside `RobotStateMachine`**, nothing else needed to change.
+
+### Design problem: `ReturningHome` conflates two different outcomes
+
+The pre-existing `ReturningHome` state is entered from two genuinely
+different causes that must NOT share the same completion outcome:
+
+- **Automatic mission-abort** (`BatteryCritical`) - the robot is heading
+  home because the mission cannot continue; arriving is correctly a
+  mission failure outcome (`Aborted`).
+- **Explicit user request** (`ReturnHomeRequested`, i.e. `R`) - the robot
+  is heading home because an operator asked it to; arriving is not a
+  failure at all, and blindly reusing `Aborted` here (or blindly
+  reassigning *every* `ReturningHome + HomeReached` transition to some
+  other state) would have silently changed the meaning of the pre-existing
+  `BatteryCritical` path, which is exactly what the brief warned against.
+
+### The fix: `ReturnHomeReason`
+
+`RobotStateMachine` gained one new plain robot-domain enum (not an
+`EventType` - never something a caller sends in, only derived FSM
+context) and one `ReturnHomeReason returnHomeReason_` member, set at
+every point that enters `ReturningHome` and read only at the point that
+leaves it via `HomeReached`:
+
+```cpp
+enum class ReturnHomeReason { None, MissionAbort, UserRequest };
+```
+
+| Entry point | Reason set |
+|---|---|
+| `Moving + BatteryCritical -> ReturningHome` | `MissionAbort` |
+| `Moving + ReturnHomeRequested -> ReturningHome` | `UserRequest` |
+| `Ready + ReturnHomeRequested -> ReturningHome` (new) | `UserRequest` |
+
+```cpp
+case EventType::HomeReached:
+    state_ = (returnHomeReason_ == ReturnHomeReason::UserRequest)
+                 ? RobotState::Ready
+                 : RobotState::Aborted;
+    returnHomeReason_ = ReturnHomeReason::None;
+    return TransitionResult::Success;
+```
+
+`MissionAbort` (and the defensive `None` case, which should never
+actually occur since `ReturningHome` is unreachable without one of the
+two entry points above setting a reason) still produces `Aborted`,
+byte-for-byte unchanged from before this fix -
+`MissionAbortHomeReachedStillTransitionsToAborted` and
+`LowBatteryReturnHomeStillEndsInAbortedThroughRealEventChain` both prove
+this regression directly. `UserRequest` now produces `Ready`.
+
+### Why `Ready`, not a new state
+
+The brief asked for this to be explicitly justified rather than assumed.
+`Ready` was chosen over inventing a new state because it is *already*
+exactly the right shape: `RobotController::applyState(Ready)` already
+calls `hardware_.stop()` (correct - the robot should sit still at base);
+`Ready` is already non-terminal and already accepts `StartMission`
+(so a fresh mission remains reachable with no new code); and it already
+carries "infrastructure loaded, mission not actively running, not an
+error" semantics - precisely the state "safely parked at base" needs.
+Reusing it meant the entire fix required exactly one new case
+(`Ready + ReturnHomeRequested`) instead of a new `RobotState` variant, a
+new `toString()` case, a new `RobotController::applyState()` case, and
+new HUD handling.
+
+### Repeated-request semantics (audited, not guessed)
+
+- **`ReturningHome + ReturnHomeRequested`** (pressing `R` again while
+  already mid-navigation): already fell through to
+  `TransitionResult::InvalidTransition` with **zero code changes needed**
+  - `ReturningHome`'s switch never had a case for
+    `EventType::ReturnHomeRequested`. Proven by
+    `RepeatedRequestWhileReturningHomeHandledDeterministically` - state
+    and `returnHomeReason()` are both provably undisturbed.
+- **`EmergencyStopped`/`Error` + `ReturnHomeRequested`**: already
+  rejected for the same reason (no case exists) - proven by
+  `InvalidEmergencyOrErrorReturnHomeRequestRejected`.
+- **`Reset` clears `returnHomeReason_`**: `EmergencyStop` can interrupt an
+  active `ReturningHome` before `HomeReached` is ever consumed, leaving a
+  stale reason set. Both `EmergencyStopped + Reset` and `Error + Reset`
+  now also clear `returnHomeReason_` to `None`, so it can never leak into
+  a later, unrelated mission - proven by `ResetClearsReturnReason`.
+- **Obstacle interruption preserves the reason**: `ReturningHome +
+  ObstacleDetected -> WaitingForObstacleClear` (unchanged) never touches
+  `returnHomeReason_`, so it naturally survives an obstacle detour -
+  proven by `ReturnReasonSurvivesObstacleWaitResume`, and end-to-end by
+  `ObstacleDuringReturnHomeInterruptsThenResumesNavigation` (updated to
+  assert the correct `Ready` destination for its `UserRequest` scenario).
+
+### `HomeNavigator`/`HomeArrivalEventSource`: confirmed correct as-is
+
+Both were audited against the second-mission scenario and required no
+changes. `HomeNavigator`'s `enabled` contract
+(`hardware.currentCommand() == ReturnToBase`) is driven by
+`RobotController::applyState()`, which now calls `hardware_.returnToBase()`
+again the moment `Ready + ReturnHomeRequested -> ReturningHome` succeeds -
+so `HomeNavigator` re-engages and recomputes its target from the robot's
+new (manually-moved) pose automatically. `HomeArrivalEventSource`'s
+`wasArrived_` latch already resets to `false` whenever `HomeNavigator`
+leaves `Arrived` (which happens the instant `enabled` goes false between
+missions), so a second arrival is always a fresh `false -> true` edge -
+this was already covered by the pre-existing
+`ReArmsAfterLeavingAndReturningToArrived` test and is now also proven
+end-to-end by the new closed-loop test below.
+
+### Regression test reproducing the exact human sequence
+
+`RepeatedUserRequestedReturnHomeAfterManualInterruptionWorksTwice`
+(`tests/visual/VirtualRobotHardwareTests.cpp`) drives the entire real
+production stack through the literal reported sequence: reach `Moving`,
+request Return Home, navigate to base, arrive (`Ready`, not `Aborted`),
+drive away under real `setManualWheelSpeeds()` for real simulated seconds
+(never a position/state hack), clear manual, request Return Home again,
+confirm the event is genuinely `TransitionAccepted` (not silently
+dropped), confirm `DriveAuthority::Navigation` genuinely takes over,
+confirm distance to base genuinely decreases across real frames, and
+confirm the second arrival also completes correctly with navigation fully
+cleared back to `Fsm`. Never sets `RobotState` directly; never injects
+`HomeReached` directly.
+
+### Two pre-existing Phase 13T tests updated, not left silently wrong
+
+`FullClosedLoopReturnHomeThroughRealEventChain` and
+`ObstacleDuringReturnHomeInterruptsThenResumesNavigation` both drive a
+Return Home via `ReturnHomeRequestSource` (i.e. `UserRequest`), so both
+needed their final-state assertion corrected from `Aborted` to `Ready`
+once this fix landed - running the full suite immediately after the FSM
+change surfaced both as genuine failures (not flakes), confirming the fix
+changed exactly the behavior it was meant to and nothing else silently
+broke.
+
+### What was NOT touched
+
+`RobotController` and `IRobotHardware` remain unchanged. `HomeNavigator`,
+`HomeArrivalEventSource`, `ReturnHomeRequestSource`,
+`CompositePollingEventSource`, and the `DriveAuthority` priority chain are
+all unchanged - the entire fix is contained inside `RobotStateMachine`
+(one new enum + one new member + reason-setting at three entry points +
+a branch at one exit point + `Reset` clearing), plus one new accepted
+transition (`Ready + ReturnHomeRequested`). An optional Full-HUD-only
+`Return reason: None/MissionAbort/UserRequest` diagnostic line was added
+to `VisualTelemetry`/`Renderer3D` (never consulted by any decision, purely
+displayed) - Compact HUD is deliberately untouched.

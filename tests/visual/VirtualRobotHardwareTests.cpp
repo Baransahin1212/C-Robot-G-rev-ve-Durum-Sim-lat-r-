@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "robot/CompositePollingEventSource.hpp"
+#include "robot/Event.hpp"
 #include "robot/HardwareEventSource.hpp"
 #include "robot/RobotController.hpp"
 #include "robot/RobotRuntime.hpp"
@@ -10,7 +11,10 @@
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/DemoCommandSource.hpp"
 #include "robot/visual/ForwardClearanceProbe.hpp"
+#include "robot/visual/HomeArrivalEventSource.hpp"
+#include "robot/visual/HomeNavigator.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
+#include "robot/visual/ReturnHomeRequestSource.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/VirtualCliffSensor.hpp"
 #include "robot/visual/VirtualObstacleSensorArray.hpp"
@@ -22,17 +26,27 @@ namespace
 {
 
 using robot::CompositePollingEventSource;
+using robot::Event;
+using robot::EventType;
 using robot::HardwareEventSource;
 using robot::RobotController;
 using robot::RobotRuntime;
+using robot::ReturnHomeReason;
 using robot::RobotState;
 using robot::RobotStateMachine;
 using robot::RuntimeStepResult;
+using robot::TransitionResult;
+using robot::visual::BasePlatform;
 using robot::visual::DemoCommandSource;
 using robot::visual::DriveAuthority;
 using robot::visual::CliffSensorReadings;
 using robot::visual::ForwardClearanceProbe;
+using robot::visual::HomeArrivalEventSource;
+using robot::visual::HomeNavigationOutput;
+using robot::visual::HomeNavigationState;
+using robot::visual::HomeNavigator;
 using robot::visual::ReactiveObstacleAvoidance;
+using robot::visual::ReturnHomeRequestSource;
 using robot::visual::robotPositionCollidesWithObstacles;
 using robot::visual::shortestSignedHeadingErrorDegrees;
 using robot::visual::TableEdgeSafetyController;
@@ -1666,6 +1680,270 @@ TEST(VirtualRobotHardwareTest, AutonomousRequestsUnderSafetyRemainRemembered)
     EXPECT_FLOAT_EQ(speeds.right, 0.6F);
 }
 
+// --- Navigation authority (Phase 13T) ---
+//
+// Fixed priority: Safety > Manual > AutonomousAvoidance > Navigation >
+// Fsm. Mirrors the Autonomous/Safety authority test shapes above exactly,
+// one tier lower.
+
+// 1: NavigationOverrideTakesAuthorityFromFsm
+TEST(VirtualRobotHardwareTest, NavigationOverrideTakesAuthorityFromFsm)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.returnToBase();
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+
+    // Act
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    EXPECT_TRUE(hardware.navigationOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 2: AutonomousOverrideTakesAuthorityFromNavigation
+TEST(VirtualRobotHardwareTest, AutonomousOverrideTakesAuthorityFromNavigation)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    // Act
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+
+    // Assert: autonomous wins; the navigation request is still recorded
+    // underneath but does not control physical wheel speeds.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    EXPECT_TRUE(hardware.navigationOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.6F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.6F);
+}
+
+// 3: ClearingAutonomousRestoresNavigationIfStillActive
+TEST(VirtualRobotHardwareTest, ClearingAutonomousRestoresNavigationIfStillActive)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    // Act
+    hardware.clearAutonomousWheelOverride();
+
+    // Assert: falls through to the still-active navigation override, not
+    // the FSM command.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 4: ClearingNavigationRestoresFsm
+TEST(VirtualRobotHardwareTest, ClearingNavigationRestoresFsm)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    // Act
+    hardware.clearNavigationWheelOverride();
+
+    // Assert: falls through to the FSM command (MoveForward).
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_GT(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// 5: ManualOverrideTakesAuthorityFromNavigation
+TEST(VirtualRobotHardwareTest, ManualOverrideTakesAuthorityFromNavigation)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    // Act
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    EXPECT_TRUE(hardware.navigationOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 1.0F);
+}
+
+// 6: ClearingManualRestoresNavigationIfStillActiveAndNoAutonomous
+TEST(VirtualRobotHardwareTest, ClearingManualRestoresNavigationIfStillActiveAndNoAutonomous)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // Act
+    hardware.clearManualWheelOverride();
+
+    // Assert: falls through to the still-active navigation override (no
+    // autonomous override was ever set).
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 7: FsmStopWhileNavigationActiveDoesNotOverwriteNavigationWheelSpeeds
+TEST(VirtualRobotHardwareTest, FsmStopWhileNavigationActiveDoesNotOverwriteNavigationWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+
+    // Act: a stop() call arrives (e.g. WaitingForObstacleClear) while
+    // navigation is active.
+    hardware.stop();
+
+    // Assert: currentCommand() reflects the FSM call, but physical wheel
+    // speeds are still the navigation override's values.
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 8: FsmMoveForwardWhileNavigationActiveDoesNotOverwriteNavigationWheelSpeeds
+TEST(VirtualRobotHardwareTest, FsmMoveForwardWhileNavigationActiveDoesNotOverwriteNavigationWheelSpeeds)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+
+    // Act
+    hardware.moveForward();
+
+    // Assert
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::MoveForward);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 9: SafetyOverridesNavigation
+TEST(VirtualRobotHardwareTest, SafetyOverridesNavigation)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    // Act
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, -1.0F);
+}
+
+// 10: ClearingSafetyRestoresNavigationIfNoManualOrAutonomous
+TEST(VirtualRobotHardwareTest, ClearingSafetyRestoresNavigationIfNoManualOrAutonomous)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act
+    hardware.clearSafetyWheelOverride();
+
+    // Assert: falls through to navigation, not the FSM command.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 11: NavigationRequestsUnderSafetyRemainRemembered
+TEST(VirtualRobotHardwareTest, NavigationRequestsUnderSafetyRemainRemembered)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act: a navigation request arrives while safety is active (e.g. a
+    // table edge is reached mid Return-Home).
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+
+    // Assert: recorded, but safety still physically wins.
+    EXPECT_TRUE(hardware.navigationOverrideActive());
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act: safety releases.
+    hardware.clearSafetyWheelOverride();
+
+    // Assert: the navigation request was never lost.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.8F);
+}
+
+// 12: ManualPriorityIntegrationAcrossNavigationAndFsm
+TEST(VirtualRobotHardwareTest, ManualPriorityIntegrationAcrossNavigationAndFsm)
+{
+    // Arrange: navigation active, no manual yet.
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.8F, 0.8F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    // Act: manual engages.
+    hardware.setManualWheelSpeeds(1.0F, -1.0F);
+
+    // Assert: manual wins immediately.
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    const WheelSpeeds manualSpeeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(manualSpeeds.left, 1.0F);
+    EXPECT_FLOAT_EQ(manualSpeeds.right, -1.0F);
+
+    // Act: manual ends.
+    hardware.clearManualWheelOverride();
+
+    // Assert: navigation resumes automatically, unchanged, with no need
+    // to be re-triggered.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    const WheelSpeeds resumedSpeeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(resumedSpeeds.left, 0.8F);
+    EXPECT_FLOAT_EQ(resumedSpeeds.right, 0.8F);
+}
+
 // --- Full table-edge safety closed-loop integration test (Phase 13S,
 // section 21 - one of this phase's main acceptance tests) ---
 //
@@ -2261,4 +2539,557 @@ TEST(VirtualRobotHardwareTest, FullClosedLoopOffsetObstacleAvoidanceThroughRealE
         hardware.update(0.05F);
         EXPECT_FALSE(hardware.collidedLastUpdate());
     }
+}
+
+// --- Full closed-loop Return Home integration test (Phase 13T) ---
+//
+// Drives the real production stack - VirtualWorld -> VirtualRobotHardware
+// -> [DemoCommandSource + ReturnHomeRequestSource] (command priority) /
+// [HardwareEventSource + HomeArrivalEventSource] (hardware priority),
+// nested via CompositePollingEventSource exactly like main3d.cpp -
+// RobotRuntime -> RobotStateMachine -> RobotController, plus the real
+// HomeNavigator - end to end, without ever setting DriveAuthority
+// directly, injecting ReturnHomeRequested/HomeReached directly, or
+// teleporting the robot (every position change comes from
+// VirtualRobotHardware::update() -> DifferentialDrive, driven by
+// HomeNavigator's own wheel speeds). All obstacles are disabled so this
+// test isolates Return Home navigation itself from obstacle avoidance
+// (see ObstacleDuringReturnHomeInterruptsThenResumesNavigation below for
+// the two combined).
+TEST(VirtualRobotHardwareTest, FullClosedLoopReturnHomeThroughRealEventChain)
+{
+    // Arrange
+    VirtualWorld world;
+    disableAllObstacles(world);
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    ReturnHomeRequestSource returnHomeRequestSource;
+    HomeNavigator homeNavigator;
+    HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
+    CompositePollingEventSource innerCommandSource(commandSource, returnHomeRequestSource);
+    CompositePollingEventSource innerHardwareSource(hardwareEventSource, homeArrivalEventSource);
+    CompositePollingEventSource compositeSource(innerCommandSource, innerHardwareSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+
+    // Act / Assert: reach Moving through real FSM transitions.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Moving);
+
+    // Act: `R` equivalent - request Return Home through the real event
+    // source, never a direct FSM mutation.
+    returnHomeRequestSource.requestReturnHome();
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Moving -> ReturningHome
+    ASSERT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+
+    // Act: per-frame loop matching main3d.cpp's own frame order exactly -
+    // runtime.step() first, HomeNavigator::update() after, so a same-frame
+    // arrival is naturally consumed on the NEXT frame (Phase 13T's
+    // documented one-frame event latency, never worked around by calling
+    // runtime.step() twice).
+    for (int frame = 0; frame < 3000 && stateMachine.currentState() == RobotState::ReturningHome; ++frame)
+    {
+        runtime.step();
+
+        const bool navigationEnabled = hardware.currentCommand() == VirtualDriveCommand::ReturnToBase;
+        const HomeNavigationOutput nav = homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        else if (hardware.navigationOverrideActive())
+        {
+            hardware.clearNavigationWheelOverride();
+        }
+
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+    }
+
+    // Assert: HomeReached was produced through HomeArrivalEventSource's own
+    // edge-triggered pollEvent() (never a direct
+    // stateMachine.handleEvent(HomeReached) call), consumed through the
+    // ReturningHome + HomeReached transition - manual-validation bugfix:
+    // a USER-REQUESTED arrival (this test's returnHomeRequestSource path)
+    // lands in the reusable Ready state, not Aborted (which remains
+    // reserved for the automatic BatteryCritical/MissionAbort path - see
+    // LowBatteryReturnHomeStillEndsInAbortedThroughRealEventChain).
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
+    EXPECT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::None);
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+
+    const BasePlatform& base = world.basePlatform();
+    const float dx = base.position.x - world.robotPose().position.x;
+    const float dz = base.position.z - world.robotPose().position.z;
+    const float finalDistance = std::sqrt((dx * dx) + (dz * dz));
+    EXPECT_LE(finalDistance, HomeNavigator::kHomeArrivalRadius);
+}
+
+// --- Obstacle-during-Return-Home integration test (Phase 13T) ---
+//
+// Proves the ALREADY-EXISTING (unmodified) ReturningHome + ObstacleDetected
+// -> WaitingForObstacleClear transition (with resumeState_ = ReturningHome,
+// audited before this phase - see RobotStateMachine.cpp) genuinely works
+// end-to-end while a real Return Home mission is underway, and that
+// HomeNavigator's `enabled` contract correctly interrupts then resumes
+// navigation with no extra bookkeeping. AutonomousAvoidance is not driven
+// here (that interplay is already proven by the Phase 13R/13S closed-loop
+// tests above) - this isolates exactly the Navigation-interruption-and-
+// resumption behavior.
+TEST(VirtualRobotHardwareTest, ObstacleDuringReturnHomeInterruptsThenResumesNavigation)
+{
+    // Arrange: robot already faces the base directly (heading pre-aligned
+    // to 0, base is due +Z from here), with an obstacle placed directly in
+    // that straight-line path.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{4.0F, 0.125F, 0.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(0, Vec3{4.0F, 0.4F, 2.0F});
+    world.setObstacleEnabled(0, true);
+
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    ReturnHomeRequestSource returnHomeRequestSource;
+    HomeNavigator homeNavigator;
+    HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
+    CompositePollingEventSource innerCommandSource(commandSource, returnHomeRequestSource);
+    CompositePollingEventSource innerHardwareSource(hardwareEventSource, homeArrivalEventSource);
+    CompositePollingEventSource compositeSource(innerCommandSource, innerHardwareSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    returnHomeRequestSource.requestReturnHome();
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Moving -> ReturningHome
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+
+    // Act: drive frames until the obstacle naturally interrupts Return
+    // Home, through the real HardwareEventSource edge - never a manual
+    // Event injection.
+    for (int frame = 0; frame < 3000 && stateMachine.currentState() != RobotState::WaitingForObstacleClear; ++frame)
+    {
+        runtime.step();
+        const bool navigationEnabled = hardware.currentCommand() == VirtualDriveCommand::ReturnToBase;
+        const HomeNavigationOutput nav = homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        else if (hardware.navigationOverrideActive())
+        {
+            hardware.clearNavigationWheelOverride();
+        }
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+    }
+
+    // Assert: interrupted through the already-existing, unmodified
+    // transition - RobotController's stop() call already happened this
+    // same frame (before this loop iteration's navigationEnabled check),
+    // so HomeNavigator has already reset to Inactive.
+    ASSERT_EQ(stateMachine.currentState(), RobotState::WaitingForObstacleClear);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    EXPECT_EQ(homeNavigator.state(), HomeNavigationState::Inactive);
+
+    // Act: clear the obstacle - identical world-only mutation to
+    // RobotSimulator3D's "O" key; never a manual Event injection.
+    world.setObstacleEnabled(0, false);
+
+    // Assert: HardwareEventSource observes the edge and emits
+    // ObstacleCleared; RobotStateMachine resumes ReturningHome (the
+    // remembered resumeState_) - never plain Moving; RobotController
+    // resumes ReturnToBase.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted);
+    ASSERT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+
+    // Act: continue until the mission completes - HomeNavigator
+    // recomputes a fresh target from wherever the robot ended up, with no
+    // manual reset needed by this test.
+    for (int frame = 0; frame < 3000 && stateMachine.currentState() == RobotState::ReturningHome; ++frame)
+    {
+        runtime.step();
+        const bool navigationEnabled = hardware.currentCommand() == VirtualDriveCommand::ReturnToBase;
+        const HomeNavigationOutput nav = homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        else if (hardware.navigationOverrideActive())
+        {
+            hardware.clearNavigationWheelOverride();
+        }
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+    }
+
+    // Manual-validation bugfix: this obstacle-interrupted mission was
+    // still initiated via returnHomeRequestSource (UserRequest), so the
+    // eventual arrival still lands in Ready, not Aborted - the return
+    // reason survived the obstacle interruption/resumption unchanged (see
+    // ReturnReasonSurvivesObstacleWaitResume for the focused FSM-level
+    // proof of this).
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
+    EXPECT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::None);
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+}
+
+// --- Table-edge-during-Return-Home integration test (Phase 13T) ---
+//
+// Mirrors AvoidanceEdgeSafetyOverridesAutonomousAndAutonomousResumesIfStillActive
+// above exactly, one authority tier lower: Safety must override Navigation
+// exactly like it overrides every other authority, and Navigation must
+// resume automatically once safety releases, still wanting the same
+// (recomputed) wheel speeds, with no re-request needed.
+TEST(VirtualRobotHardwareTest, TableEdgeDuringReturnHomeSafetyOverridesNavigationThenResumes)
+{
+    // Arrange: front corner exactly at the table edge, heading such that
+    // HomeNavigator's own in-place Aligning turn immediately starts
+    // swinging a corner past it - isolating exactly the Safety-vs-
+    // Navigation priority interaction this test exists for, driven by the
+    // real HomeNavigator (not a scripted turn).
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.6F});
+    world.setRobotHeading(0.0F);
+
+    VirtualRobotHardware hardware(world);
+    VirtualCliffSensor cliffSensor(world);
+    TableEdgeSafetyController tableEdgeSafety;
+    HomeNavigator homeNavigator;
+
+    HomeNavigationOutput nav = homeNavigator.update(world.robotPose(), world.basePlatform(), true);
+    ASSERT_NE(nav.state, HomeNavigationState::Arrived); // sanity: base is far away
+    hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    bool everSafetyOverrodeNavigation = false;
+    bool everReturnedToNavigation = false;
+
+    for (int frame = 0; frame < 4000 && !everReturnedToNavigation; ++frame)
+    {
+        const CliffSensorReadings readings = cliffSensor.readings();
+        tableEdgeSafety.update(readings, world.robotPose(), world.tableSurface());
+
+        if (tableEdgeSafety.active())
+        {
+            const WheelSpeeds recovery = tableEdgeSafety.recoveryWheelSpeeds();
+            hardware.setSafetyWheelSpeeds(recovery.left, recovery.right);
+        }
+        else if (hardware.safetyOverrideActive())
+        {
+            hardware.clearSafetyWheelOverride();
+        }
+
+        // HomeNavigator keeps recomputing every frame exactly like
+        // main3d.cpp - regardless of who currently has authority (enabled
+        // stays true throughout: currentCommand()-style interruption is
+        // not what this test isolates, only the Safety/Navigation
+        // priority interaction is).
+        nav = homeNavigator.update(world.robotPose(), world.basePlatform(), true);
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        else if (hardware.navigationOverrideActive())
+        {
+            hardware.clearNavigationWheelOverride();
+        }
+
+        if (hardware.driveAuthority() == DriveAuthority::Safety)
+        {
+            everSafetyOverrodeNavigation = true;
+        }
+
+        hardware.update(0.05F);
+
+        if (everSafetyOverrodeNavigation && !tableEdgeSafety.active() &&
+            hardware.driveAuthority() == DriveAuthority::Navigation)
+        {
+            everReturnedToNavigation = true;
+        }
+    }
+
+    ASSERT_TRUE(everSafetyOverrodeNavigation);
+    ASSERT_TRUE(everReturnedToNavigation);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    EXPECT_TRUE(hardware.navigationOverrideActive());
+}
+
+// --- Manual-interruption-during-Return-Home integration test (Phase
+// 13T) ---
+//
+// Proves Manual overrides Navigation exactly like it overrides every
+// other authority, that FSM/controller intent (currentCommand() ==
+// ReturnToBase) is completely untouched by a manual interruption, and
+// that Navigation resumes automatically - recomputed, not merely
+// replayed - the instant manual ends, with no need to re-press `R`.
+TEST(VirtualRobotHardwareTest, ManualInterruptionDuringReturnHomeResumesNavigationAfterward)
+{
+    // Arrange: reach ReturningHome through the real FSM chain.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    ReturnHomeRequestSource returnHomeRequestSource;
+    HomeNavigator homeNavigator;
+    HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
+    CompositePollingEventSource innerCommandSource(commandSource, returnHomeRequestSource);
+    CompositePollingEventSource innerHardwareSource(hardwareEventSource, homeArrivalEventSource);
+    CompositePollingEventSource compositeSource(innerCommandSource, innerHardwareSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    returnHomeRequestSource.requestReturnHome();
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Moving -> ReturningHome
+    ASSERT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+
+    // Act: run a few real frames first, proving navigation was genuinely
+    // driving before manual intervenes.
+    for (int i = 0; i < 5; ++i)
+    {
+        runtime.step();
+        const bool navigationEnabled = hardware.currentCommand() == VirtualDriveCommand::ReturnToBase;
+        const HomeNavigationOutput nav = homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        hardware.update(0.05F);
+    }
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    ASSERT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+
+    // Act: user takes manual control mid Return-Home.
+    hardware.setManualWheelSpeeds(1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // Act / Assert: FSM/controller intent (ReturnToBase) is completely
+    // untouched by manual control - runtime.step() keeps polling
+    // normally, and HomeNavigator keeps recomputing in the background even
+    // though its wheel-speed request is not physically applied while
+    // manual wins.
+    for (int i = 0; i < 5; ++i)
+    {
+        runtime.step();
+        ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+        const HomeNavigationOutput nav = homeNavigator.update(world.robotPose(), world.basePlatform(), true);
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    }
+
+    // Act: manual ends.
+    hardware.clearManualWheelOverride();
+
+    // Assert: navigation resumes automatically - no need to re-request
+    // Return Home.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    EXPECT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+}
+
+// --- Manual-validation bugfix: repeated user-requested Return Home
+// integration test (Phase 13T follow-up) ---
+//
+// Reproduces the exact human-validation defect end-to-end: a completed
+// user-requested Return Home used to leave the FSM in Aborted - a
+// terminal state with NO outgoing transitions at all, not even from a
+// second ReturnHomeRequested - so a second `R` press after driving away
+// under manual control silently did nothing (the event was polled once,
+// rejected, and discarded). Drives the real production stack throughout;
+// never sets RobotState directly, never injects HomeReached directly.
+TEST(VirtualRobotHardwareTest, RepeatedUserRequestedReturnHomeAfterManualInterruptionWorksTwice)
+{
+    // Arrange
+    VirtualWorld world;
+    disableAllObstacles(world);
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    ReturnHomeRequestSource returnHomeRequestSource;
+    HomeNavigator homeNavigator;
+    HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
+    CompositePollingEventSource innerCommandSource(commandSource, returnHomeRequestSource);
+    CompositePollingEventSource innerHardwareSource(hardwareEventSource, homeArrivalEventSource);
+    CompositePollingEventSource compositeSource(innerCommandSource, innerHardwareSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+
+    // One frame of the exact main3d.cpp navigation order: runtime.step()
+    // first, HomeNavigator::update() after.
+    const auto driveNavigationFrame = [&]() {
+        runtime.step();
+        const bool navigationEnabled = hardware.currentCommand() == VirtualDriveCommand::ReturnToBase;
+        const HomeNavigationOutput nav =
+            homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        else if (hardware.navigationOverrideActive())
+        {
+            hardware.clearNavigationWheelOverride();
+        }
+        hardware.update(0.05F);
+    };
+
+    const auto distanceToBase = [&]() {
+        const BasePlatform& base = world.basePlatform();
+        const float dx = base.position.x - world.robotPose().position.x;
+        const float dz = base.position.z - world.robotPose().position.z;
+        return std::sqrt((dx * dx) + (dz * dz));
+    };
+
+    // 1-3: reach Moving.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Moving);
+
+    // 4-5: first user-requested Return Home - `R` equivalent, through the
+    // real event source.
+    returnHomeRequestSource.requestReturnHome();
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Moving -> ReturningHome
+    ASSERT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+
+    // 6-7: navigate to base and let HomeReached fire naturally through
+    // HomeArrivalEventSource.
+    for (int frame = 0; frame < 3000 && stateMachine.currentState() == RobotState::ReturningHome; ++frame)
+    {
+        driveNavigationFrame();
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+    }
+
+    // 8: THE FIX - a user-requested arrival lands in the reusable Ready
+    // state, not the terminal Aborted state.
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
+    EXPECT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::None);
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    EXPECT_EQ(homeNavigator.state(), HomeNavigationState::Inactive);
+    ASSERT_LE(distanceToBase(), HomeNavigator::kHomeArrivalRadius);
+
+    // 9-11: drive away under manual control - RobotState must stay
+    // completely untouched by this (Manual is authority-only, never FSM
+    // state). Reverses straight back along the same approach line - stays
+    // well inside the table the entire time, matching the original safe
+    // approach path.
+    hardware.setManualWheelSpeeds(-1.0F, -1.0F);
+    for (int i = 0; i < 60; ++i)
+    {
+        hardware.update(0.05F);
+    }
+    hardware.clearManualWheelOverride();
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
+    const float distanceAfterManualDrive = distanceToBase();
+    ASSERT_GT(distanceAfterManualDrive, HomeNavigator::kHomeArrivalRadius + 1.0F); // meaningfully far away
+
+    // 12-13: second Return Home request - THIS is exactly what the
+    // reported defect silently rejected.
+    returnHomeRequestSource.requestReturnHome();
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> ReturningHome
+    ASSERT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+    EXPECT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::UserRequest);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+
+    // 14-17: navigate from the NEW (manually-moved) pose - authority
+    // genuinely becomes Navigation, and distance genuinely decreases.
+    driveNavigationFrame();
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    float previousDistance = distanceAfterManualDrive;
+    bool everDecreased = false;
+    for (int frame = 0; frame < 3000 && stateMachine.currentState() == RobotState::ReturningHome; ++frame)
+    {
+        driveNavigationFrame();
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+
+        const float currentDistance = distanceToBase();
+        if (currentDistance < previousDistance)
+        {
+            everDecreased = true;
+        }
+        previousDistance = currentDistance;
+    }
+    EXPECT_TRUE(everDecreased);
+
+    // 18-20: second arrival also completes correctly, through the same
+    // real HomeArrivalEventSource re-arming from scratch, and navigation
+    // clears back to Fsm.
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
+    EXPECT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::None);
+    EXPECT_EQ(homeNavigator.state(), HomeNavigationState::Inactive);
+    EXPECT_FALSE(hardware.navigationOverrideActive());
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    EXPECT_LE(distanceToBase(), HomeNavigator::kHomeArrivalRadius);
+}
+
+// --- Manual-validation bugfix: low-battery (MissionAbort) regression
+// (Phase 13T follow-up) ---
+//
+// The automatic BatteryCritical -> ReturningHome -> HomeReached -> Aborted
+// path must be completely unaffected by the ReturnHomeReason fix above -
+// it is the pre-existing, original meaning of "the robot is heading
+// home."
+TEST(VirtualRobotHardwareTest, LowBatteryReturnHomeStillEndsInAbortedThroughRealEventChain)
+{
+    // Arrange
+    VirtualWorld world;
+    disableAllObstacles(world);
+    VirtualRobotHardware hardware(world);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+
+    // Act / Assert: reach Moving directly (no runtime/event-source needed
+    // for this focused regression - BatteryCritical is a sensor-derived
+    // event this test injects directly, exactly like existing sensor-path
+    // tests elsewhere in this file).
+    stateMachine.processEvent(Event{EventType::ScenarioLoaded, 0, std::nullopt});
+    stateMachine.processEvent(Event{EventType::StartMission, 0, std::nullopt});
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Moving);
+
+    const TransitionResult toReturning =
+        stateMachine.processEvent(Event{EventType::BatteryCritical, 0, std::nullopt});
+    ASSERT_EQ(toReturning, TransitionResult::Success);
+    ASSERT_EQ(stateMachine.currentState(), RobotState::ReturningHome);
+    ASSERT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::MissionAbort);
+
+    // Act
+    const TransitionResult toAborted = stateMachine.processEvent(Event{EventType::HomeReached, 0, std::nullopt});
+
+    // Assert: unchanged from before this bugfix - MissionAbort still ends
+    // in Aborted, never Ready.
+    EXPECT_EQ(toAborted, TransitionResult::Success);
+    EXPECT_EQ(stateMachine.currentState(), RobotState::Aborted);
+    EXPECT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::None);
 }

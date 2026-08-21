@@ -54,6 +54,13 @@ struct VisualTelemetry
 {
     std::string_view stateText;
     std::string_view commandText;
+
+    // Manual-validation bugfix: RobotStateMachine::returnHomeReason()'s
+    // already-formatted text ("None"/"MissionAbort"/"UserRequest") -
+    // optional Full-HUD-only diagnostic, never consulted by any decision
+    // in this class; helps a human observer confirm WHY the robot is
+    // currently returning home without needing console access.
+    std::string_view returnHomeReasonText;
     Vec3 sensorOrigin;
     Vec3 sensorDirection;
     std::optional<float> obstacleDistance;
@@ -179,6 +186,26 @@ struct VisualTelemetry
     // unchanged existing telemetry) or Compact (a small, high-value
     // operational subset). Presentation-only; see HudMode's own docs.
     HudMode hudMode = HudMode::Full;
+
+    // Phase 13T: HomeNavigator's own state/telemetry - already computed
+    // by main3d.cpp's HomeNavigator::update() every frame, regardless of
+    // whether it is currently enabled (Inactive is a completely normal,
+    // most-of-the-time value, not an error state). Renderer3D never has
+    // any notion of the Aligning/Driving/Arrived policy itself - it only
+    // ever displays these already-computed values.
+    std::string_view homeNavigationStateText;
+    float homeNavigationDistance = 0.0F;
+    float homeNavigationTargetHeadingDegrees = 0.0F;
+    float homeNavigationHeadingErrorDegrees = 0.0F;
+
+    // Phase 13T: true while HomeNavigator is actively steering (Aligning
+    // or Driving this frame) - never true for Inactive/Arrived. Drives
+    // the optional target-direction guide line in drawScene() below.
+    // Computed by main3d.cpp from the real HomeNavigationState enum, not
+    // re-derived here from homeNavigationStateText - Renderer3D never
+    // calculates navigation decisions, only visualizes already-computed
+    // data.
+    bool homeNavigationGuideVisible = false;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,

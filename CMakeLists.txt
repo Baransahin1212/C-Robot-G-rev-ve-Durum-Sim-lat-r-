@@ -453,7 +453,11 @@ target_link_libraries(robot_visual PUBLIC
 # wheel speeds via VirtualRobotHardware's new highest-priority Safety
 # override (setSafetyWheelSpeeds()/clearSafetyWheelOverride()) - entirely
 # separate from solid-obstacle collision/avoidance, since a table edge is
-# not a solid obstacle.
+# not a solid obstacle. HomeNavigator (Phase 13T) is the raylib-free V1
+# reactive point-to-point Return Home navigation policy - Aligning/Driving/
+# Arrived toward VirtualWorld's BasePlatform, reusing VisualMath's existing
+# heading utilities; it has no FSM/Event/IRobotHardware knowledge of its
+# own, driven purely by the `enabled` argument main3d.cpp supplies.
 add_library(robot_visual_simulation STATIC
     src/visual/VirtualRobotHardware.cpp
     src/visual/VirtualDistanceSensor.cpp
@@ -465,6 +469,8 @@ add_library(robot_visual_simulation STATIC
     src/visual/VirtualCliffSensor.cpp
     src/visual/TableEdgeSafetyController.cpp
     src/visual/VirtualObstacleSensorArray.cpp
+    src/visual/HomeNavigator.cpp
+    src/visual/HomeArrivalEventSource.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -994,6 +1000,41 @@ target_link_libraries(VirtualObstacleSensorArrayTests PRIVATE
 
 gtest_discover_tests(VirtualObstacleSensorArrayTests)
 
+# --- HomeNavigatorTests: deterministic V1 reactive point-to-point Return
+# Home navigation policy (Phase 13T) - Inactive/Aligning/Driving/Arrived
+# transitions, heading hysteresis, arrival radius, wheel-speed direction
+# convention, and reset/re-enable lifecycle. Links only
+# robot_visual_simulation - never robot_visual/raylib - genuinely
+# headless, no window is ever created by this target.
+add_executable(HomeNavigatorTests
+    tests/visual/HomeNavigatorTests.cpp
+)
+
+target_link_libraries(HomeNavigatorTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(HomeNavigatorTests)
+
+# --- HomeArrivalEventSourceTests: edge-triggered HomeReached emission over
+# HomeNavigator's own Arrived state (Phase 13T) - no event while not
+# arrived, exactly one event on the false->true edge, no repeat spam while
+# still arrived, no event on the way out, and re-arming for a second
+# distinct Return Home mission. Links only robot_visual_simulation - never
+# robot_visual/raylib - genuinely headless, no window is ever created by
+# this target.
+add_executable(HomeArrivalEventSourceTests
+    tests/visual/HomeArrivalEventSourceTests.cpp
+)
+
+target_link_libraries(HomeArrivalEventSourceTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(HomeArrivalEventSourceTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -1015,7 +1056,8 @@ if (MSVC)
         VirtualDistanceSensorTests DifferentialDriveTests
         RobotCollisionTests ManualDriveInputTests ReactiveObstacleAvoidanceTests
         ForwardClearanceProbeTests VirtualCliffSensorTests TableEdgeSafetyControllerTests
-        VirtualObstacleSensorArrayTests
+        VirtualObstacleSensorArrayTests HomeNavigatorTests
+        HomeArrivalEventSourceTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

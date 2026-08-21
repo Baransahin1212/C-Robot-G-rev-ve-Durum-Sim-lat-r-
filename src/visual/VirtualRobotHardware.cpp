@@ -167,6 +167,10 @@ DriveAuthority VirtualRobotHardware::driveAuthority() const noexcept
     {
         return DriveAuthority::AutonomousAvoidance;
     }
+    if (navigationOverrideActive_)
+    {
+        return DriveAuthority::Navigation;
+    }
     return DriveAuthority::Fsm;
 }
 
@@ -183,6 +187,11 @@ bool VirtualRobotHardware::autonomousOverrideActive() const noexcept
 bool VirtualRobotHardware::safetyOverrideActive() const noexcept
 {
     return safetyOverrideActive_;
+}
+
+bool VirtualRobotHardware::navigationOverrideActive() const noexcept
+{
+    return navigationOverrideActive_;
 }
 
 void VirtualRobotHardware::setManualWheelSpeeds(float left, float right) noexcept
@@ -224,6 +233,19 @@ void VirtualRobotHardware::clearSafetyWheelOverride() noexcept
     applyEffectiveWheelSpeeds();
 }
 
+void VirtualRobotHardware::setNavigationWheelSpeeds(float left, float right) noexcept
+{
+    navigationOverrideActive_ = true;
+    navigationSpeeds_ = WheelSpeeds{left, right};
+    applyEffectiveWheelSpeeds();
+}
+
+void VirtualRobotHardware::clearNavigationWheelOverride() noexcept
+{
+    navigationOverrideActive_ = false;
+    applyEffectiveWheelSpeeds();
+}
+
 WheelSpeeds VirtualRobotHardware::wheelSpeedsForCommand(VirtualDriveCommand command) const noexcept
 {
     switch (command)
@@ -239,15 +261,15 @@ WheelSpeeds VirtualRobotHardware::wheelSpeedsForCommand(VirtualDriveCommand comm
 
 void VirtualRobotHardware::applyEffectiveWheelSpeeds() noexcept
 {
-    // Fixed priority (Phase 13Q; extended Phase 13S):
-    // Safety > Manual > AutonomousAvoidance > Fsm. RobotController's
-    // moveForward()/stop()/returnToBase() calls (via command_ above) and
-    // setManualWheelSpeeds()/setAutonomousWheelSpeeds()/
-    // setSafetyWheelSpeeds() all funnel through this one function, so
-    // drive authority is never decided by scattered ad-hoc checks
-    // elsewhere - this is the single source of truth main3d.cpp relies on
-    // instead of duplicating arbitration itself (docs/technical-decisions.md,
-    // Phase 13S).
+    // Fixed priority (Phase 13Q; extended Phase 13S; extended Phase 13T):
+    // Safety > Manual > AutonomousAvoidance > Navigation > Fsm.
+    // RobotController's moveForward()/stop()/returnToBase() calls (via
+    // command_ above) and setManualWheelSpeeds()/setAutonomousWheelSpeeds()/
+    // setSafetyWheelSpeeds()/setNavigationWheelSpeeds() all funnel through
+    // this one function, so drive authority is never decided by scattered
+    // ad-hoc checks elsewhere - this is the single source of truth
+    // main3d.cpp relies on instead of duplicating arbitration itself
+    // (docs/technical-decisions.md, Phase 13S/13T).
     WheelSpeeds speeds;
     if (safetyOverrideActive_)
     {
@@ -260,6 +282,10 @@ void VirtualRobotHardware::applyEffectiveWheelSpeeds() noexcept
     else if (autonomousOverrideActive_)
     {
         speeds = autonomousSpeeds_;
+    }
+    else if (navigationOverrideActive_)
+    {
+        speeds = navigationSpeeds_;
     }
     else
     {
