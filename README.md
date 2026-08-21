@@ -360,10 +360,12 @@ with the mouse (`TAB` toggles mouse capture, drag to rotate, scroll to
 zoom - raylib's built-in `CAMERA_FREE` mode) and an on-screen HUD showing
 the robot's live FSM state/command, (Phase 13Q) drive authority
 (`FSM`/`AUTONOMOUS`/`MANUAL`) and whether reactive avoidance is enabled,
-position, heading, obstacle count, (Phase 13O) the forward distance
-sensor's live reading, (Phase 13P) the current left/right wheel speeds and
-whether the last movement was rejected by the obstacle-collision guard
-(`Collision: YES`/`NO`). `SPACE` pauses/resumes world movement only
+(Phase 13R) whether the avoidance latch is currently active and whether
+the forward BODY-clearance corridor is clear or blocked, position,
+heading, obstacle count, (Phase 13O) the forward distance sensor's live
+reading, (Phase 13P) the current left/right wheel speeds and whether the
+last movement was rejected by the obstacle-collision guard (`Collision:
+YES`/`NO`). `SPACE` pauses/resumes world movement only
 (camera and FSM stepping are unaffected). `O` toggles the one demo
 obstacle placed directly in the robot's path, enabled/disabled, to
 demonstrate obstacle clearing. `M` toggles manual drive mode (Phase 13P,
@@ -570,6 +572,99 @@ it resumes forward on its new heading if that heading did not turn out to
 be quite clear enough (this is expected V1 behavior, not a bug - see
 `docs/technical-decisions.md`, Phase 13Q, "limitations").
 
+**As of Phase 13R, avoidance is body-clearance-aware, closing the Phase
+13Q limitation above.** The bug: "the forward sensor RAY is clear" is not
+the same fact as "the robot's physical BODY has room to move forward" -
+`VirtualDistanceSensor` casts a single zero-width ray, but the robot's
+actual collision footprint (`RobotCollision.hpp`) is a circle with real
+width. A heading could clear the narrow ray, hand control back to the FSM
+via the real `ObstacleCleared` edge, and then have `RobotController`'s
+`moveForward()` immediately run straight back into the very obstacle the
+ray had just "cleared" - `Moving` with zero further physical progress,
+repeatedly capped by the collision guard. Three distinct safety concepts
+now exist side by side, each with one job:
+
+```text
+VirtualDistanceSensor    -> perception: single forward ray, drives the real
+                             ObstacleDetected/ObstacleCleared Events
+                             (unchanged, Phase 13O)
+ForwardClearanceProbe    -> avoidance's release condition: does the robot's
+                             swept BODY corridor have room to move forward
+                             (new, Phase 13R)
+RobotCollision            -> final physical guard: unconditionally rejects
+                             any proposed pose that would penetrate an
+                             obstacle, regardless of what the other two
+                             report (unchanged, Phase 13P)
+```
+
+`ForwardClearanceProbe` (`include/robot/visual/ForwardClearanceProbe.hpp`,
+raylib-free, headless) answers "does the robot's body have a physically
+safe corridor to move forward along its CURRENT heading for
+`kLookaheadDistance` (1.4F) world units?" - a Minkowski-sum-style test:
+each enabled obstacle's X/Z footprint is expanded outward by
+`RobotCollision`'s own `kRobotCollisionRadius` (the *same* source of
+truth the physical guard uses, never a second hand-duplicated body
+dimension) plus a small `kSafetyMargin` (0.08F), and the finite forward
+center-line segment (robot center -> robot center +
+`forwardDirection(pose) * kLookaheadDistance`) is tested against that
+expanded box. `ReactiveObstacleAvoidance` (Phase 13Q) is now a small
+stateful LATCH instead of a stateless per-frame recomputation - once
+triggered (avoidance enabled, FSM `WaitingForObstacleClear`, sensor still
+detected), it stays `active()` across frames - including frames where the
+trigger condition has already gone false, e.g. the instant the real
+`ObstacleCleared` edge returns the FSM to `Moving` - until
+`ForwardClearanceProbe::isForwardCorridorClear()` is also true:
+
+```text
+Moving -> ObstacleDetected -> WaitingForObstacleClear -> Command: Stopped
+                                       |
+                                       v
+                    avoidance latch activates, robot turns in place
+                                       |
+                                       v
+                     forward sensor RAY eventually clears
+                                       |
+                                       v
+        HardwareEventSource naturally emits ObstacleCleared; FSM -> Moving
+                                       |
+                                       v
+       ** latch stays active if ForwardClearanceProbe still reports BLOCKED **
+                                       |
+                                       v
+              State: Moving, Command: MoveForward, Drive authority: AUTONOMOUS
+                          (a real, expected, tested intermediate state)
+                                       |
+                                       v
+                        robot keeps turning; body corridor clears
+                                       |
+                                       v
+                   latch deactivates; drive authority returns to FSM
+                                       |
+                                       v
+                  equal positive wheel speeds take effect; robot advances
+                  without the collision guard immediately rejecting it
+```
+
+`currentCommand()` (`MoveForward`) and `driveAuthority()` (`AUTONOMOUS`)
+can legitimately disagree for several frames after the FSM has already
+returned to `Moving` - this is intentional and directly tested
+(`ClearanceAwareAvoidanceClosedLoopThroughRealEventChain` in
+`tests/visual/VirtualRobotHardwareTests.cpp`), not a contradiction. Manual
+mode still always outranks avoidance (`Manual > AutonomousAvoidance >
+Fsm`, unchanged): the latch stays logically active underneath a manual
+override and is restored automatically the instant manual mode ends,
+exactly like Phase 13Q. **`ForwardClearanceProbe` and
+`ReactiveObstacleAvoidance` remain entirely raylib-free**, and this is
+still **reactive avoidance only** - no A*, Dijkstra, SLAM, map building,
+waypoint navigation, target tracking, or return-to-original-path
+behavior; the robot still does not attempt to recover its original
+heading once avoidance releases. The HUD gained two lines: `Avoidance
+active: YES/NO` (the latch's `active()`, distinct from the `Avoidance:
+ON/OFF` enable toggle above it) and `Forward clearance: CLEAR/BLOCKED`
+(this frame's `isForwardCorridorClear()` reading), plus `Clearance
+lookahead` showing the constant in use. See `docs/technical-decisions.md`
+(Phase 13R) for the full geometry derivation and latch semantics.
+
 **Still deliberately simple - not full robotics simulation.** The robot's
 position is only clamped to the demo world's ~10x10 bounds so it cannot
 drift away indefinitely (`DifferentialDrive` itself is world-bounds- and
@@ -764,7 +859,7 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `RobotSimulator` | The executable — `src/main.cpp` is a ~10-line composition root that calls into `robot_app`. |
 | `robot_visual_world` | `VirtualWorld`/`RobotPose`/`BoxObstacle`/`BasePlatform` (Phase 13M) - plain demo-scene data using this project's own `Vec3`, deliberately raylib-free. `VirtualWorld::setRobotPosition()`/`setRobotHeading()` (Phase 13N) and `setObstaclePosition()`/`setObstacleEnabled()` (Phase 13O) are its only mutation entry points. Depends only on `robot_domain` for the include directory. |
 | `robot_visual` | `VisualRobot`/`Renderer3D` (Phase 13M), the raylib-based 3D drawing layer. Depends on `robot_visual_world` and `raylib`. This is the **only** point where this project depends on raylib - the dependency points inward, never the other way, and no robot-core/domain/hardware target links it. `Renderer3D` receives a plain `VisualTelemetry` struct (state/command text plus sensor readings, Phase 13N/13O) rather than depending on any FSM/hardware/sensor type. |
-| `robot_visual_simulation` | `VirtualRobotHardware` (Phase 13N) - the `IRobotHardware` implementation that is the visual simulator's FSM-driven actuator/sensor boundary, translating `RobotController` commands into wheel speeds and, once per frame, `VirtualWorld` pose changes via `update()` - plus `VirtualDistanceSensor` (Phase 13O), the raylib-free geometry-based forward distance sensor `obstacleDetected()`/`obstacleDistance()` are backed by, and `DifferentialDrive`/`RobotCollision`/`ManualDriveInput` (Phase 13P) - the raylib-free differential-drive kinematic model `VirtualRobotHardware::update()` delegates movement to, the raylib-free circle-vs-AABB obstacle collision query that same `update()` validates a proposed pose against before committing it, and the pure X/UP/DOWN/LEFT/RIGHT wheel-speed decision function behind `RobotSimulator3D`'s manual drive mode (only caller: `main3d.cpp`), respectively, and `ReactiveObstacleAvoidance` (Phase 13Q) - the deterministic, stateless, raylib-free "what wheel speeds does an avoidance turn use" policy behind `RobotSimulator3D`'s reactive obstacle avoidance, with `VirtualRobotHardware::driveAuthority()`/`setAutonomousWheelSpeeds()`/`clearAutonomousWheelOverride()` implementing its fixed Manual > AutonomousAvoidance > Fsm priority. Depends on `robot_visual_world`, `robot_hardware`, `robot_controller`, `robot_runtime`, and `robot_domain` - the same real FSM/controller/runtime stack the CLI uses. Deliberately has no raylib dependency, and is a sibling of `robot_visual` (neither depends on the other) under `RobotSimulator3D`. |
+| `robot_visual_simulation` | `VirtualRobotHardware` (Phase 13N) - the `IRobotHardware` implementation that is the visual simulator's FSM-driven actuator/sensor boundary, translating `RobotController` commands into wheel speeds and, once per frame, `VirtualWorld` pose changes via `update()` - plus `VirtualDistanceSensor` (Phase 13O), the raylib-free geometry-based forward distance sensor `obstacleDetected()`/`obstacleDistance()` are backed by, and `DifferentialDrive`/`RobotCollision`/`ManualDriveInput` (Phase 13P) - the raylib-free differential-drive kinematic model `VirtualRobotHardware::update()` delegates movement to, the raylib-free circle-vs-AABB obstacle collision query that same `update()` validates a proposed pose against before committing it, and the pure X/UP/DOWN/LEFT/RIGHT wheel-speed decision function behind `RobotSimulator3D`'s manual drive mode (only caller: `main3d.cpp`), respectively, and `ReactiveObstacleAvoidance` (Phase 13Q; a stateful latch as of Phase 13R) - the raylib-free "what wheel speeds does an avoidance turn use, and is the turn still active" policy behind `RobotSimulator3D`'s reactive obstacle avoidance, with `VirtualRobotHardware::driveAuthority()`/`setAutonomousWheelSpeeds()`/`clearAutonomousWheelOverride()` implementing its fixed Manual > AutonomousAvoidance > Fsm priority, plus `ForwardClearanceProbe` (Phase 13R) - the raylib-free swept-body forward-corridor clearance query (expanded-AABB-vs-segment, reusing `RobotCollision`'s own collision radius) that drives the avoidance latch's release condition, distinct from `VirtualDistanceSensor`'s single-point-ray perception and never a substitute for `RobotCollision`'s own unconditional final penetration guard. Depends on `robot_visual_world`, `robot_hardware`, `robot_controller`, `robot_runtime`, and `robot_domain` - the same real FSM/controller/runtime stack the CLI uses. Deliberately has no raylib dependency, and is a sibling of `robot_visual` (neither depends on the other) under `RobotSimulator3D`. |
 | `RobotSimulator3D` | The interactive 3D visual simulator executable. Depends on `robot_visual` (rendering), `robot_visual_simulation` (FSM-driven movement/sensing), and (Phase 13O) `robot_hardware_events`/`robot_polling_composite` directly, since `main3d.cpp` constructs a real `HardwareEventSource`/`CompositePollingEventSource` - never links `robot_app`, and `RobotSimulator` never links any of these or raylib. `main3d.cpp` constructs the real `RobotStateMachine`/`RobotController`/`RobotRuntime` plus a tiny visual-only `DemoCommandSource` to reach `Moving` through real FSM transitions, and (Phase 13O) the real `HardwareEventSource` to reach `WaitingForObstacleClear`/back to `Moving` through the same real transition rules. |
 
 Dependencies flow one way only: `RobotStateMachine` never depends on

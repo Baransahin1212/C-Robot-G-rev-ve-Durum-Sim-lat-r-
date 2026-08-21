@@ -7,6 +7,7 @@
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/DemoCommandSource.hpp"
+#include "robot/visual/ForwardClearanceProbe.hpp"
 #include "robot/visual/ManualDriveInput.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
@@ -49,7 +50,12 @@ constexpr float kManualWheelSpeed = 1.0F;
 // manualDriveMode block below and docs/technical-decisions.md. As of
 // Phase 13Q, an A-toggled reactive obstacle-avoidance policy sits between
 // manual and the FSM in drive authority - see the avoidanceEnabled block
-// below.
+// below. As of Phase 13R, that policy is body-clearance-aware: the
+// avoidance latch (ReactiveObstacleAvoidance::active()) can legitimately
+// stay engaged for several frames after the FSM has already returned to
+// Moving, if ForwardClearanceProbe still reports the robot's physical
+// body corridor as blocked - see the frame-order block below and
+// docs/technical-decisions.md (Phase 13R).
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -70,13 +76,25 @@ int main()
     robot::RobotRuntime runtime(compositeSource, stateMachine, controller);
     robot::visual::Renderer3D renderer;
 
-    // Reactive obstacle-avoidance policy (Phase 13Q) - stateless/
-    // deterministic, only ever answers "what wheel speeds does an
-    // avoidance turn use." The decision of *whether* to apply it each
-    // frame lives entirely here in main3d.cpp (see avoidanceEnabled
-    // below) - ReactiveObstacleAvoidance itself has no FSM/sensor
-    // knowledge.
+    // Reactive obstacle-avoidance policy (Phase 13Q; stateful latch as of
+    // Phase 13R) - only ever answers "what wheel speeds does an avoidance
+    // turn use" and "is the latch currently engaged." The decision of
+    // *whether/when* to trigger or release it each frame lives entirely
+    // here in main3d.cpp (see the update() call below) -
+    // ReactiveObstacleAvoidance itself has no FSM/sensor/clearance
+    // knowledge of its own.
     robot::visual::ReactiveObstacleAvoidance avoidance;
+
+    // Forward BODY-clearance probe (Phase 13R) - answers a different
+    // question than the point-ray VirtualDistanceSensor below: whether
+    // the robot's circular collision footprint has a physically safe
+    // corridor to move forward along its current heading, not merely
+    // whether a single ray is unobstructed. Drives avoidance's release
+    // condition (see the update() call below) - never
+    // RobotStateMachine/RobotController/RobotRuntime/IRobotHardware
+    // directly, and never a replacement for RobotCollision's own
+    // unconditional last-resort guard inside VirtualRobotHardware::update().
+    robot::visual::ForwardClearanceProbe clearanceProbe(world);
 
     // Display-only sensor handle (Phase 13O): reads the exact same
     // VirtualWorld state VirtualRobotHardware's own internal sensor does, so
@@ -198,13 +216,51 @@ int main()
         // detection.
         runtime.step();
 
-        // Determine and apply drive authority (Phase 13Q) - manual first,
-        // autonomous avoidance second, FSM otherwise (see
-        // VirtualRobotHardware::driveAuthority()). This runs AFTER
-        // runtime.step() specifically so the avoidance decision below sees
-        // this frame's up-to-date FSM state (e.g. a WaitingForObstacleClear
-        // transition that just happened this same frame) - see
-        // docs/technical-decisions.md (Phase 13Q, frame order).
+        // Compute this frame's forward BODY-clearance telemetry (Phase
+        // 13R) - independent of, and complementary to, the point-ray
+        // sensor below. Read once here so the trigger/release decision
+        // and the HUD telemetry always agree on the exact same value.
+        const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
+
+        // Advance the avoidance latch (Phase 13R) - runs every frame,
+        // regardless of manual drive mode, so it stays in sync with the
+        // real FSM/sensor/clearance state and is correctly restored the
+        // instant manual mode ends (see docs/technical-decisions.md,
+        // Phase 13R, "manual priority while latched"). The trigger
+        // condition is unchanged from Phase 13Q (section 7): avoidance
+        // enabled, the FSM is actually WaitingForObstacleClear, and the
+        // forward sensor still reports the obstacle. This never calls
+        // stateMachine.processEvent()/handleEvent() or injects
+        // ObstacleDetected/ObstacleCleared itself - HardwareEventSource
+        // observes the sensor's real true -> false edge naturally, once
+        // the turn below has rotated the sensor ray far enough away from
+        // the obstacle. What changed from Phase 13Q: the FSM's real
+        // return to Moving on that edge no longer by itself releases the
+        // override - the latch stays active until forwardCorridorClear is
+        // also true.
+        const bool triggerAvoidance = avoidanceEnabled &&
+                                       stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
+                                       hardware.obstacleDetected();
+        avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear);
+
+        // Apply drive authority (Manual > AutonomousAvoidance > Fsm - see
+        // VirtualRobotHardware::driveAuthority()). The autonomous override
+        // is kept in sync with the latch unconditionally, even while
+        // manual mode is active: manual still physically wins (driveAuthority()
+        // always prefers it), but the avoidance request stays logically
+        // latched underneath, exactly as it did in Phase 13Q, and is
+        // restored automatically the instant manual mode ends without
+        // needing to be re-triggered.
+        if (avoidance.active())
+        {
+            const robot::visual::WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+            hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+        }
+        else if (hardware.autonomousOverrideActive())
+        {
+            hardware.clearAutonomousWheelOverride();
+        }
+
         if (manualDriveMode)
         {
             // Recomputed from scratch every frame from currently-held
@@ -221,12 +277,6 @@ int main()
             // silently override X's zero and the robot would resume
             // moving). Combining UP/DOWN with LEFT/RIGHT produces an arc
             // turn; holding only LEFT/RIGHT rotates in place.
-            //
-            // While manual mode is active, any pending autonomous-
-            // avoidance override is deliberately left untouched below (the
-            // policy is simply not evaluated) - it automatically resumes
-            // the instant clearManualWheelOverride() runs above, without
-            // needing to be re-requested.
             const robot::visual::WheelSpeeds manualSpeeds = robot::visual::computeManualWheelSpeeds(
                 IsKeyDown(KEY_UP), IsKeyDown(KEY_DOWN), IsKeyDown(KEY_LEFT), IsKeyDown(KEY_RIGHT), IsKeyDown(KEY_X),
                 kManualWheelSpeed);
@@ -236,34 +286,6 @@ int main()
             // fake RobotController/IRobotHardware call, and never
             // presented as if it came from the FSM.
             hardware.setManualWheelSpeeds(manualSpeeds.left, manualSpeeds.right);
-        }
-        else
-        {
-            // Simple V1 reactive-avoidance policy (Phase 13Q, section 7):
-            // engage only while avoidance is enabled, the FSM is actually
-            // WaitingForObstacleClear, and the forward sensor still
-            // reports the obstacle. The moment any of those stops holding
-            // true - including the real ObstacleCleared edge returning the
-            // FSM to Moving above - the override is released and control
-            // falls back to whatever RobotController/the FSM currently
-            // wants. This never calls stateMachine.processEvent()/
-            // handleEvent() or injects ObstacleDetected/ObstacleCleared
-            // itself - HardwareEventSource observes the sensor's real
-            // true -> false edge naturally, once the turn below has
-            // rotated the sensor ray far enough away from the obstacle.
-            const bool shouldAvoidObstacle = avoidanceEnabled &&
-                                              stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
-                                              hardware.obstacleDetected();
-
-            if (shouldAvoidObstacle)
-            {
-                const robot::visual::WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
-                hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
-            }
-            else if (hardware.autonomousOverrideActive())
-            {
-                hardware.clearAutonomousWheelOverride();
-            }
         }
 
         if (!worldPaused)
@@ -285,6 +307,9 @@ int main()
         telemetry.driveAuthorityText = robot::visual::toString(hardware.driveAuthority());
         telemetry.collidedLastUpdate = hardware.collidedLastUpdate();
         telemetry.avoidanceEnabled = avoidanceEnabled;
+        telemetry.avoidanceActive = avoidance.active();
+        telemetry.forwardClearanceClear = forwardCorridorClear;
+        telemetry.clearanceLookahead = robot::visual::ForwardClearanceProbe::kLookaheadDistance;
 
         // Camera updates (mouse-look and CAMERA_FREE's own arrow-key
         // pitch/yaw) are suppressed while manual drive mode is active -

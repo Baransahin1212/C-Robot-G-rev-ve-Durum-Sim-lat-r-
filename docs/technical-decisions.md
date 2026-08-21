@@ -2069,6 +2069,182 @@ are never constructed/injected directly - both still only ever come from
 `HardwareEventSource` reading `VirtualRobotHardware`'s real sensor state,
 exactly as in Phase 13O.
 
+## Phase 13R: clearance-aware reactive avoidance
+
+### The Phase 13Q limitation, precisely
+
+Phase 13Q's V1 avoidance policy released the moment the FSM's real
+`ObstacleCleared` edge returned it to `Moving`. That edge is driven
+entirely by `VirtualDistanceSensor`, which casts one zero-width forward
+ray from the robot's front. "The ray is clear" and "the robot's BODY has
+room to move forward" are different facts: the robot's actual physical
+footprint (`RobotCollision.hpp`'s `kRobotCollisionRadius` circle) has
+real width, so a heading can rotate the ray clear of an obstacle's
+corner while the circle would still clip it. The Phase 13Q section
+documented this outcome explicitly ("Real limitation discovered while
+writing the closed-loop test") but did not fix it: `MoveForward` could
+resume, and `RobotCollision` (not the FSM/sensor) would immediately cap
+further progress again - `State: Moving` with the robot physically stuck.
+
+### Three safety concepts, three separate jobs
+
+Phase 13R does not merge or replace any of the existing three - it adds a
+fourth relationship between two of them:
+
+1. **`VirtualDistanceSensor`** (Phase 13O, unchanged) - perception. One
+   forward ray, drives the real `ObstacleDetected`/`ObstacleCleared`
+   `Event`s through the unmodified `HardwareEventSource`. This is the
+   only source of those events; nothing about that changes.
+2. **`ForwardClearanceProbe`** (new) - avoidance's *release condition*.
+   Answers "does the robot's swept body have a physically safe forward
+   corridor," not "is a single ray unobstructed."
+3. **`RobotCollision`** (Phase 13P, unchanged) - the final, unconditional
+   physical guard inside `VirtualRobotHardware::update()`. Every proposed
+   pose is still validated against it regardless of what the sensor or
+   the clearance probe report - `ForwardClearanceProbe` is a *release*
+   heuristic for avoidance, never a replacement for this guard.
+
+### `ForwardClearanceProbe`: expanded-AABB / swept-circle corridor
+
+The robot's collision footprint is a circle (`kRobotCollisionRadius`,
+`0.5F` exactly for this project's `RobotDimensions`). Sweeping a circle
+along a forward segment and testing it against each obstacle's exact
+box is equivalent to (and simpler than) the reverse: expand each
+obstacle's X/Z AABB outward by the same radius (plus a small
+`kSafetyMargin`, `0.08F`) on every side, then test the ORIGINAL,
+un-swept segment against the expanded box - a standard Minkowski-sum
+simplification. The segment runs from the robot's center to its center
+plus `forwardDirection(pose) * kLookaheadDistance` (`1.4F`); intersection
+uses the same slab method `VirtualDistanceSensor.cpp` already uses for
+its ray, adapted to a bounded `[0, length]` parametric range instead of
+`[0, +inf)` so an obstacle entirely behind the segment's start (the
+robot's current center) or entirely beyond the lookahead distance can
+never register, without a separate special case for either - the clamped
+`tMin`/`tMax` range handles both automatically. `clearanceRadius`
+(`kRobotCollisionRadius + kSafetyMargin`) is always derived from
+`RobotCollision.hpp`'s own constant, never a second hand-duplicated body
+dimension - see `include/robot/visual/ForwardClearanceProbe.hpp` for the
+exact rationale behind the `1.4F`/`0.08F` constants.
+
+**Why width, not just length, is the fix.** `VirtualDistanceSensor`'s ray
+has zero width; `ForwardClearanceProbe`'s corridor has the robot's full
+collision width. As the robot turns, the ray sweeps clear of an
+obstacle's angular extent strictly before the wider corridor does - this
+is *why* the sensor's `ObstacleCleared` edge reliably fires before the
+body corridor is actually safe, not a coincidence of this project's
+specific demo geometry. (The lookahead distance, `1.4F`, is deliberately
+close to the sensor's own effective forward reach from the robot's
+center - `kDetectionDistance` 1.0 plus the sensor's own 0.4 front offset
+- so the fix is squarely about width, not artificially extending how far
+ahead avoidance looks.)
+
+### The avoidance latch
+
+`ReactiveObstacleAvoidance` gained one boolean field and one method,
+`update(bool enabled, bool triggerAvoidance, bool forwardCorridorClear)`:
+
+```cpp
+void ReactiveObstacleAvoidance::update(bool enabled, bool triggerAvoidance, bool forwardCorridorClear) noexcept
+{
+    if (!enabled) { active_ = false; return; }
+    if (triggerAvoidance) { active_ = true; }
+    if (active_ && forwardCorridorClear) { active_ = false; }
+}
+```
+
+Semantics, in order of precedence: `enabled == false` (the `A` toggle)
+always wins, forcing the latch off immediately regardless of the other
+two arguments. Otherwise, a true `triggerAvoidance` activates the latch
+(idempotent if already active) - unchanged Phase 13Q trigger condition:
+avoidance enabled, FSM `WaitingForObstacleClear`, sensor still detected.
+Once active, the latch survives calls where `triggerAvoidance` has
+already gone false - the direct fix, since that is exactly what happens
+the frame the real `ObstacleCleared` edge returns the FSM to `Moving` -
+and only clears when `forwardCorridorClear` is separately observed true.
+`avoidanceWheelSpeeds()` itself is unchanged (`{-0.6F, +0.6F}`,
+deterministic, independent of `active()`); `active()` is the caller's cue
+for whether to apply it.
+
+`main3d.cpp` calls `avoidance.update()` exactly once per frame,
+unconditionally - including while manual drive mode is active - so the
+latch always reflects the real, current FSM/sensor/clearance state:
+
+```cpp
+const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
+const bool triggerAvoidance = avoidanceEnabled &&
+    stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
+    hardware.obstacleDetected();
+avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear);
+
+if (avoidance.active())
+{
+    const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+    hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+}
+else if (hardware.autonomousOverrideActive())
+{
+    hardware.clearAutonomousWheelOverride();
+}
+
+if (manualDriveMode) { hardware.setManualWheelSpeeds(...); }
+```
+
+Running `update()`/the autonomous-override sync unconditionally (not
+skipped during manual mode, unlike Phase 13Q's original structure) is
+what makes the manual-priority-while-latched semantics fall out for
+free: manual still physically wins (`driveAuthority()`'s fixed `Manual >
+AutonomousAvoidance > Fsm` priority, unchanged), but the latch keeps
+tracking real clearance underneath, so the instant manual mode ends,
+`driveAuthority()` correctly reads `AUTONOMOUS` if clearance is still
+blocked, or `FSM` if clearance became safe while manual was engaged -
+with no explicit "was avoidance pending" bookkeeping needed in
+`main3d.cpp` beyond calling `update()` every frame.
+
+### Why `ObstacleCleared` still comes only from `HardwareEventSource`
+
+Phase 13R never calls `stateMachine.processEvent()`/`handleEvent()` and
+never constructs an `ObstacleDetected`/`ObstacleCleared` `Event` directly,
+exactly like Phase 13Q. The FSM's `Moving` transition is still driven
+purely by the sensor's real edge - what changed is *what happens after*:
+the FSM reaching `Moving` no longer implies avoidance releases wheel
+authority. This keeps the boundary intact: `HardwareEventSource` is
+still the only thing that decides FSM transitions from hardware state;
+`ReactiveObstacleAvoidance` only ever decides who holds the *wheels*,
+a visual-simulator-only concept the FSM has no knowledge of.
+
+### Why the collision guard remains separate
+
+`ForwardClearanceProbe` is deliberately not wired into
+`VirtualRobotHardware::update()` or `RobotCollision` in any way. It is a
+*heuristic release condition* for a specific policy (when should
+avoidance stop turning), computed once per frame from the CURRENT
+heading only; `RobotCollision` is an *unconditional guard* validated
+against every single proposed pose, forward or otherwise, manual or
+autonomous or FSM-driven, regardless of any avoidance state. Collapsing
+them would mean a proposed pose's validity depended on which policy
+last happened to compute clearance, instead of being a pure function of
+the proposed position and the obstacle list - a strictly worse
+invariant. The two remaining separate, redundant-by-design, is why
+Phase 13R's fix does not weaken Phase 13P's guarantee at all: resumed
+`MoveForward` after avoidance releases is expected to *not* immediately
+collide (a slightly larger effective radius than `RobotCollision`'s own
+was checked for `kLookaheadDistance` ahead), but it is still validated
+pose-by-pose exactly as before, with no special case for "avoidance just
+released."
+
+### What was NOT touched
+
+Same list as Phase 13Q, still true: no new `RobotState` values, no new
+FSM transitions, no `TurnLeft`/`TurnRight` (or any other) addition to
+`IRobotHardware`, no change to `RobotController`'s `RobotState ->
+IRobotHardware` mapping, no change to `HardwareEventSource`'s edge-
+trigger semantics, no change to `CompositePollingEventSource`'s command-
+before-sensor priority, no change to `RobotStateMachine`/`RobotRuntime`.
+Still not A*, Dijkstra, SLAM, map building, waypoint navigation, target
+tracking, dynamic obstacle prediction, or return-to-original-path
+behavior - "turn until the forward BODY corridor clears, then continue"
+is still the entire policy.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

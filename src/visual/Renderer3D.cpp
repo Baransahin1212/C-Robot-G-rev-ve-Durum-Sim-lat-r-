@@ -174,6 +174,18 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     char avoidanceLine[64];
     std::snprintf(avoidanceLine, sizeof(avoidanceLine), "Avoidance: %s", telemetry.avoidanceEnabled ? "ON" : "OFF");
 
+    char avoidanceActiveLine[64];
+    std::snprintf(avoidanceActiveLine, sizeof(avoidanceActiveLine), "Avoidance active: %s",
+                   telemetry.avoidanceActive ? "YES" : "NO");
+
+    char forwardClearanceLine[64];
+    std::snprintf(forwardClearanceLine, sizeof(forwardClearanceLine), "Forward clearance: %s",
+                   telemetry.forwardClearanceClear ? "CLEAR" : "BLOCKED");
+
+    char clearanceLookaheadLine[64];
+    std::snprintf(clearanceLookaheadLine, sizeof(clearanceLookaheadLine), "Clearance lookahead: %.2f",
+                   telemetry.clearanceLookahead);
+
     char collisionLine[64];
     std::snprintf(collisionLine, sizeof(collisionLine), "Collision: %s", telemetry.collidedLastUpdate ? "YES" : "NO");
 
@@ -186,6 +198,9 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {commandLine, 18, kHudTextColor},
         {driveAuthorityLine, 18, kHudTextColor},
         {avoidanceLine, 18, kHudTextColor},
+        {avoidanceActiveLine, 18, kHudTextColor},
+        {forwardClearanceLine, 18, kHudTextColor},
+        {clearanceLookaheadLine, 18, kHudTextColor},
         {positionLine, 18, kHudTextColor},
         {headingLine, 18, kHudTextColor},
         {obstaclesLine, 18, kHudTextColor},

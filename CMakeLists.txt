@@ -434,11 +434,18 @@ target_link_libraries(robot_visual PUBLIC
 # the pure X/UP/DOWN/LEFT/RIGHT -> WheelSpeeds decision function behind
 # RobotSimulator3D's manual drive mode, kept here so it is unit-testable
 # without raylib even though its only caller is main3d.cpp.
-# ReactiveObstacleAvoidance (Phase 13Q) is the deterministic, stateless,
-# raylib-free "what wheel speeds does an avoidance turn use" policy behind
-# RobotSimulator3D's autonomous obstacle avoidance - it has no FSM/sensor
-# knowledge of its own; the decision of *when* to apply its wheel speeds
-# lives in main3d.cpp, exactly like ManualDriveInput's decision function.
+# ReactiveObstacleAvoidance (Phase 13Q; stateful latch as of Phase 13R) is
+# the raylib-free "what wheel speeds does an avoidance turn use, and is
+# the turn still active" policy behind RobotSimulator3D's autonomous
+# obstacle avoidance - it has no FSM/sensor/clearance knowledge of its
+# own; the decision of *when* to trigger/release it lives in main3d.cpp,
+# exactly like ManualDriveInput's decision function. ForwardClearanceProbe
+# (Phase 13R) is the raylib-free swept-body forward-corridor clearance
+# query - expanded-AABB-vs-segment, using RobotCollision's own collision
+# radius as its source of truth - that drives avoidance's release
+# condition; it answers a different question than VirtualDistanceSensor's
+# single-point ray (perception) and is never a substitute for
+# RobotCollision's own unconditional final penetration guard.
 add_library(robot_visual_simulation STATIC
     src/visual/VirtualRobotHardware.cpp
     src/visual/VirtualDistanceSensor.cpp
@@ -446,6 +453,7 @@ add_library(robot_visual_simulation STATIC
     src/visual/RobotCollision.cpp
     src/visual/ManualDriveInput.cpp
     src/visual/ReactiveObstacleAvoidance.cpp
+    src/visual/ForwardClearanceProbe.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -908,6 +916,23 @@ target_link_libraries(ReactiveObstacleAvoidanceTests PRIVATE
 
 gtest_discover_tests(ReactiveObstacleAvoidanceTests)
 
+# --- ForwardClearanceProbeTests: swept-body forward corridor clearance
+# geometry (Phase 13R) - the expanded-AABB-vs-segment test behind
+# avoidance's release condition, distinct from VirtualDistanceSensor's
+# single-point ray. Links only robot_visual_simulation - never
+# robot_visual/raylib - genuinely headless, no window is ever created by
+# this target.
+add_executable(ForwardClearanceProbeTests
+    tests/visual/ForwardClearanceProbeTests.cpp
+)
+
+target_link_libraries(ForwardClearanceProbeTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(ForwardClearanceProbeTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -928,6 +953,7 @@ if (MSVC)
         SerialRobotTransportTests VirtualWorldTests VirtualRobotHardwareTests
         VirtualDistanceSensorTests DifferentialDriveTests
         RobotCollisionTests ManualDriveInputTests ReactiveObstacleAvoidanceTests
+        ForwardClearanceProbeTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

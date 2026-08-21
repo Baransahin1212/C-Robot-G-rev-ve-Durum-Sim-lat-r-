@@ -52,8 +52,33 @@ struct VisualTelemetry
     // Phase 13Q: whether RobotSimulator3D's reactive-obstacle-avoidance
     // policy is currently enabled (the `A` toggle in main3d.cpp) -
     // independent of whether it is actively turning the robot right now
-    // (see driveAuthorityText above for that).
+    // (see avoidanceActive below for that).
     bool avoidanceEnabled = false;
+
+    // Phase 13R: whether ReactiveObstacleAvoidance's latch is currently
+    // engaged this frame (main3d.cpp's avoidance.active()) - distinct
+    // from driveAuthorityText, which can briefly still read "AUTONOMOUS"
+    // even one frame after this turns false (the override is cleared the
+    // same frame active() goes false, so in practice they change
+    // together, but they are conceptually different questions: this is
+    // "does the avoidance policy want the wheels," driveAuthorityText is
+    // "who currently has them"). Makes the key Phase 13R transitional
+    // state - the latch remaining active after the FSM has already
+    // returned to Moving - directly visible in the HUD.
+    bool avoidanceActive = false;
+
+    // Phase 13R: this frame's ForwardClearanceProbe::isForwardCorridorClear()
+    // reading - true when the robot's physical body has a safe forward
+    // corridor along its current heading, independent of (and generally
+    // lagging behind) obstacleDetected() above, which only reflects a
+    // single forward sensor ray. This is the value that actually gates
+    // avoidanceActive's release.
+    bool forwardClearanceClear = false;
+
+    // Phase 13R: ForwardClearanceProbe::kLookaheadDistance, surfaced so
+    // the HUD can display it - Renderer3D never computes clearance
+    // geometry itself, it only ever displays already-computed telemetry.
+    float clearanceLookahead = 0.0F;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,
