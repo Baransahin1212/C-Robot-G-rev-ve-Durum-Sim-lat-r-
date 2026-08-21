@@ -67,6 +67,14 @@ constexpr Color kHudTitleColor = RAYWHITE;
 constexpr Color kHudTextColor = RAYWHITE;
 constexpr Color kHudControlsColor = LIGHTGRAY;
 
+// Mission Control panel (Phase 13U): top-right, deliberately separate
+// from the engineering HUD panel's top-left position above - the two
+// never overlap regardless of HudMode/window size, since each is sized
+// and placed independently.
+constexpr int kMissionControlMarginRight = 20;
+constexpr int kMissionControlMarginY = 20;
+constexpr Color kMissionControlTaskColor = Color{255, 220, 100, 255};
+
 struct HudLine
 {
     const char* text;
@@ -101,6 +109,7 @@ void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, const
     EndMode3D();
 
     drawHud(world, telemetry);
+    drawMissionControlPanel(telemetry);
 
     EndDrawing();
 }
@@ -472,6 +481,53 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     }
 
     DrawFPS(10, GetScreenHeight() - 30);
+}
+
+void Renderer3D::drawMissionControlPanel(const VisualTelemetry& telemetry) const
+{
+    char taskLine[48];
+    std::snprintf(taskLine, sizeof(taskLine), "Task: %.*s", static_cast<int>(telemetry.missionTaskText.size()),
+                   telemetry.missionTaskText.data());
+
+    char homeZoneLine[48];
+    std::snprintf(homeZoneLine, sizeof(homeZoneLine), "Home zone: %s", telemetry.homeZoneInside ? "INSIDE" : "OUTSIDE");
+
+    char baseDistanceLine[48];
+    std::snprintf(baseDistanceLine, sizeof(baseDistanceLine), "Base distance: %.2f", telemetry.baseDistance);
+
+    const HudLine lines[] = {
+        {"MISSION CONTROL", 20, kHudTitleColor},
+        {taskLine, 18, kMissionControlTaskColor},
+        {"1  Start Roam", 16, kHudControlsColor},
+        {"2  Return Home", 16, kHudControlsColor},
+        {"3  Stop Task", 16, kHudControlsColor},
+        {"R  Return Home", 16, kHudControlsColor},
+        {homeZoneLine, 16, kHudTextColor},
+        {baseDistanceLine, 16, kHudTextColor},
+    };
+    constexpr std::size_t lineCount = sizeof(lines) / sizeof(lines[0]);
+
+    int panelWidth = 0;
+    int contentHeight = 0;
+    for (std::size_t i = 0; i < lineCount; ++i)
+    {
+        panelWidth = std::max(panelWidth, MeasureText(lines[i].text, lines[i].fontSize));
+        contentHeight += lines[i].fontSize + kHudLineSpacing;
+    }
+    panelWidth += 2 * kHudPadding;
+    const int panelHeight = contentHeight + (2 * kHudPadding) - kHudLineSpacing;
+
+    const int panelX = GetScreenWidth() - kMissionControlMarginRight - panelWidth;
+    const int panelY = kMissionControlMarginY;
+    DrawRectangle(panelX, panelY, panelWidth, panelHeight, kHudPanelBackground);
+
+    const int textX = panelX + kHudPadding;
+    int textY = panelY + kHudPadding;
+    for (std::size_t i = 0; i < lineCount; ++i)
+    {
+        DrawText(lines[i].text, textX, textY, lines[i].fontSize, lines[i].color);
+        textY += lines[i].fontSize + kHudLineSpacing;
+    }
 }
 
 } // namespace robot::visual

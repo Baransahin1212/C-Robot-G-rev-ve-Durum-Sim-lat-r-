@@ -55,6 +55,7 @@ std::optional<EventType> CommandFromString(const std::string& name)
         {"start_mission", EventType::StartMission},
         {"mission_completed", EventType::MissionCompleted},
         {"return_home", EventType::ReturnHomeRequested},
+        {"stop_task", EventType::StopTaskRequested},
         {"home_reached", EventType::HomeReached},
         {"reset", EventType::Reset},
     };

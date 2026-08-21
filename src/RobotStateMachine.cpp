@@ -61,6 +61,17 @@ TransitionResult RobotStateMachine::processEvent(const Event& event)
                     resumeState_ = RobotState::Moving;
                     state_ = RobotState::WaitingForObstacleClear;
                     return TransitionResult::Success;
+                case EventType::StopTaskRequested:
+                    // Phase 13U: user-cancelled task, not a mission
+                    // failure/completion and not a fault - lands in the
+                    // same reusable Ready state a user-requested Return
+                    // Home arrival already uses (see
+                    // ReturningHome + HomeReached below), so a new task
+                    // can be assigned immediately. returnHomeReason_ is
+                    // already None here (Moving never sets it) - nothing
+                    // to clear.
+                    state_ = RobotState::Ready;
+                    return TransitionResult::Success;
                 case EventType::BatteryCritical:
                     // Automatic mission-abort trigger - see
                     // ReturnHomeReason::MissionAbort's own docs.
@@ -102,6 +113,20 @@ TransitionResult RobotStateMachine::processEvent(const Event& event)
                 case EventType::ObstacleCleared:
                     state_ = resumeState_;
                     return TransitionResult::Success;
+                case EventType::StopTaskRequested:
+                    // Phase 13U: cancels whichever task was interrupted by
+                    // the obstacle pause - Roam (resumeState_ == Moving)
+                    // or a Return Home (resumeState_ == ReturningHome).
+                    // Either way this lands in Ready, and any in-flight
+                    // Return Home reason is discarded (see the
+                    // ReturningHome case's own StopTaskRequested docs
+                    // below) - a stale resumeState_ is never read again
+                    // afterward, since the only reader (ObstacleCleared,
+                    // above) is unreachable once state_ is no longer
+                    // WaitingForObstacleClear.
+                    returnHomeReason_ = ReturnHomeReason::None;
+                    state_ = RobotState::Ready;
+                    return TransitionResult::Success;
                 case EventType::EmergencyStop:
                     state_ = RobotState::EmergencyStopped;
                     return TransitionResult::Success;
@@ -141,6 +166,21 @@ TransitionResult RobotStateMachine::processEvent(const Event& event)
                 case EventType::ObstacleDetected:
                     resumeState_ = RobotState::ReturningHome;
                     state_ = RobotState::WaitingForObstacleClear;
+                    return TransitionResult::Success;
+                case EventType::StopTaskRequested:
+                    // Phase 13U: cancels an in-progress Return Home
+                    // (whether user-requested or an automatic mission-
+                    // abort) - the user gets the robot back under their
+                    // control immediately. returnHomeReason_ must be
+                    // cleared here: otherwise it would stay set (e.g.
+                    // UserRequest) while sitting in Ready with no active
+                    // task, violating returnHomeReason()'s own documented
+                    // invariant ("Valid only while currentState() ==
+                    // ReturningHome; None otherwise") and leaving a stale
+                    // value for a Full-HUD "Return reason" line to
+                    // display incorrectly.
+                    returnHomeReason_ = ReturnHomeReason::None;
+                    state_ = RobotState::Ready;
                     return TransitionResult::Success;
                 case EventType::EmergencyStop:
                     state_ = RobotState::EmergencyStopped;

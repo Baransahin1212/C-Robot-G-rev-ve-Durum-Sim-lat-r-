@@ -1,3 +1,5 @@
+#include <cmath>
+
 #include "raylib.h"
 
 #include "robot/CompositePollingEventSource.hpp"
@@ -6,14 +8,15 @@
 #include "robot/RobotRuntime.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
-#include "robot/visual/DemoCommandSource.hpp"
 #include "robot/visual/ForwardClearanceProbe.hpp"
 #include "robot/visual/HomeArrivalEventSource.hpp"
 #include "robot/visual/HomeNavigator.hpp"
+#include "robot/visual/HomeZoneMonitor.hpp"
 #include "robot/visual/ManualDriveInput.hpp"
+#include "robot/visual/MissionControlEventSource.hpp"
+#include "robot/visual/MissionTask.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
-#include "robot/visual/ReturnHomeRequestSource.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/VirtualCliffSensor.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
@@ -41,42 +44,54 @@ constexpr float kManualWheelSpeed = 1.0F;
 // unmodified RobotStateMachine/RobotController/RobotRuntime; as of Phase
 // 13O, obstacle stop/resume is driven by the real, unmodified
 // HardwareEventSource reading VirtualRobotHardware's geometry-backed
-// obstacleDetected() - see docs/technical-decisions.md. DemoCommandSource
-// delivers exactly ScenarioLoaded then StartMission once each, so the FSM
-// reaches Moving through its real transition rules; CompositePollingEventSource
-// then combines that finite command source with the always-live
-// HardwareEventSource (command-before-sensor priority, unmodified from Phase
-// 13J), exactly the same composition Application::runLiveSimulation() uses
-// for the CLI's --live mode. main3d never injects ObstacleDetected/
-// ObstacleCleared directly - both only ever come from HardwareEventSource
-// reading VirtualRobotHardware's real sensor state. As of Phase 13P,
-// movement is differential-drive kinematics (VirtualRobotHardware now owns
-// a DifferentialDrive), and this file adds an M-toggled manual wheel
-// override purely for interactively proving turning - see the
-// manualDriveMode block below and docs/technical-decisions.md. As of
-// Phase 13Q, an A-toggled reactive obstacle-avoidance policy sits between
-// manual and the FSM in drive authority - see the avoidanceEnabled block
-// below. As of Phase 13R, that policy is body-clearance-aware: the
-// avoidance latch (ReactiveObstacleAvoidance::active()) can legitimately
-// stay engaged for several frames after the FSM has already returned to
-// Moving, if ForwardClearanceProbe still reports the robot's physical
-// body corridor as blocked - see the frame-order block below and
+// obstacleDetected() - see docs/technical-decisions.md. main3d never
+// injects ObstacleDetected/ObstacleCleared directly - both only ever come
+// from HardwareEventSource reading VirtualRobotHardware's real sensor
+// state. As of Phase 13P, movement is differential-drive kinematics
+// (VirtualRobotHardware now owns a DifferentialDrive), and this file adds
+// an M-toggled manual wheel override purely for interactively proving
+// turning - see the manualDriveMode block below and
+// docs/technical-decisions.md. As of Phase 13Q, an A-toggled reactive
+// obstacle-avoidance policy sits between manual and the FSM in drive
+// authority - see the avoidanceEnabled block below. As of Phase 13R, that
+// policy is body-clearance-aware: the avoidance latch
+// (ReactiveObstacleAvoidance::active()) can legitimately stay engaged for
+// several frames after the FSM has already returned to Moving, if
+// ForwardClearanceProbe still reports the robot's physical body corridor
+// as blocked - see the frame-order block below and
 // docs/technical-decisions.md (Phase 13R). As of Phase 13S, a fourth,
 // HIGHEST-priority authority - Safety - sits above even manual driving:
 // TableEdgeSafetyController, driven by VirtualCliffSensor's four corner
 // readings, takes the wheels the instant the robot's footprint nears the
 // table's edge, regardless of what manual/autonomous/FSM currently want -
-// see docs/technical-decisions.md (Phase 13S). As of Phase 13T, `R`
-// requests real geometric Return Home navigation: ReturnHomeRequestSource
-// turns the keypress into a ReturnHomeRequested Event (never a direct FSM
-// mutation), consumed through the real Moving + ReturnHomeRequested ->
-// ReturningHome transition; HomeNavigator then steers the robot toward
-// VirtualWorld's BasePlatform via the new Navigation drive-authority tier
-// (Safety > Manual > AutonomousAvoidance > Navigation > Fsm); and
-// HomeArrivalEventSource turns HomeNavigator's own Arrived state into a
-// HomeReached Event, consumed through the existing (unmodified)
-// ReturningHome + HomeReached -> Aborted transition - see
-// docs/technical-decisions.md (Phase 13T).
+// see docs/technical-decisions.md (Phase 13S). As of Phase 13T,
+// HomeNavigator steers the robot toward VirtualWorld's BasePlatform via
+// the Navigation drive-authority tier (Safety > Manual >
+// AutonomousAvoidance > Navigation > Fsm), and HomeArrivalEventSource
+// turns HomeNavigator's own Arrived state into a HomeReached Event,
+// consumed through the existing ReturningHome + HomeReached transition.
+//
+// As of Phase 13U, mission assignment is fully explicit - the simulator no
+// longer auto-starts. MissionControlEventSource is the single event source
+// behind every Mission Control command (`1`/`2`/`3`/`R`), turning each
+// into ScenarioLoaded/StartMission/ReturnHomeRequested/StopTaskRequested
+// Events - never a direct FSM mutation, and never two competing Return
+// Home implementations (`2` and `R` are literally the same call). Task
+// status (`MissionTask` - None/Roam/ReturnHome) is derived fresh every
+// frame from RobotStateMachine's own public state
+// (MissionTask.hpp::deriveMissionTask()) - it is presentation/Home-Zone-
+// activation context only, never a second authority over the robot.
+// HomeZoneMonitor is an automatic convenience trigger: while the task is
+// Roam, it watches distance from base with hysteresis (exit/rearm radii)
+// and emits its own ReturnHomeRequested the instant the robot wanders too
+// far, through the exact same IPollingEventSource/FSM path as every
+// manual request - see docs/technical-decisions.md (Phase 13U) for the
+// full audit, the nested event-source priority
+// (MissionControl > HardwareEventSource > HomeArrivalEventSource >
+// HomeZoneMonitor), and a real V1 limitation this phase's own testing
+// discovered (reactive avoidance can resonate against HomeNavigator's
+// continuous re-aiming for a centered obstacle sitting exactly on the
+// return path).
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -90,38 +105,52 @@ int main()
     robot::visual::VirtualWorld world;
     robot::visual::VirtualRobotHardware hardware(world);
     robot::HardwareEventSource hardwareEventSource(hardware);
-    robot::visual::DemoCommandSource commandSource;
 
-    // Phase 13T: `R` feeds a ReturnHomeRequested Event through this
-    // source (see the keyboard-input block below) - never a direct FSM
-    // mutation. HomeNavigator is raylib-free navigation logic (Aligning/
-    // Driving/Arrived toward world.basePlatform()); HomeArrivalEventSource
+    // Phase 13U: the single event source behind every explicit Mission
+    // Control command (`1`/`2`/`3`, and `R` as the Return Home alias - see
+    // the keyboard-input block below) - never a direct FSM mutation, and
+    // never a separate/competing implementation from `R`'s own Return Home
+    // path. Replaces DemoCommandSource's automatic ScenarioLoaded/
+    // StartMission for this interactive executable - the simulator no
+    // longer auto-starts; mission assignment is fully explicit. (Nothing
+    // deletes DemoCommandSource itself - it remains in the codebase, still
+    // used by tests/examples that want a fixed automatic two-event
+    // sequence with no keyboard involved.)
+    robot::visual::MissionControlEventSource missionControl;
+
+    // HomeNavigator is raylib-free navigation logic (Aligning/Driving/
+    // Arrived toward world.basePlatform()); HomeArrivalEventSource
     // observes ITS OWN Arrived state (edge-triggered) to produce
     // HomeReached, exactly like HardwareEventSource observes
     // VirtualRobotHardware's sensors - see HomeNavigator.hpp/
     // HomeArrivalEventSource.hpp for why neither ever decides FSM
     // transitions itself.
-    robot::visual::ReturnHomeRequestSource returnHomeRequestSource;
     robot::visual::HomeNavigator homeNavigator;
     robot::visual::HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
 
+    // HomeZoneMonitor (Phase 13U) - the automatic "come home" trigger for
+    // Roam: watches distance from world.basePlatform() with hysteresis
+    // while the current task is Roam, and produces its own
+    // ReturnHomeRequested the instant the robot wanders outside the exit
+    // radius - through this same IPollingEventSource path, never a direct
+    // Navigation call or FSM mutation (see HomeZoneMonitor.hpp).
+    robot::visual::HomeZoneMonitor homeZone;
+
     // CompositePollingEventSource only combines two sources at a time
     // (Phase 13J, unmodified), so the four effective sources this phase
-    // needs are composed via NESTING rather than rewriting that class:
-    // an inner command-priority pair (DemoCommandSource,
-    // ReturnHomeRequestSource) and an inner hardware-priority pair
-    // (HardwareEventSource, HomeArrivalEventSource), then those two
-    // composites combined at the top level exactly as Phase 13J already
-    // did for the un-nested two-source case. This preserves
-    // command-before-sensor priority at the top level, AND ensures
-    // HardwareEventSource (emergency stop/battery/obstacle - safety-
-    // critical) always wins over HomeArrivalEventSource within the
-    // hardware branch, so a HomeReached readiness can never cause a
-    // same-frame safety/obstacle event to be lost - see
-    // docs/technical-decisions.md (Phase 13T).
-    robot::CompositePollingEventSource innerCommandSource(commandSource, returnHomeRequestSource);
-    robot::CompositePollingEventSource innerHardwareSource(hardwareEventSource, homeArrivalEventSource);
-    robot::CompositePollingEventSource compositeSource(innerCommandSource, innerHardwareSource);
+    // needs are composed via NESTING rather than rewriting that class.
+    // Priority (Phase 13U, highest first): explicit Mission Control
+    // commands > hardware obstacle/sensor events > HomeReached arrival >
+    // automatic Home Zone return request. Rationale: explicit user
+    // commands must never be starved by an automatic trigger; safety-
+    // relevant hardware perception must never be lost underneath a
+    // same-frame HomeReached/Home-Zone readiness; HomeReached completes an
+    // already-active Return Home, which outranks a brand new automatic
+    // request from the same or a different mission. See
+    // docs/technical-decisions.md (Phase 13U) for the full audit.
+    robot::CompositePollingEventSource innerHardwareGroup(hardwareEventSource, homeArrivalEventSource);
+    robot::CompositePollingEventSource innerAutoGroup(innerHardwareGroup, homeZone);
+    robot::CompositePollingEventSource compositeSource(missionControl, innerAutoGroup);
     robot::RobotStateMachine stateMachine;
     robot::RobotController controller(hardware);
     robot::RobotRuntime runtime(compositeSource, stateMachine, controller);
@@ -286,16 +315,39 @@ int main()
             avoidanceEnabled = !avoidanceEnabled;
         }
 
-        if (IsKeyPressed(KEY_R))
+        if (IsKeyPressed(KEY_ONE))
         {
-            // Edge-triggered (IsKeyPressed, not IsKeyDown) so holding R
-            // requests exactly one Return Home per press - never a direct
-            // RobotStateMachine mutation or a direct
-            // hardware.returnToBase() call; the request is only ever
-            // consumed through the real Moving + ReturnHomeRequested ->
-            // ReturningHome transition on a later runtime.step() (Phase
-            // 13T).
-            returnHomeRequestSource.requestReturnHome();
+            // Start Roam - edge-triggered, state-aware (see
+            // MissionControlEventSource::requestStartRoam()): queues
+            // ScenarioLoaded+StartMission from Idle, only StartMission
+            // from Ready, or nothing at all if already Moving/
+            // ReturningHome/etc. Reads stateMachine.currentState() as of
+            // the END of the previous frame's runtime.step() - the
+            // correct up-to-date snapshot, since input is handled before
+            // this frame's own step() below.
+            missionControl.requestStartRoam(stateMachine.currentState());
+        }
+
+        if (IsKeyPressed(KEY_TWO) || IsKeyPressed(KEY_R))
+        {
+            // Return Home - `2` and `R` (preserved from Phase 13T) are
+            // deliberately the exact same call: one Return Home
+            // implementation, never two competing ones. Edge-triggered,
+            // never a direct RobotStateMachine mutation or a direct
+            // hardware.returnToBase() call - the request is only ever
+            // consumed through the real Moving/Ready + ReturnHomeRequested
+            // -> ReturningHome transition on a later runtime.step().
+            missionControl.requestReturnHome();
+        }
+
+        if (IsKeyPressed(KEY_THREE))
+        {
+            // Stop Task - cancels whatever task is currently active
+            // (Roam, Return Home, or a task paused in
+            // WaitingForObstacleClear), landing in the reusable Ready
+            // state - never a direct RobotStateMachine mutation (Phase
+            // 13U).
+            missionControl.requestStopTask();
         }
 
         if (IsKeyPressed(KEY_H))
@@ -375,6 +427,25 @@ int main()
             hardware.currentCommand() == robot::visual::VirtualDriveCommand::ReturnToBase;
         const robot::visual::HomeNavigationOutput homeNavigation =
             homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
+
+        // Phase 13U: this frame's user-facing task status - derived
+        // fresh from RobotStateMachine's own public state, never a second
+        // authority over the robot (see MissionTask.hpp). Drives both the
+        // Mission Control HUD panel and HomeZoneMonitor's activation
+        // condition below.
+        const robot::visual::MissionTask missionTask =
+            robot::visual::deriveMissionTask(stateMachine.currentState(), stateMachine.returnHomeReason());
+
+        // Advance HomeZoneMonitor (Phase 13U) - runs every frame,
+        // unconditionally, exactly like HomeNavigator's own update()
+        // above; only actually evaluates distance while missionTask is
+        // Roam (see HomeZoneMonitor::update()'s own docs for why it must
+        // freeze - not merely suppress its trigger - the rest of the
+        // time). Its own pollEvent() (polled by runtime.step() next
+        // frame, via the composite chain) is the ONLY way a Home-Zone
+        // excursion ever reaches the FSM - never a direct Navigation call
+        // or RobotState mutation.
+        homeZone.update(world.robotPose(), world.basePlatform(), missionTask == robot::visual::MissionTask::Roam);
 
         // Apply drive authority (Safety > Manual > AutonomousAvoidance >
         // Navigation > Fsm - see VirtualRobotHardware::driveAuthority()).
@@ -523,6 +594,24 @@ int main()
         telemetry.homeNavigationTargetHeadingDegrees = homeNavigation.targetHeadingDegrees;
         telemetry.homeNavigationHeadingErrorDegrees = homeNavigation.headingErrorDegrees;
         telemetry.homeNavigationGuideVisible = navigationDriving;
+
+        // Phase 13U: Mission Control panel telemetry - main3d computes
+        // task status and base distance directly (the same simple
+        // dx/dz-from-pose formula HomeNavigator/HomeZoneMonitor each
+        // independently use internally for their own decisions); this is
+        // a third, presentation-only computation purely for display,
+        // exactly like "Position: X/Z" above already reads
+        // world.robotPose() directly rather than through another
+        // component.
+        telemetry.missionTaskText = robot::visual::toString(missionTask);
+        {
+            const robot::visual::Vec3& robotPosition = world.robotPose().position;
+            const robot::visual::Vec3& basePosition = world.basePlatform().position;
+            const float dx = basePosition.x - robotPosition.x;
+            const float dz = basePosition.z - robotPosition.z;
+            telemetry.baseDistance = std::sqrt((dx * dx) + (dz * dz));
+        }
+        telemetry.homeZoneInside = telemetry.baseDistance <= robot::visual::HomeZoneMonitor::kHomeZoneExitRadius;
 
         // Camera updates (mouse-look and CAMERA_FREE's own arrow-key
         // pitch/yaw) are suppressed while manual drive mode is active -

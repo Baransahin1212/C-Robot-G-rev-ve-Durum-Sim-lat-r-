@@ -206,6 +206,17 @@ struct VisualTelemetry
     // calculates navigation decisions, only visualizes already-computed
     // data.
     bool homeNavigationGuideVisible = false;
+
+    // Phase 13U: Mission Control panel telemetry - already-formatted
+    // MissionTask text ("NONE"/"ROAM"/"RETURN HOME", see
+    // MissionTask.hpp::toString()), whether the robot is currently within
+    // HomeZoneMonitor's own exit radius, and the live distance to base.
+    // Renderer3D never derives task status or Home Zone membership
+    // itself - both are computed once in main3d.cpp and displayed
+    // verbatim, exactly like every other VisualTelemetry field.
+    std::string_view missionTaskText;
+    bool homeZoneInside = true;
+    float baseDistance = 0.0F;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,
@@ -243,6 +254,13 @@ public:
 private:
     void drawScene(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
     void drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
+
+    // Phase 13U: the compact Mission Control panel (task status, 1/2/3/R
+    // key hints, Home Zone status) - deliberately separate from drawHud()'s
+    // engineering telemetry panel: positioned top-right (never fighting
+    // the existing top-left panel) and drawn unconditionally regardless of
+    // HudMode, so task controls stay visible in both Full and Compact.
+    void drawMissionControlPanel(const VisualTelemetry& telemetry) const;
 
     Camera3D camera_;
 };

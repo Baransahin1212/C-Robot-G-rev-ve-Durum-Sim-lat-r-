@@ -471,6 +471,8 @@ add_library(robot_visual_simulation STATIC
     src/visual/VirtualObstacleSensorArray.cpp
     src/visual/HomeNavigator.cpp
     src/visual/HomeArrivalEventSource.cpp
+    src/visual/MissionControlEventSource.cpp
+    src/visual/HomeZoneMonitor.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -1035,6 +1037,62 @@ target_link_libraries(HomeArrivalEventSourceTests PRIVATE
 
 gtest_discover_tests(HomeArrivalEventSourceTests)
 
+# --- MissionControlEventSourceTests: Phase 13U - turns explicit Mission
+# Control commands (1/2/3/R) into domain Events, including Start Roam's
+# state-dependent Idle/Ready event queueing. Links only
+# robot_visual_simulation - never robot_visual/raylib - genuinely
+# headless, no window is ever created by this target.
+add_executable(MissionControlEventSourceTests
+    tests/visual/MissionControlEventSourceTests.cpp
+)
+
+target_link_libraries(MissionControlEventSourceTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(MissionControlEventSourceTests)
+
+# --- HomeZoneMonitorTests: Phase 13U - hysteresis automatic Return Home
+# trigger around the base platform, active only during Roam. Links only
+# robot_visual_simulation - never robot_visual/raylib - genuinely
+# headless, no window is ever created by this target.
+add_executable(HomeZoneMonitorTests
+    tests/visual/HomeZoneMonitorTests.cpp
+)
+
+target_link_libraries(HomeZoneMonitorTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(HomeZoneMonitorTests)
+
+# --- MissionControlIntegrationTests: Phase 13U - closed-loop tests
+# through the real production stack (MissionControlEventSource,
+# HomeZoneMonitor, RobotRuntime, RobotStateMachine, RobotController,
+# VirtualRobotHardware, HomeNavigator, HomeArrivalEventSource, table
+# safety, obstacle perception) - Start Roam, Stop/restart, Stop-Return-
+# Home, Stop-during-Safety, Stop-during-Avoidance, Home-Zone closed loop,
+# and obstacle-during-automatic-Return-Home. Links robot_visual_simulation
+# plus robot_hardware_events/robot_polling_composite/robot_controller/
+# robot_core for the same reasons VirtualRobotHardwareTests does. Never
+# links robot_visual/raylib - genuinely headless.
+add_executable(MissionControlIntegrationTests
+    tests/visual/MissionControlIntegrationTests.cpp
+)
+
+target_link_libraries(MissionControlIntegrationTests PRIVATE
+    robot_visual_simulation
+    robot_controller
+    robot_core
+    robot_hardware_events
+    robot_polling_composite
+    GTest::gtest_main
+)
+
+gtest_discover_tests(MissionControlIntegrationTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -1057,7 +1115,8 @@ if (MSVC)
         RobotCollisionTests ManualDriveInputTests ReactiveObstacleAvoidanceTests
         ForwardClearanceProbeTests VirtualCliffSensorTests TableEdgeSafetyControllerTests
         VirtualObstacleSensorArrayTests HomeNavigatorTests
-        HomeArrivalEventSourceTests
+        HomeArrivalEventSourceTests MissionControlEventSourceTests
+        HomeZoneMonitorTests MissionControlIntegrationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

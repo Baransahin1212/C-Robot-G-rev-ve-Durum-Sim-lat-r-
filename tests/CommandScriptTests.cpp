@@ -65,6 +65,17 @@ TEST(CommandScriptTest, ParsesReturnHome)
     EXPECT_EQ(script.entries()[0].eventType, EventType::ReturnHomeRequested);
 }
 
+// 3c: ParsesStopTask (Phase 13U)
+TEST(CommandScriptTest, ParsesStopTask)
+{
+    // Act
+    CommandScript script(FixturePath("command_script_stop_task.txt"));
+
+    // Assert
+    ASSERT_EQ(script.entries().size(), 1u);
+    EXPECT_EQ(script.entries()[0].eventType, EventType::StopTaskRequested);
+}
+
 // 4: ParsesOtherSupportedCommandTypes (home_reached, reset)
 TEST(CommandScriptTest, ParsesOtherSupportedCommandTypes)
 {

@@ -3377,3 +3377,216 @@ transition (`Ready + ReturnHomeRequested`). An optional Full-HUD-only
 `Return reason: None/MissionAbort/UserRequest` diagnostic line was added
 to `VisualTelemetry`/`Renderer3D` (never consulted by any decision, purely
 displayed) - Compact HUD is deliberately untouched.
+
+## Phase 13U: Mission Control, roaming, and Home Zone
+
+Turns `RobotSimulator3D` from an automatically-starting demonstration into
+an interactive task-driven simulator: the robot starts `Idle` and stays
+still until the user explicitly assigns a task (`1` Start Roam, `2`/`R`
+Return Home, `3` Stop Task), plus an automatic "come home" trigger
+(`HomeZoneMonitor`) for Roam.
+
+### Why mission assignment is Event-driven, and why `DemoCommandSource` no longer drives interactive startup
+
+Every prior phase's rule holds: a UI action never mutates `RobotState`
+directly, it only ever produces an `Event` for `RobotRuntime` to feed
+through the real FSM. `DemoCommandSource` (Phase 13N) already existed
+purely to get the CLI-equivalent `ScenarioLoaded`/`StartMission` sequence
+into the interactive executable automatically, with no keyboard
+involvement - exactly wrong for Phase 13U's explicit-assignment
+requirement. Rather than modify or delete it (other tests still use its
+fixed, keyboard-free two-event sequence), `main3d.cpp` simply stops
+constructing/using it: `MissionControlEventSource` is a new,
+purpose-built source for the explicit, state-aware, multi-intent keyboard
+case `DemoCommandSource` was never designed for.
+
+### Start Roam's two-event Idle sequence, and why it is state-aware
+
+`requestStartRoam(RobotState currentState)` takes the caller's
+`RobotStateMachine::currentState()` snapshot (read in `main3d.cpp` at the
+moment `1` is pressed, before that frame's own `runtime.step()`) rather
+than holding a `RobotStateMachine&` reference itself - matching every
+other event source in this codebase, none of which read FSM state
+directly. From `Idle` it queues `ScenarioLoaded` then `StartMission` (two
+Events, delivered on two separate `pollEvent()` calls / rendered frames -
+`RobotRuntime::step()` never processes more than one Event per call, so
+this was never at risk of being forced through in a single frame). From
+`Ready` it queues only `StartMission` (`Idle`'s `ScenarioLoaded` step
+would be rejected there). From anywhere else (already `Moving`,
+`ReturningHome`, ...) it queues nothing at all - a deterministic no-op,
+never a doomed-to-be-rejected event, and never "restarting" the FSM. A
+Start Roam sequence already queued and not yet fully delivered is never
+re-queued on top of itself (guards against a mashed `1` corrupting the
+sequence) - the same idempotent-pending principle Phase 13T's
+`ReturnHomeRequestSource` already established for a single event, extended
+here to a short queue.
+
+### `StopTaskRequested` semantics, and why normal Stop is not `EmergencyStop`
+
+Audited first, per the Protected Core Policy: `MissionCompleted` implies
+successful completion (wrong - a cancelled task is not a success);
+`EmergencyStop` is a physical fault condition with its own
+`EmergencyStopped` terminal-until-`Reset` semantics (wrong - conflating a
+normal task cancellation with a safety fault would make ordinary Stop
+Task presses look like emergencies, and would need `Reset` just to
+recover from pressing `3`); `Reset` is reserved for clearing
+`EmergencyStopped`/`Error` back to `Idle`, an unrelated, pre-existing
+contract, and reusing it here would send a cancelled task all the way back
+to `Idle` (losing `ScenarioLoaded` context) instead of the reusable
+`Ready` state Phase 13U needs. No existing event fits, so exactly one new
+one was added: `StopTaskRequested`. Accepted from `Moving`,
+`ReturningHome`, and `WaitingForObstacleClear` (the three states where a
+task can genuinely be actively running), always landing in `Ready`.
+`ReturnHomeReason` is cleared in the `ReturningHome`/`WaitingForObstacleClear`
+cases (never in `Moving`, where it is already `None`) so the invariant
+`returnHomeReason()` already documents ("`None` whenever not
+`ReturningHome`") stays true - otherwise a stale reason would linger in
+`Ready`'s telemetry. `resumeState_` needs no explicit clearing: it is only
+ever read by `ObstacleCleared`, which is unreachable once `state_` has
+left `WaitingForObstacleClear` - the next genuine `ObstacleDetected`
+(from whatever fresh mission comes next) always overwrites it before it
+could ever be read stale, proven directly by
+`ResumeStateContextClearedByStopTask`.
+
+### Why Safety can remain active after the FSM becomes `Ready`
+
+Mission cancellation must never abort physical safety recovery. Pressing
+`3` while `TableEdgeSafetyController` is actively recovering moves the
+FSM to `Ready` immediately (the user's cancellation intent is honored),
+but `DriveAuthority` is a completely separate question from
+`RobotState` - `Safety` remains the highest tier in the unchanged
+`Safety > Manual > AutonomousAvoidance > Navigation > Fsm` priority chain
+regardless of what the FSM currently says, so the wheels keep executing
+the recovery maneuver until `TableEdgeSafetyController` itself decides
+it is safe to release. Only then does authority fall through to `Fsm`,
+whose command is now `Stopped` (from the `Ready` transition already
+applied) - `StopDuringSafetyIntegrationTest` proves this exact sequence
+end-to-end. The same reasoning covers avoidance: `3` removes
+`WaitingForObstacleClear` (avoidance's own trigger condition), so it is
+never re-triggered, but an already-active turn is not forcibly cancelled
+either - it keeps turning under `ReactiveObstacleAvoidance`'s existing
+"stays active until `forwardCorridorClear`" release condition
+(unchanged from Phase 13R) until it releases on its own -
+`StopDuringAvoidanceIntegrationTest` proves the wheels end at zero and no
+collision occurs.
+
+### Why Roam uses the plain FSM command, not a new authority tier
+
+Audited before assuming otherwise: `Moving` already means
+`RobotController` calls `hardware_.moveForward()`, and the existing
+reactive layers (body-width obstacle perception/avoidance,
+cliff/table-edge safety) already turn a plain forward command into
+believable reactive wandering with zero new locomotion code. Adding a
+`Roaming` `DriveAuthority` tier would only add complexity for no new
+capability - `DriveAuthority` stays exactly
+`Safety > Manual > AutonomousAvoidance > Navigation > Fsm`, unchanged.
+
+### Task status is derived, not a second state machine
+
+`MissionTask` (`None`/`Roam`/`ReturnHome`) is a pure function of
+`RobotStateMachine`'s own already-public state -
+`deriveMissionTask(RobotState, ReturnHomeReason)` in `MissionTask.hpp` -
+never a separate mutable field that could drift out of sync. `Moving` →
+`Roam`; `ReturningHome` → `ReturnHome`; `WaitingForObstacleClear` →
+whichever task was interrupted, read from `returnHomeReason()` rather
+than requiring a new `resumeState_` getter (`None` means the interrupted
+task was Roam, since Roam never sets a return reason; anything else means
+it was a Return Home, both `MissionAbort` and `UserRequest` alike);
+everything else → `None`. `MissionTask` is used for exactly two things -
+the Mission Control panel's `Task:` line, and `HomeZoneMonitor`'s
+activation condition - and grants no transition authority of its own.
+
+### Home Zone hysteresis, derived from actual demo geometry
+
+`HomeZoneMonitor` was explicitly told not to blindly reuse the brief's
+own illustrative radii - the actual `VirtualWorld.cpp` geometry was
+audited instead. The demo base sits at `(4, 4)`, near one corner of the
+12x12 (`kTableHalfExtent = 6.0F`) table, and the demo robot starts at
+`(-3, 1)` - `sqrt(7² + 3²) ≈ 7.615F` from base. `kHomeZoneExitRadius =
+9.0F` sits comfortably above that starting distance, so a freshly started
+Roam session is never immediately outside the zone before it has actually
+travelled anywhere (verified directly: 9.0F was chosen after 7.615F was
+computed, not before). `kHomeZoneRearmRadius = 6.0F` reuses
+`kTableHalfExtent`'s own value as an already-meaningful geometric
+reference point - "back within one table-half-extent of base" - leaving a
+3.0F hysteresis gap. The armed/disarmed latch (never a single threshold)
+means a robot sitting exactly at the boundary can never chatter: crossing
+the exit radius disarms until the robot is back within the (smaller)
+rearm radius.
+
+`HomeZoneMonitor::update()` freezes ENTIRELY while the task is not Roam -
+not merely suppressing the trigger, but leaving the armed/disarmed latch
+itself untouched, and discarding any not-yet-polled pending trigger. Two
+consequences follow directly, both proven by dedicated tests: first, a
+trigger that fires but has not yet been polled by the time the task
+changes (e.g. `3` is pressed the same frame) never fires later against a
+task the user already cancelled
+(`PendingEventDiscardedWhenRoamStops`/`DisabledWhenTaskIsNotRoam`);
+second, re-arming is only ever evaluated once Roam is active again - so
+after an automatic Return Home completes (task becomes `None`, not Roam,
+the entire time the robot is close to base), the monitor is still
+legitimately `Disarmed` right up until a fresh Start Roam is issued, at
+which point the very first Roam frame re-arms it (the robot is already
+well within the rearm radius) - `HomeZoneClosedLoopIntegrationTest`
+exercises this exact sequence.
+
+### The automatic `ReturnHomeRequested` event, and composition priority
+
+`HomeZoneMonitor` implements `IPollingEventSource` directly (not a
+separate wrapper class, unlike `HomeNavigator`/`HomeArrivalEventSource`'s
+deliberate split) - its own "trigger" concept is inherently edge-
+triggered/single-shot, exactly like a poll, so a second file would only
+add indirection. `update()` (called every frame, computing/latching the
+trigger) and `pollEvent()` (drains the latch, at most one `Event` per
+trigger) are cleanly separable responsibilities on the one class.
+Composition priority (highest first): explicit Mission Control commands,
+hardware obstacle/sensor events, `HomeReached` arrival, automatic Home
+Zone request - nested via `CompositePollingEventSource` exactly as Phase
+13T already established (that class still only ever combines two sources;
+nesting, never rewriting):
+
+```text
+innerHardwareGroup = Composite(HardwareEventSource, HomeArrivalEventSource)
+innerAutoGroup     = Composite(innerHardwareGroup, HomeZoneMonitor)
+compositeSource    = Composite(MissionControlEventSource, innerAutoGroup)
+```
+
+Explicit user commands must never be starved by an automatic convenience
+trigger; safety-relevant hardware perception must never be lost
+underneath a same-frame `HomeReached`/Home-Zone readiness; `HomeReached`
+completing an already-active Return Home outranks a brand new automatic
+request. `R`'s own `ReturnHomeRequestSource` (Phase 13T) is no longer
+constructed in `main3d.cpp` - `2` and `R` are now the literal same
+`missionControl.requestReturnHome()` call, never two competing
+implementations - though the class remains, still exercised directly by
+`VirtualRobotHardwareTests.cpp`'s own closed-loop tests.
+
+### A real V1 limitation, discovered while testing this phase
+
+While writing the automatic-Return-Home-with-obstacle closed-loop test,
+genuine `ReactiveObstacleAvoidance` turning was found to be able to
+resonate indefinitely against `HomeNavigator`'s continuous re-aiming, for
+certain obstacle placements sitting close to the direct line back to
+base: avoidance turns away, `forwardCorridorClear` releases it quickly,
+`HomeNavigator` immediately re-aims exactly back along the same line
+(position is unchanged - avoidance is pure rotation), and if that re-aim
+heading re-enters detection range before `HomeNavigator` reaches its own
+`Driving` threshold, the cycle repeats with zero net forward progress,
+observed directly across thousands of frames in several attempted test
+geometries. This is a previously-undiscovered interaction, because Phase
+13T's own obstacle-during-Return-Home test never actually exercises real
+avoidance convergence in the first place - it clears the obstacle via a
+direct `world.setObstacleEnabled()` mutation (identical to the `O` key),
+sidestepping the interaction entirely. `MissionControlIntegrationTests.cpp`'s
+`ObstacleDuringAutomaticHomeZoneReturnIntegrationTest` follows that exact
+same established precedent rather than depending on convergence this
+codebase has never actually verified. This is flagged here as a genuine,
+currently-unfixed V1 limitation - not attempted to be fixed in this phase,
+since a real fix would likely require some form of obstacle-aware
+approach-angle memory in `HomeNavigator`, which is explicitly out of scope
+("V1 reactive navigation only... NOT global path planning"). It is not
+expected to be common in the fixed demo scene (the four demo obstacles are
+not positioned exactly on the direct line from anywhere reachable back to
+base), but a future phase that wants to hard-guarantee Return Home
+completion in the presence of arbitrary obstacle placement should treat
+this as the starting point.

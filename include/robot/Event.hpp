@@ -16,6 +16,7 @@ enum class EventType
     BatteryCritical,
     MissionCompleted,
     ReturnHomeRequested,
+    StopTaskRequested,
     HomeReached,
     EmergencyStop,
     InvalidSensorData,
@@ -33,6 +34,7 @@ constexpr std::string_view toString(EventType type) noexcept
         case EventType::BatteryCritical: return "BatteryCritical";
         case EventType::MissionCompleted: return "MissionCompleted";
         case EventType::ReturnHomeRequested: return "ReturnHomeRequested";
+        case EventType::StopTaskRequested: return "StopTaskRequested";
         case EventType::HomeReached: return "HomeReached";
         case EventType::EmergencyStop: return "EmergencyStop";
         case EventType::InvalidSensorData: return "InvalidSensorData";

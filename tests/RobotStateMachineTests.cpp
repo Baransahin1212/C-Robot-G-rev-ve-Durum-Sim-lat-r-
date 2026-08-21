@@ -432,6 +432,180 @@ TEST(RobotStateMachineTest, SecondReturnHomeRequestFromReusedReadyIsAccepted)
     EXPECT_EQ(machine.returnHomeReason(), ReturnHomeReason::UserRequest);
 }
 
+// --- Phase 13U: StopTaskRequested - user-cancelled task, reusable Ready ---
+//
+// Audit confirmed no existing event fits: MissionCompleted implies
+// successful completion (wrong for a cancelled task), EmergencyStop is a
+// physical fault condition (wrong for a normal user cancellation), and
+// Reset is reserved for clearing EmergencyStopped/Error back to Idle (an
+// unrelated, pre-existing contract). StopTaskRequested is exactly one new
+// event, accepted only from the three states where a task can genuinely
+// be actively running: Moving, ReturningHome, WaitingForObstacleClear -
+// all landing in Ready (reusable, not a new mission-cancelled state).
+
+// 1: MovingStopTaskTransitionsToReady
+TEST(RobotStateMachineTest, MovingStopTaskTransitionsToReady)
+{
+    // Arrange
+    RobotStateMachine machine = MakeMovingMachine();
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+
+    // Assert
+    EXPECT_EQ(result, TransitionResult::Success);
+    EXPECT_EQ(machine.currentState(), RobotState::Ready);
+}
+
+// 2: ReturningHomeStopTaskTransitionsToReady
+TEST(RobotStateMachineTest, ReturningHomeStopTaskTransitionsToReady)
+{
+    // Arrange
+    RobotStateMachine machine = MakeUserRequestedReturningHomeMachine();
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+
+    // Assert
+    EXPECT_EQ(result, TransitionResult::Success);
+    EXPECT_EQ(machine.currentState(), RobotState::Ready);
+}
+
+// 3: WaitingForObstacleClearStopTaskTransitionsToReady
+TEST(RobotStateMachineTest, WaitingForObstacleClearStopTaskTransitionsToReady)
+{
+    // Arrange: obstacle interrupted a Roam (Moving) task.
+    RobotStateMachine machine = MakeWaitingFromMovingMachine();
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+
+    // Assert
+    EXPECT_EQ(result, TransitionResult::Success);
+    EXPECT_EQ(machine.currentState(), RobotState::Ready);
+}
+
+// 4: ReturnHomeReasonClearedByStopTask
+TEST(RobotStateMachineTest, ReturnHomeReasonClearedByStopTask)
+{
+    // Arrange
+    RobotStateMachine machine = MakeUserRequestedReturningHomeMachine();
+    ASSERT_EQ(machine.returnHomeReason(), ReturnHomeReason::UserRequest);
+
+    // Act
+    machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+
+    // Assert: the invariant ("None whenever not ReturningHome") holds -
+    // no stale reason leaks into Ready.
+    ASSERT_EQ(machine.currentState(), RobotState::Ready);
+    EXPECT_EQ(machine.returnHomeReason(), ReturnHomeReason::None);
+}
+
+// 5: ResumeStateContextClearedByStopTask
+TEST(RobotStateMachineTest, ResumeStateContextClearedByStopTask)
+{
+    // Arrange: obstacle interrupted a user-requested Return Home -
+    // resumeState_ == ReturningHome internally.
+    RobotStateMachine machine = MakeWaitingFromReturningHomeMachine();
+
+    // Act: Stop Task cancels it (never resuming ReturningHome).
+    machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+    ASSERT_EQ(machine.currentState(), RobotState::Ready);
+
+    // Assert: no observable stale resumeState_ effect - a brand new
+    // mission's own obstacle cycle behaves exactly like any fresh Roam,
+    // resuming Moving (never incorrectly resuming ReturningHome from the
+    // old, cancelled task's leftover context). resumeState_ has no public
+    // getter; this is the only way to observe it is not stale, matching
+    // resumeState_'s own contract (it is always freshly overwritten by
+    // ObstacleDetected before ObstacleCleared can ever read it again).
+    machine.processEvent(MakeEvent(EventType::StartMission));
+    ASSERT_EQ(machine.currentState(), RobotState::Moving);
+    machine.processEvent(MakeEvent(EventType::ObstacleDetected));
+    ASSERT_EQ(machine.currentState(), RobotState::WaitingForObstacleClear);
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::ObstacleCleared));
+    EXPECT_EQ(result, TransitionResult::Success);
+    EXPECT_EQ(machine.currentState(), RobotState::Moving);
+}
+
+// 6: ReadyStopTaskRejectedOrHandledDeterministically
+TEST(RobotStateMachineTest, ReadyStopTaskRejectedOrHandledDeterministically)
+{
+    // Arrange: Ready already has no active task to stop.
+    RobotStateMachine machine = MakeReadyMachine();
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+
+    // Assert: rejected, deterministically, state unchanged - consistent
+    // with how a repeated ReturnHomeRequested while already ReturningHome
+    // is also rejected rather than silently accepted as a no-op success.
+    EXPECT_EQ(result, TransitionResult::InvalidTransition);
+    EXPECT_EQ(machine.currentState(), RobotState::Ready);
+}
+
+// 7: EmergencyStoppedStopTaskRejected
+TEST(RobotStateMachineTest, EmergencyStoppedStopTaskRejected)
+{
+    // Arrange
+    RobotStateMachine machine = MakeEmergencyStoppedMachine();
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+
+    // Assert: a normal task-cancel intent must never be how a physical
+    // emergency stop is cleared - only Reset does that.
+    EXPECT_EQ(result, TransitionResult::InvalidTransition);
+    EXPECT_EQ(machine.currentState(), RobotState::EmergencyStopped);
+}
+
+// 8: ErrorStopTaskRejected
+TEST(RobotStateMachineTest, ErrorStopTaskRejected)
+{
+    // Arrange
+    RobotStateMachine machine = MakeErrorMachine();
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+
+    // Assert
+    EXPECT_EQ(result, TransitionResult::InvalidTransition);
+    EXPECT_EQ(machine.currentState(), RobotState::Error);
+}
+
+// 9: NewRoamCanStartAfterStop
+TEST(RobotStateMachineTest, NewRoamCanStartAfterStop)
+{
+    // Arrange
+    RobotStateMachine machine = MakeMovingMachine();
+    machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+    ASSERT_EQ(machine.currentState(), RobotState::Ready);
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::StartMission));
+
+    // Assert
+    EXPECT_EQ(result, TransitionResult::Success);
+    EXPECT_EQ(machine.currentState(), RobotState::Moving);
+}
+
+// 10: ReturnHomeCanStartAfterStop
+TEST(RobotStateMachineTest, ReturnHomeCanStartAfterStop)
+{
+    // Arrange
+    RobotStateMachine machine = MakeMovingMachine();
+    machine.processEvent(MakeEvent(EventType::StopTaskRequested));
+    ASSERT_EQ(machine.currentState(), RobotState::Ready);
+
+    // Act
+    const TransitionResult result = machine.processEvent(MakeEvent(EventType::ReturnHomeRequested));
+
+    // Assert
+    EXPECT_EQ(result, TransitionResult::Success);
+    EXPECT_EQ(machine.currentState(), RobotState::ReturningHome);
+    EXPECT_EQ(machine.returnHomeReason(), ReturnHomeReason::UserRequest);
+}
+
 TEST(RobotStateMachineTest, EmergencyStopFromMovingTransitionsToEmergencyStopped)
 {
     // Arrange
