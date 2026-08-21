@@ -75,8 +75,23 @@ public:
     // segment, including a tangent/boundary touch (see the .cpp for the
     // exact deterministic tolerance). Disabled obstacles are always
     // ignored, matching VirtualDistanceSensor/RobotCollision's own
-    // enabled-only convention.
+    // enabled-only convention. Equivalent to
+    // isForwardCorridorClearWithinDistance(kLookaheadDistance).
     bool isForwardCorridorClear() const;
+
+    // Same corridor test as isForwardCorridorClear(), but with an
+    // explicit lookahead distance instead of the fixed
+    // kLookaheadDistance - added for the manual-validation bugfix so
+    // VirtualRobotHardware can reuse this class's body-aware corridor
+    // geometry as a secondary, width-aware obstacle-detection hazard
+    // signal with its OWN, shorter, independently-derived lookahead,
+    // without changing kLookaheadDistance itself (still reserved for
+    // ReactiveObstacleAvoidance's release condition - see
+    // docs/technical-decisions.md, manual-validation bugfix, for why
+    // reusing the same 1.4F lookahead for both purposes would have
+    // changed existing centered-obstacle detection distances and risked
+    // event oscillation). `lookaheadDistance` must be >= 0.
+    bool isForwardCorridorClearWithinDistance(float lookaheadDistance) const;
 
 private:
     const VirtualWorld& world_;

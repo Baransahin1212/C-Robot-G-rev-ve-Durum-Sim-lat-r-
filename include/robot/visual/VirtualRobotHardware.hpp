@@ -7,6 +7,7 @@
 #include "robot/visual/DifferentialDrive.hpp"
 #include "robot/visual/RobotCollision.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
+#include "robot/visual/VirtualObstacleSensorArray.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
 namespace robot::visual
@@ -40,16 +41,21 @@ constexpr std::string_view toString(VirtualDriveCommand command) noexcept
 }
 
 // Who currently owns the physical wheel speeds DifferentialDrive executes
-// (Phase 13Q) - deliberately distinct from currentCommand(), which is only
-// ever what RobotController/the FSM *wants*. Priority is fixed and always
-// Manual > AutonomousAvoidance > Fsm; see
+// (Phase 13Q; extended Phase 13S) - deliberately distinct from
+// currentCommand(), which is only ever what RobotController/the FSM
+// *wants*. Priority is fixed and always
+// Safety > Manual > AutonomousAvoidance > Fsm; see
 // VirtualRobotHardware::driveAuthority() and
-// docs/technical-decisions.md (Phase 13Q) for the full authority model.
+// docs/technical-decisions.md (Phase 13Q/13S) for the full authority
+// model. Safety (Phase 13S, TableEdgeSafetyController) sits above even
+// Manual - a physical robot must never be driveable off a table edge,
+// including under direct human control.
 enum class DriveAuthority
 {
     Fsm,
     AutonomousAvoidance,
-    Manual
+    Manual,
+    Safety
 };
 
 // Visual-only, not part of any FSM/RobotState convention - mirrors
@@ -65,6 +71,7 @@ constexpr std::string_view toString(DriveAuthority authority) noexcept
         case DriveAuthority::Fsm: return "FSM";
         case DriveAuthority::AutonomousAvoidance: return "AUTONOMOUS";
         case DriveAuthority::Manual: return "MANUAL";
+        case DriveAuthority::Safety: return "SAFETY";
     }
     return "Unknown";
 }
@@ -82,6 +89,24 @@ constexpr std::string_view toString(DriveAuthority authority) noexcept
 // FSM transitions or produces Event values itself - that boundary belongs to
 // HardwareEventSource, unmodified. See docs/technical-decisions.md (Phase
 // 13N/13O).
+//
+// As of the Phase 13S manual-validation bugfix, obstacleDetected() is no
+// longer backed by VirtualDistanceSensor's single center ray alone - a
+// solid obstacle offset from the robot's exact centerline, but still
+// intersecting its actual body-width forward path, could pass beside that
+// one ray undetected, so the robot would keep receiving MoveForward until
+// RobotCollision (a last-resort guard, never meant to be the primary
+// obstacle signal) finally rejected a pose. obstacleDetected() is now the
+// OR of a three-ray VirtualObstacleSensorArray (perception coverage
+// across the body width) and a width-aware ForwardClearanceProbe hazard
+// check with its own short, independently-derived lookahead (closes the
+// gaps between the three discrete rays) - see effectiveObstacleHazard()
+// in the .cpp and docs/technical-decisions.md (manual-validation bugfix)
+// for the full derivation, and why it deliberately does not reuse
+// ForwardClearanceProbe::kLookaheadDistance (that value remains reserved
+// for ReactiveObstacleAvoidance's release condition). obstacleDistance()
+// below is unchanged - still exactly VirtualDistanceSensor's own single
+// center-ray reading.
 //
 // VirtualRobotHardware has no raylib dependency of its own - it depends
 // only on IRobotHardware and VirtualWorld's plain data, exactly like
@@ -111,6 +136,24 @@ constexpr std::string_view toString(DriveAuthority authority) noexcept
 // still active, and clearing the autonomous override falls through to
 // the FSM command if manual is not active - see applyEffectiveWheelSpeeds()
 // in the .cpp and docs/technical-decisions.md (Phase 13Q).
+//
+// As of Phase 13S, a third override - the safety override
+// (setSafetyWheelSpeeds()/clearSafetyWheelOverride()) - sits ABOVE the
+// manual override, the single highest-priority wheel-speed source:
+// Safety > Manual > AutonomousAvoidance > Fsm. It is driven by
+// TableEdgeSafetyController's cliff-sensor-triggered emergency recovery
+// (main3d.cpp), and follows the exact same never-destroyed-by-an-
+// unrelated-actor / falls-through-on-clear pattern as the manual and
+// autonomous overrides: clearing it falls through to manual if still
+// active, otherwise to autonomous if still active, otherwise to the FSM
+// command - see applyEffectiveWheelSpeeds() and
+// docs/technical-decisions.md (Phase 13S).
+//
+// As of Phase 13S, update() also validates a proposed pose against a
+// second, independent guard beyond the existing obstacle-collision one:
+// a table-support fail-safe (see update()'s own docs below) - entirely
+// separate from RobotCollision, since a table edge is not a solid
+// obstacle.
 class VirtualRobotHardware : public IRobotHardware
 {
 public:
@@ -150,6 +193,24 @@ public:
     // IRobotHardware - mirrors currentCommand()'s role (Phase 13O).
     std::optional<float> obstacleDistance() const;
 
+    // Manual-validation bugfix: this frame's three-ray perception
+    // readings (FrontLeft/FrontCenter/FrontRight) - FrontCenter is
+    // geometrically identical to obstacleDistance()/the value
+    // obstacleDetected() used to be based on alone. Visual-simulator-
+    // only telemetry getter (HUD), not part of IRobotHardware.
+    ObstacleSensorArrayReadings obstacleSensorReadings() const;
+
+    // Manual-validation bugfix: true when the width-aware forward-body
+    // corridor hazard check (a ForwardClearanceProbe query using this
+    // class's own short, detection-purpose lookahead - see
+    // effectiveObstacleHazard() in the .cpp) currently reports blocked,
+    // independent of whether any individual ray in
+    // obstacleSensorReadings() detected anything. This is one of the two
+    // inputs obstacleDetected() ORs together; exposed separately so the
+    // HUD can show which signal is actually driving detection. Visual-
+    // simulator-only telemetry getter, not part of IRobotHardware.
+    bool bodyCorridorObstacleHazard() const;
+
     // Current left/right wheel speeds actually driving movement -
     // whichever of manual override, autonomous-avoidance override, or
     // currentCommand()'s mapped speeds currently has drive authority (see
@@ -175,6 +236,14 @@ public:
     // simulator-only telemetry getter, not part of IRobotHardware (Phase
     // 13Q).
     bool autonomousOverrideActive() const noexcept;
+
+    // True while a safety wheel override (below) is active - the highest-
+    // priority override, can be true even while a manual and/or
+    // autonomous request is also recorded underneath (neither is cleared
+    // by an active safety override; see clearSafetyWheelOverride()
+    // below). Visual-simulator-only telemetry getter, not part of
+    // IRobotHardware (Phase 13S).
+    bool safetyOverrideActive() const noexcept;
 
     // Visual-simulator-only debug/test control (Phase 13P): temporarily
     // overrides the physical wheel speeds DifferentialDrive uses, without
@@ -213,34 +282,80 @@ public:
     // the wheel speeds corresponding to currentCommand().
     void clearAutonomousWheelOverride() noexcept;
 
+    // Visual-simulator-only safety control (Phase 13S): temporarily
+    // overrides the physical wheel speeds DifferentialDrive uses, without
+    // changing currentCommand() or touching IRobotHardware/RobotController/
+    // RobotRuntime/RobotStateMachine in any way - the same shape as
+    // setManualWheelSpeeds()/setAutonomousWheelSpeeds(), but the single
+    // HIGHEST priority level, above even the manual override. Intended
+    // caller: RobotSimulator3D's table-edge safety policy (main3d.cpp),
+    // driven by TableEdgeSafetyController's recovery wheel speeds - never
+    // called from inside VirtualRobotHardware itself. Wins over an active
+    // manual override without clearing it, so manual driving resumes
+    // automatically the instant safety releases if the user is still
+    // holding a manual command.
+    void setSafetyWheelSpeeds(float left, float right) noexcept;
+
+    // Ends the safety override. Falls through to whichever of manual,
+    // autonomous-avoidance, or the FSM command is next in priority and
+    // still active - the exact same falls-through pattern
+    // clearManualWheelOverride()/clearAutonomousWheelOverride() already
+    // use.
+    void clearSafetyWheelOverride() noexcept;
+
     // Advances VirtualWorld's robot pose by one simulated tick of
     // `deltaSeconds` via DifferentialDrive, using whichever wheel speeds
-    // wheelSpeeds() currently reports (manual override or FSM command).
-    // The proposed position is clamped to the demo world's ~10-unit bounds
-    // (unchanged from Phase 13N), then validated against enabled obstacle
-    // geometry (Phase 13P - see RobotCollision.hpp): if the clamped
-    // proposed position would collide, only the position is rejected
-    // (kept at its previous value) - the proposed heading is still
-    // committed, since the robot's circular collision footprint is
-    // rotation-independent, so in-place/combined turning is never blocked
-    // by a translation rejection. This is a last-resort physical guard,
-    // not a replacement for VirtualDistanceSensor/HardwareEventSource's
-    // existing Phase 13O stop-before-contact behavior, which is
-    // unmodified and still what normally halts the FSM-driven robot well
-    // before this guard would ever trigger. Return-to-base navigation is
-    // not implemented yet, so it is deliberately treated the same as
-    // Stopped (zero wheel speeds) for this phase (see
-    // docs/technical-decisions.md, Phase 13N/13P).
+    // wheelSpeeds() currently reports (safety/manual override, autonomous
+    // override, or FSM command). The proposed position is clamped to a
+    // generic ~10-unit simulation-coordinate bound (unchanged from Phase
+    // 13N - a purely defensive numeric safety net, not the tabletop
+    // safety boundary; see docs/technical-decisions.md, Phase 13S), then
+    // validated against TWO independent guards before being committed:
+    //   1. enabled obstacle geometry (Phase 13P - RobotCollision.hpp)
+    //   2. the table-support fail-safe (Phase 13S - see below)
+    // If EITHER guard rejects it, only the position is rejected (kept at
+    // its previous value) - the proposed heading is still committed,
+    // since the robot's circular collision footprint is rotation-
+    // independent, so in-place/combined turning is never blocked by a
+    // translation rejection.
+    //
+    // Table-support fail-safe (Phase 13S): rejects the proposed position
+    // only when computeCliffSensorReadings() reports ALL FOUR footprint
+    // corners off the table (VirtualCliffSensor.hpp's `allCliff()`) - a
+    // genuine full-footprint fall/tunneling event, not merely one corner
+    // overhanging the edge (which is the normal, expected, transient
+    // state while TableEdgeSafetyController is actively recovering, and
+    // must never be blocked by this guard - see
+    // docs/technical-decisions.md, Phase 13S). This is a last-resort
+    // backstop against an unusually large `deltaSeconds` skipping past
+    // the edge in one step, not the primary table-edge-avoidance
+    // behavior - that is TableEdgeSafetyController's job, engaged well
+    // before this guard would ever trigger, exactly like
+    // VirtualDistanceSensor/HardwareEventSource's existing Phase 13O
+    // stop-before-contact behavior versus RobotCollision's own guard.
+    // Return-to-base navigation is not implemented yet, so it is
+    // deliberately treated the same as Stopped (zero wheel speeds) for
+    // this phase (see docs/technical-decisions.md, Phase 13N/13P).
     void update(float deltaSeconds);
 
     // True when the most recent update() call rejected the proposed
-    // position due to obstacle collision. Visual-simulator-only telemetry
+    // position due to obstacle collision (RobotCollision.hpp) - never
+    // true for a table-support rejection (see tableEdgeRejectedLastUpdate()
+    // below); the two are deliberately distinct telemetry, matching the
+    // distinct guards that produce them. Visual-simulator-only telemetry
     // getter (HUD), not part of IRobotHardware (Phase 13P).
     bool collidedLastUpdate() const noexcept;
+
+    // True when the most recent update() call rejected the proposed
+    // position because the table-support fail-safe guard fired (Phase
+    // 13S) - never true for an obstacle-collision rejection. Visual-
+    // simulator-only telemetry getter (HUD), not part of IRobotHardware.
+    bool tableEdgeRejectedLastUpdate() const noexcept;
 
 private:
     WheelSpeeds wheelSpeedsForCommand(VirtualDriveCommand command) const noexcept;
     void applyEffectiveWheelSpeeds() noexcept;
+    bool effectiveObstacleHazard() const;
 
     VirtualWorld& world_;
     VirtualDistanceSensor sensor_;
@@ -250,7 +365,10 @@ private:
     WheelSpeeds manualSpeeds_{};
     bool autonomousOverrideActive_ = false;
     WheelSpeeds autonomousSpeeds_{};
+    bool safetyOverrideActive_ = false;
+    WheelSpeeds safetySpeeds_{};
     bool collidedLastUpdate_ = false;
+    bool tableEdgeRejectedLastUpdate_ = false;
 };
 
 } // namespace robot::visual

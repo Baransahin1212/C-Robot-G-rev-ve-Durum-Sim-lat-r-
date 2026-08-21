@@ -2245,6 +2245,674 @@ tracking, dynamic obstacle prediction, or return-to-original-path
 behavior - "turn until the forward BODY corridor clears, then continue"
 is still the entire policy.
 
+## Phase 13S: table-edge / cliff safety
+
+### The problem: an unbounded plane is not a physical desk
+
+Every prior phase's "world bounds" (`VirtualRobotHardware.cpp`'s ~10-unit
+clamp) treated the demo world as an infinite plane with an arbitrary
+coordinate limit - reaching it simply clamped the robot in place, an
+"invisible wall." A physical robot intended for a desk/table has no such
+wall: past the table's edge is a drop. Phase 13S replaces the invisible-
+wall behavior with a model of that real constraint.
+
+### Downward/support-surface sensor abstraction
+
+`VirtualCliffSensor` does not model real cliff-sensor physics (IR/ToF
+downward distance/reflectance). It models a simpler, sufficient
+abstraction for this project's purposes: presence/absence of supporting
+tabletop directly beneath each of four fixed points on the robot's
+footprint. A real cliff sensor answers "is there a surface within N
+centimeters below me"; this answers the equivalent binary question
+geometrically - "is this X/Z point inside the table's rectangle" - since
+the demo table is a flat, uniform-height surface with no ramps/steps to
+model. This is a deliberate simplification, not an oversight: the
+robotics-relevant behavior (detect before falling, react, recover) does
+not require modeling actual downward distance.
+
+### Four-corner sensor arrangement
+
+Sensors sit exactly at the four corners of the robot's rectangular
+footprint (`RobotDimensions::kBodyWidth`/`kBodyLength`, the same source
+of truth every other geometry component in this codebase uses - never a
+duplicated body dimension), rotated with the robot's heading via a new
+`rightDirection()` helper in `VisualMath.hpp`, added alongside the
+existing `forwardDirection()`:
+
+```cpp
+// forwardDirection(pose) = (sin(theta), 0, cos(theta))
+// rightDirection(pose)   = (cos(theta), 0, -sin(theta))
+//                         = forwardDirection() evaluated at (theta + 90)
+```
+
+Placing sensors at the exact geometric corners (not inset) mirrors how
+real robot vacuums mount cliff sensors near/at the chassis edge - a
+corner is considered unsafe the moment it is no longer directly above the
+table, which is the earliest a purely geometric (no physical inertia/
+overhang-support) model can detect it.
+
+**Why axis-aligned headings cannot isolate a single corner.** At heading
+0/90/180/270, `FrontLeft`/`RearLeft` always share one world coordinate
+(the "left" offset only affects X or Z, never both, at a cardinal
+heading) and `FrontRight`/`RearRight` share the other - so a straight
+table edge always trips a *pair* of corners simultaneously at those
+headings, never exactly one. `VirtualCliffSensorTests.cpp`'s single-
+corner isolation tests (`FrontLeftDetectsEdge` etc.) deliberately use a
+45-degree heading, where all four corners have distinct (x, z) offsets,
+to construct a scenario where exactly one sensor trips - this is a
+property of the geometry, not a limitation of the sensor model, and
+`MultipleSensorsCanDetectEdge` covers the (much more common in practice)
+axis-aligned two-corners-at-once case directly.
+
+### Safety authority: `Safety > Manual > AutonomousAvoidance > Fsm`
+
+`DriveAuthority` gained a fourth value, `Safety`, ranked ABOVE `Manual` -
+the only authority level explicitly allowed to override direct human
+control, because the physical constraint it represents (falling off a
+table) is real regardless of who is driving. `VirtualRobotHardware`
+gained `setSafetyWheelSpeeds()`/`clearSafetyWheelOverride()`/
+`safetyOverrideActive()`, the same override shape as the existing manual/
+autonomous overrides, and `applyEffectiveWheelSpeeds()` (the *one*
+arbitration path every override funnels through) now checks safety
+first. `main3d.cpp` never independently arbitrates authority - it only
+ever calls `setSafetyWheelSpeeds()`/`clearSafetyWheelOverride()` and lets
+`VirtualRobotHardware` resolve the actual priority, exactly like the
+Phase 13Q/13R overrides.
+
+### Edge recovery state machine
+
+`TableEdgeSafetyController` is a small, deliberately unsophisticated
+state machine - the brief is explicit that this is not the place for a
+planner:
+
+```text
+Inactive
+  |  any front cliff                    |  any rear cliff (no front cliff)
+  v                                      v
+BackingAway                        MovingForwardFromRearEdge
+  |  no front cliff                     |  no rear cliff
+  v                                      v
+                    Turning
+                      |  NO cliff at all (any corner)
+                      v
+                  Inactive
+```
+
+`BackingAway`/`MovingForwardFromRearEdge` transition to `Turning` as soon
+as their OWN triggering condition clears (front or rear respectively) -
+not once every sensor is clear - because backing/moving forward is a
+straight-line motion that only ever needs to pull the specific edge that
+triggered it back over the table; `Turning` is what changes heading, and
+it is deliberately the only state whose exit condition is "no cliff at
+all," because rotating in place moves the OTHER corners too (see below).
+These are internal recovery states only - never exposed to or consumed
+by `RobotStateMachine`. `RobotState` can legitimately still read `Moving`
+throughout an entire recovery sequence: `RobotController`'s
+`RobotState -> IRobotHardware` mapping is completely unmodified, and
+`FullTableEdgeSafetyClosedLoopThroughRealEventChain`
+(`VirtualRobotHardwareTests.cpp`) proves this directly against the real
+FSM/event chain.
+
+**Why `Turning`'s exit condition is "no cliff at all," not just "the
+original corner is clear."** Cliff-sensor corner positions rotate with
+heading even though the robot's center does not move during an in-place
+turn. Turning away from one edge can swing a *different* corner over the
+edge (most likely very close to a corner of the table, or immediately
+after backing away leaves the robot sitting exactly on a straight edge's
+boundary). If `Turning` exited the instant the originally-triggering
+corner cleared, it could release safety authority mid-turn with a
+different corner now unsupported. Requiring `anyCliff() == false` (all
+four safe) before releasing is what makes this self-correcting: if
+turning creates a new problem, the controller simply keeps turning -
+`RemainsActiveUntilSafe` in `TableEdgeSafetyControllerTests.cpp` proves
+this directly (a different corner going unsafe mid-`Turning` does not
+release the latch).
+
+**Known limitation: simultaneous front-and-rear detection.** If both a
+front and a rear cliff are detected at the same instant (a small robot
+straddling two edges near a table corner), `Inactive`'s transition checks
+front first, so `BackingAway` is chosen - which, if the rear edge is also
+already unsafe, would drive that edge further off rather than away from
+it. This V1 policy does not solve the "wedged at a corner from both
+sides" case correctly; per the Phase 13S brief's explicit "do not build a
+sophisticated planner" instruction, this is left as a known, documented
+limitation rather than engineered around it.
+
+### Front-edge and rear-edge responses
+
+`BackingAway`: equal negative wheel speeds
+(`-kRecoveryLinearSpeed`/`-kRecoveryLinearSpeed`, magnitude `1.0F`,
+matching `VirtualRobotHardware::kForwardWheelSpeed` - an emergency
+response reads as a normal-speed maneuver, not hesitant creeping).
+`MovingForwardFromRearEdge`: the mirror image, equal positive speeds.
+`Turning`: `-kRecoveryTurnSpeed`/`+kRecoveryTurnSpeed` (`0.6F`, matching
+`ReactiveObstacleAvoidance::kTurnWheelSpeed` exactly, so both
+"autonomous-authority turning" maneuvers read identically in the HUD) -
+the same deterministic turn-direction convention as
+`ReactiveObstacleAvoidance`, verified directly by
+`DeterministicTurnDirection`/`TurnUsesOppositeWheelSigns`.
+
+### Difference between collision safety and cliff safety
+
+`RobotCollision` answers "would this proposed position penetrate a solid
+obstacle" - a binary, position-only geometric test against `BoxObstacle`
+AABBs, with no notion of "falling." `VirtualCliffSensor`/
+`TableEdgeSafetyController` answer an entirely different question - "is
+this corner still supported" - and deliberately never touch
+`RobotCollision`'s machinery: a table edge is not an obstacle with a
+position and size, it is the *absence* of surface beyond a boundary.
+Representing it as an invisible `BoxObstacle` AABB wall was explicitly
+rejected by the brief, and would have been semantically wrong regardless
+- collision guards against entering geometry; cliff safety guards against
+leaving supported geometry. The two guards inside
+`VirtualRobotHardware::update()` are independent and additive (either one
+alone can reject a proposed position), with independent telemetry
+(`collidedLastUpdate()` vs `tableEdgeRejectedLastUpdate()`) so the HUD/
+tests never conflate which guard actually fired.
+
+### Table-support fail-safe: why `allCliff()`, not `anyCliff()`
+
+The initial design considered rejecting any proposed position where
+`anyCliff()` is true (any single corner off the table) - this is wrong,
+and would make recovery impossible. `BackingAway`/`MovingForwardFromRearEdge`
+necessarily spend their entire duration with one edge's corners still off
+the table (that is *why* they are actively recovering); a guard that
+rejected any such position would freeze the robot the instant recovery
+began, since the very first recovery step's proposed position still has
+the triggering corner unsafe. The guard instead uses `allCliff()` - reject
+only when the ENTIRE footprint (all four corners) has left the table, a
+genuine full-footprint fall. This is consistent with the brief's own
+"completely unsafe" phrasing for this guard, and gives the guard a
+correct, narrow job: catching an unusually large `deltaSeconds` tunneling
+the whole robot past the edge in a single step (before
+`TableEdgeSafetyController` ever got a chance to react), not the primary
+edge-avoidance behavior. `FullTableEdgeSafetyClosedLoopThroughRealEventChain`
+and the manual/avoidance edge integration tests all assert
+`tableEdgeRejectedLastUpdate()` never fires - proving the soft recovery
+layer always catches it first, exactly as intended; the fail-safe exists
+for the tunneling case those tests do not construct.
+
+### Simulation bounds vs. tabletop safety
+
+`VirtualWorld::tableSurface()` (a new `TableSurface{minX, maxX, minZ,
+maxZ}`, the demo table sized 12x12 world units) and
+`VirtualRobotHardware.cpp`'s pre-existing ~10-unit-half-extent clamp
+(`kWorldHalfExtent`) are now explicitly two different concepts. The
+former is the physical safety boundary this phase is about; the latter
+remains only as a generic, purely defensive simulation-coordinate safety
+net against unbounded numeric drift, deliberately larger than the table
+so it is never expected to be the thing that actually stops the robot in
+normal operation - the table-edge safety system (and, as a last resort,
+the `allCliff()` fail-safe above) does that well before ~10 units is ever
+reached. `TableSupportGuardStopsRobotNearTableEdgeInsteadOfWorldBound`
+(`VirtualRobotHardwareTests.cpp`) replaces the old
+`WorldBoundsStillApplyWithCollisionGuardPresent` test, whose assertion
+(position settling near the *old* 10-unit bound) directly encoded the
+now-removed invisible-wall behavior.
+
+### What was NOT touched
+
+No new `RobotState` values (`CliffDetected`/`TableEdgeDetected`/
+`AvoidingCliff` were deliberately not added), no new FSM transitions, no
+change to `RobotController`'s `RobotState -> IRobotHardware` mapping, no
+change to `HardwareEventSource`/`CompositePollingEventSource`, no change
+to `RobotCollision`'s obstacle-penetration logic, no change to
+`ReactiveObstacleAvoidance`/`ForwardClearanceProbe`'s own behavior (only
+`main3d.cpp`'s frame-order wiring gained the additional safety step
+around them). Return-to-home/return-to-original-path recovery is
+explicitly out of scope for this phase (Phase 13T); Phase 13S's
+acceptance is solely that the robot cannot drive off the table and
+recovers from table edges.
+
+### Manual-validation bugfix: "all sensors safe" is not sufficient to release
+
+Human manual validation of the initial Phase 13S implementation found a
+real behavior defect: on a straight table edge, the robot would
+repeatedly approach the edge, back away, and approach it again - a
+visible back-and-forth ping-pong, never establishing a stable heading
+back into the table interior. Turning appeared to work properly only
+near table corners.
+
+**Root cause, confirmed against the actual code (not assumed).** The
+original `Turning` release condition was exactly
+`!readings.anyCliff()`. On a straight edge, `BackingAway` stops the
+instant the triggering corner(s) clear - typically with only a small
+margin past the boundary, since the check re-evaluates every simulated
+frame and the robot is reversing at a fixed 1.0 unit/second. Once
+`Turning` begins, a rotation of only about 5.7 degrees (one 0.6 rad/s-
+equivalent simulation step at the project's usual 0.05s frame time) is
+frequently already enough for all four corners to read safe again -
+`readings.anyCliff()` becomes false almost immediately, with no
+requirement that the robot had turned toward anywhere in particular. The
+robot then resumes forward motion on a heading barely different from the
+one that caused the approach in the first place, and re-triggers the same
+edge shortly after. At a table corner, two edges' worth of sensors must
+simultaneously read safe, which geometrically demands substantially more
+rotation before `anyCliff()` clears - which is exactly why corner
+recovery looked correct while straight-edge recovery did not: the same
+buggy condition, just harder to satisfy accidentally in that case.
+
+This was confirmed by hand-deriving the exact corner-sensor geometry for
+a representative straight-edge scenario before making any code change,
+then encoding it as
+`TableEdgeSafetyControllerTest.DoesNotReleaseOnSensorsAloneWhenHeadingStillFacesTheEdge`
+(`TableEdgeSafetyControllerTests.cpp`) - a scenario where all four
+sensors are verifiably safe (`ASSERT_FALSE(...anyCliff())`, asserted
+directly against the real geometry) after only one simulation step's
+rotation, which the pre-fix `!readings.anyCliff()`-only condition would
+have released immediately.
+
+**Fix: release requires sensors safe AND heading alignment with a
+geometry-derived target.** When a recovery incident begins (the
+`Inactive -> BackingAway`/`MovingForwardFromRearEdge` transition), the
+controller now captures a target heading once, pointing from the robot's
+CURRENT position toward `TableSurface`'s center:
+
+```cpp
+targetDirection = tableCenter - robotPosition;   // X/Z only
+targetRecoveryHeadingDegrees = headingDegreesFromDirection(targetDirection.x, targetDirection.z);
+```
+
+`Turning` now releases only when BOTH:
+
+```text
+!readings.anyCliff()
+AND
+|shortestSignedHeadingErrorDegrees(pose.headingDegrees, targetRecoveryHeadingDegrees)| <= kRecoveryHeadingToleranceDegrees (10.0F)
+```
+
+The target is captured once per incident and held fixed - it is not
+continuously re-aimed as the robot moves during `BackingAway`/
+`MovingForwardFromRearEdge`, which would risk unstable steering for
+essentially no benefit here (the table center is a single fixed point;
+re-deriving it from a position a small distance away rarely changes the
+result meaningfully).
+
+**Why geometric heading completion, not a timer.** A "turn for N frames"
+or "turn for 0.5 seconds" fallback was deliberately not used. This
+simulator is otherwise entirely deterministic and geometry-based - every
+other safety/avoidance decision (`ForwardClearanceProbe`,
+`VirtualCliffSensor` itself) is a function of world state, not elapsed
+time. A timer-based turn duration would need to be tuned per turn-speed/
+starting-heading combination to reliably reach a safe heading, would
+either overshoot (spinning longer than necessary once already safely
+inward) or undershoot (releasing too early on an unlucky starting angle,
+reproducing a variant of the exact bug this fix addresses) - a geometric
+target is correct by construction for every approach angle and every
+edge, with no tuning constant beyond the tolerance angle itself.
+
+**Turn direction is no longer fixed.** Unlike `ReactiveObstacleAvoidance`
+(deliberately left unchanged - it has no notion of "toward what," only
+"away from the immediate obstacle," so a fixed direction remains the
+right choice there), `TableEdgeSafetyController::recoveryWheelSpeeds()`
+now picks whichever in-place turn direction is the shorter path to the
+target heading, using the sign of
+`shortestSignedHeadingErrorDegrees()` - a positive error turns the same
+direction `ReactiveObstacleAvoidance` always uses (`omega > 0`); a
+negative error turns the opposite way. `VisualMath.hpp` gained three
+small heading helpers to support this:
+`headingDegreesFromDirection()` (inverse of `forwardDirection()`),
+`normalizeHeadingDegrees()`, and `shortestSignedHeadingErrorDegrees()` -
+all raylib-free, all sharing this project's one heading convention (0 =
++Z, 90 = +X).
+
+**API change.** `TableEdgeSafetyController::update()` gained two
+parameters: `update(const CliffSensorReadings&, const RobotPose&, const
+TableSurface&)`. `VirtualCliffSensor`/`RobotStateMachine`/`RobotController`/
+`RobotRuntime` are unmodified; `main3d.cpp` and every test constructing a
+`TableEdgeSafetyController` were updated to pass the robot's live pose
+and table surface.
+
+**Regression coverage added.** Beyond the direct unit-level regression
+test above, four new straight-edge closed-loop integration tests
+(`StraightEdgeRecoveryPositiveZ`/`NegativeZ`/`PositiveX`/`NegativeX`,
+`VirtualRobotHardwareTests.cpp`) each drive the real FSM/hardware/event
+chain toward one table side and assert BOTH a meaningful heading change
+(more than 90 degrees between the start of the recovery and its release -
+comfortably beyond the old bug's ~5.7-degree single-step release, and
+comfortably below the roughly 170-degree worst case) and that safety does
+not reactivate for 100 further frames after release (no ping-pong). A
+corner regression test (`CornerRecoveryStillWorks`) confirms the
+previously-working corner case is unaffected. The manual-edge integration
+test was strengthened with the same two assertions.
+
+**Known limitations reassessed.** The simultaneous front-and-rear
+detection limitation (documented above) is unchanged by this fix -
+`Inactive`'s front-first precedence is orthogonal to the heading-release
+condition, and still does not correctly resolve the "wedged at a corner
+from both sides" case. The corner case in general, however, is now
+provably more robust: recovery no longer merely happens to require more
+rotation near a corner (an accident of the old sensor-only condition), it
+explicitly turns toward the table center regardless of geometry.
+
+## Manual-validation bugfix: body-width-aware obstacle perception
+
+### The blind spot, confirmed against the actual code
+
+Human manual validation found a second real defect, independent of the
+table-edge one: the robot's obstacle-detection "laser" could pass beside
+a solid obstacle while part of the robot's actual BODY still intersected
+it, so the FSM never entered `WaitingForObstacleClear` and avoidance
+never engaged - `RobotCollision` (a last-resort pose guard, never meant
+to be the primary obstacle signal) ended up being the first thing that
+noticed, at the last possible moment.
+
+Confirmed by inspecting the actual architecture before changing anything:
+`VirtualRobotHardware::obstacleDetected()` (the one boolean
+`HardwareEventSource` polls to produce `ObstacleDetected`/`ObstacleCleared`)
+was backed by exactly one thing - `VirtualDistanceSensor`'s single center-
+line ray. `ForwardClearanceProbe` already existed and was already body-
+width-aware (Phase 13R), but was wired ONLY into
+`ReactiveObstacleAvoidance`'s release condition, never into detection
+itself - so an obstacle offset enough to miss the single ray, but still
+within the robot's actual swept body path, was genuinely invisible to
+perception until the robot's collision circle was already touching it.
+
+### Exact blind-spot geometry
+
+A concrete reproduction: robot at world origin facing +Z, a 0.7-wide
+obstacle centered at X 0.65 - its X range [0.3, 1.0] contains none of the
+three ray origins (X -0.25 / 0.0 / +0.25, once the fix below adds the
+side rays) yet is still well within the robot's forward path once its
+actual half-body-width (0.3) plus the same safety margin
+`ForwardClearanceProbe` already uses is accounted for. Before this fix,
+even the single center ray (X 0.0) already missed this obstacle
+entirely - and RobotCollision was the only thing that would eventually
+notice, only once the robot's circular footprint (radius 0.5) was
+already within penetration distance.
+
+### The fix: two independent, complementary widenings
+
+**Part A - three parallel forward rays.** `VirtualObstacleSensorArray`
+(new, raylib-free) casts `FrontLeft`/`FrontCenter`/`FrontRight` rays in
+parallel along the robot's forward direction, using the exact same
+deterministic ray-vs-AABB slab technique `VirtualDistanceSensor.cpp`
+already uses (a fresh, self-contained copy - matching this codebase's
+existing precedent of `ForwardClearanceProbe.cpp` already duplicating
+that same technique rather than sharing one implementation). `FrontCenter`
+is geometrically identical to `VirtualDistanceSensor`'s own ray (same
+origin, same thresholds - genuinely redundant on purpose, so
+`obstacleDistance()`'s existing telemetry meaning never changes).
+`FrontLeft`/`FrontRight` originate at
+`(RobotDimensions::kBodyWidth / 2) - kLateralInset` (0.25F, from
+0.3 - 0.05) either side of center - `kLateralInset` (0.05F) is the only
+new named constant; the width itself is never re-derived independently
+of `RobotDimensions`.
+
+**Part B - a width-aware corridor as a secondary hazard.**
+Three discrete rays still leave theoretical gaps between them. A new
+`ForwardClearanceProbe::isForwardCorridorClearWithinDistance(float)`
+overload (the original `isForwardCorridorClear()` is now defined in
+terms of it, passing `kLookaheadDistance`) lets
+`VirtualRobotHardware` reuse the SAME swept-body corridor concept
+`ReactiveObstacleAvoidance` already relies on for its release condition,
+but as a perception-side hazard signal instead:
+
+```cpp
+bool VirtualRobotHardware::effectiveObstacleHazard() const
+{
+    const bool rangeSensorObstacleDetected = VirtualObstacleSensorArray(world_).readings().anyDetected();
+    const bool bodyCorridorBlocked =
+        !ForwardClearanceProbe(world_).isForwardCorridorClearWithinDistance(kBodyCorridorHazardLookahead);
+    return rangeSensorObstacleDetected || bodyCorridorBlocked;
+}
+```
+
+### Why NOT the same lookahead as avoidance release (the oscillation/
+### regression trap this fix specifically avoided)
+
+The obvious-looking shortcut - reuse `ForwardClearanceProbe::kLookaheadDistance`
+(1.4F) directly for detection too - was tried on paper first and rejected
+before writing any code, because it does NOT preserve existing detection
+distances. Worked example: the Phase 13O/13R closed-loop regression test
+advances the robot to Z 2.0 and asserts `RuntimeStepResult::NoEvent` (not
+yet detected) against a centered obstacle whose near face is at Z 3.7.
+The single ray's trigger threshold works out to Z >= 2.3 (still not
+tripped at Z 2.0, matching the test) - but the 1.4F-lookahead corridor,
+because its AABB-expansion-by-clearanceRadius (0.58F) effectively pulls
+the obstacle's boundary 0.58F closer BEFORE the 1.4F reach is even
+applied, would already trigger at Z >= 1.72F - tripping the assertion at
+Z 2.0 and breaking that (and several other) pre-existing tests.
+
+The fix: a SEPARATE, shorter, independently-derived lookahead,
+`kBodyCorridorHazardLookahead`, used ONLY for detection:
+
+```cpp
+kBodyCorridorHazardLookahead =
+    (RobotDimensions::kBodyLength / 2) + VirtualDistanceSensor::kDetectionDistance
+    - (kRobotCollisionRadius + ForwardClearanceProbe::kSafetyMargin)
+    // = 0.4 + 1.0 - 0.58 = 0.82F
+```
+
+This is derived so that for a PERFECTLY CENTERED obstacle (the case every
+pre-existing regression test uses), the corridor's effective total reach
+from the robot's center (`clearanceRadius + kBodyCorridorHazardLookahead`)
+comes out EXACTLY equal to the single ray's own total reach
+(`kBodyLength/2 + kDetectionDistance`) - both equal 1.4F, not by
+coincidence but by construction. The result: this widening changes
+detection COVERAGE (catching an obstacle offset enough to miss all three
+rays, exactly the human-observed defect) without changing the existing
+detection DISTANCE for a centered obstacle, so every pre-existing
+centered-obstacle regression test keeps its original timing unmodified.
+`ForwardClearanceProbe::kLookaheadDistance` (1.4F) itself is completely
+unchanged and remains reserved exclusively for
+`ReactiveObstacleAvoidance`'s release condition.
+
+### No oscillation, no deadlock - proved by geometry, not just tested
+
+Because the detection corridor (0.82F) and the avoidance-release corridor
+(1.4F) share the same origin and direction and differ only in length, the
+shorter one is always a geometric SUBSET of the longer one for any given
+frame. If the longer segment does not intersect an obstacle's expanded
+footprint, the shorter subset segment provably cannot either. Consequence:
+by the time `ReactiveObstacleAvoidance`'s own release condition
+(`isForwardCorridorClear()`, 1.4F) is satisfied, the detection hazard
+(0.82F) is ALREADY guaranteed clear - so `WaitingForObstacleClear` can
+never get stuck waiting on a hazard signal that avoidance's own release
+logic has already superseded. This is a property of segment geometry, not
+an empirical accident; `FullClosedLoopOffsetObstacleAvoidanceThroughRealEventChain`
+(`VirtualRobotHardwareTests.cpp`) additionally confirms it holds for a
+real offset-obstacle scenario end to end, including the (expected, Phase
+13R-established) case where the FSM's natural `ObstacleCleared` fires
+BEFORE avoidance's own latch releases.
+
+### What was NOT touched
+
+`RobotStateMachine`, `RobotController`, `RobotRuntime`,
+`HardwareEventSource`, `CompositePollingEventSource`, and
+`IRobotHardware`'s public surface are all unmodified -
+`HardwareEventSource` still observes only the one aggregate
+`IRobotHardware::obstacleDetected()` edge, exactly as before; no
+`ObstacleDetected`/`ObstacleCleared` is ever constructed or injected by
+any visual-simulator code. `ReactiveObstacleAvoidance`'s own behavior is
+unchanged (it still receives whatever `hardware.obstacleDetected()`
+reports, now simply more accurate). `RobotCollision` is unchanged -
+still the unconditional final penetration guard, and
+`OffsetObstacleMissesAllThreeRaysButBodyCorridorDetectsIt` proves the new
+aggregate hazard fires at a position `RobotCollision` would not yet
+reject. Manual mode's own priority (`Manual` still outranks
+`AutonomousAvoidance`/`Fsm`, `Safety` still outranks everything) is
+untouched - this fix widens PERCEPTION, which manual driving now also
+benefits from indirectly (the collision guard was always manual's real
+protection; nothing about that changed), but no new automatic-avoidance-
+overrides-manual behavior was introduced.
+
+## UX polish: toggleable compact/full HUD
+
+`RobotSimulator3D`'s HUD had grown large over Phases 13O-13S (29 lines by
+the time of this change). `H` (edge-triggered `IsKeyPressed`, matching
+every other toggle in `main3d.cpp` - `IsKeyDown` would flicker every frame
+while held) switches a presentation-only `HudMode` (`Full`/`Compact`,
+`Renderer3D.hpp`) between the existing full telemetry and a small
+six-line operational subset: `State`, `Authority`, `Safety`, `Avoidance`,
+`Obstacle`, `Edge`.
+
+**Zero behavioral coupling, by construction, not just by care.**
+`HudMode` lives in `Renderer3D.hpp` (the presentation layer), is read only
+inside `drawHud()`, and is never passed to, or read by, any FSM/hardware/
+safety/avoidance code - `main3d.cpp`'s `hudMode` variable exists purely to
+be copied into `VisualTelemetry` each frame and toggled on `H`, nothing
+else references it. The existing `HudLine lines[]` panel-sizing/drawing
+loop was already fully generic (panel width/height are computed from
+whatever line array is handed to it - a pre-existing, not newly-added,
+property); Compact mode therefore required no special sizing logic at
+all, only a second, shorter `HudLine` array selected by `telemetry.hudMode`.
+
+**Compact mode never hides an active safety condition.** `Authority`
+reuses `driveAuthorityText` verbatim - it reads `"SAFETY"` the instant
+`DriveAuthority::Safety` is active, identically to Full mode. `Safety`,
+`Avoidance`, `Obstacle`, and `Edge` are each derived from already-computed
+telemetry booleans (`edgeSafetyActive`, `avoidanceEnabled`/`avoidanceActive`,
+a new `obstacleHazard` field set directly from
+`VirtualRobotHardware::obstacleDetected()`'s own aggregate result, and the
+four `cliffFrontLeft`/etc. booleans ORed together) - this OR-ing and if/
+else text selection is pure presentation (which line to show), not a
+detection/safety decision; every underlying boolean is still computed
+exactly where it always was. `obstacleHazard` was added specifically so
+Compact mode's single `Obstacle:` line reflects the real aggregate signal
+(range rays OR body corridor) without Renderer3D reconstructing that OR
+itself from the individual ray/corridor fields Full mode displays
+separately.
+
+**No new tests** were added for this change - a two-state UI toggle over
+already-tested boolean telemetry does not warrant unit-testing raylib
+pixel output, and the existing `toString(HudMode)` free function (kept
+for API consistency and any future headless caller) is trivial enough
+that no dedicated test adds meaningful confidence beyond what the
+compiler's exhaustive-switch checking already guarantees. The full 469-
+test CTest suite remaining green is the regression proof that no
+behavioral code was touched.
+
+## Table-edge recovery bugfix #2: heading completion is not support completion
+
+### Root cause, confirmed against the actual code and reproduced before editing
+
+A second round of human manual validation found the robot could remain
+stuck at a table edge indefinitely, even after the first heading-based
+recovery fix (above). Screenshot telemetry captured the exact condition:
+`Edge recovery state: Turning`, heading error already ~-1.1 degrees (well
+inside the 10-degree tolerance), yet `Cliff RL: EDGE` while the other
+three sensors read `SAFE`, with the wheels holding fixed opposite signs.
+
+Confirmed by inspecting `TableEdgeSafetyController::update()`'s `Turning`
+case before changing anything: its release condition
+(`!readings.anyCliff() && headingSafe`) correctly refused to release
+(one corner was still genuinely off-table) - but `Turning`'s only
+available action, `recoveryWheelSpeeds()`'s in-place turn, can never fix
+a purely POSITIONAL problem, because pure rotation never translates the
+robot's center. Once heading reached the target, the turn direction sign
+(derived from the heading error) stabilized, and the controller had no
+other action available - an indefinite hold, not a crash or an incorrect
+release, but a real stuck condition matching the report exactly.
+
+**Reproduced deterministically before writing the fix**: a controller-
+level test was constructed that feeds the SAME "heading already at
+target (error 0), RearLeft still reporting a cliff" `(readings, pose,
+table)` triple on every `update()` call (no physics advanced - a pure
+logic probe), looped 50 times, and asserted `state() == Turning` -
+confirmed to pass against the unfixed implementation before any
+production code changed
+(`TableEdgeSafetyControllerTest.TurningTransitionsToAdvancingInwardWhenHeadingSafeButCornerStillEdge`,
+`TableEdgeSafetyControllerTests.cpp`).
+
+### Four recovery concepts, never collapsed
+
+1. **Detect the edge** - `VirtualCliffSensor`/`CliffSensorReadings` (true
+   = that corner is off the table; unchanged, this is the actual physical
+   edge).
+2. **Create separation from the triggering edge** - `BackingAway`/
+   `MovingForwardFromRearEdge` (unchanged).
+3. **Orient toward the table interior** - `Turning`, tracking a fixed
+   target heading (table-edge recovery bugfix #1, above).
+4. **Translate inward until support is robust** - the new
+   `AdvancingInward` state (this fix): once heading is safe, drives
+   straight forward until `areAllCornersSafelyInsideTable()` (all four
+   footprint corners inside the table by `kRecoverySupportMargin`, 0.15F)
+   is satisfied.
+
+Concept 4 is deliberately a DIFFERENT, stricter geometric test than
+concept 1: `isPointOnTable()` (used by `CliffSensorReadings`) is
+inclusive of the exact boundary - a corner sitting precisely at the edge
+counts as safe, because that is the real physical fact a cliff sensor
+represents. `isPointSafelyInsideTable(point, table, margin)`
+(`VirtualCliffSensor.hpp`, new) shrinks the table rectangle inward by
+`margin` on every side before testing - a corner exactly on the raw
+boundary FAILS this stricter check. This is intentional: the fundamental
+cliff-sensor semantics (`true` = actually off the table) must never
+change, since that is what drives the real, safety-critical detection
+path; the margin exists ONLY to make recovery's own release condition
+robust, not to redefine what "off the table" means anywhere else in the
+codebase. `kRecoverySupportMargin` (0.15F) sits inside the brief's
+suggested 0.10F-0.20F range - small relative to the ~12-unit table,
+comfortably larger than one simulation step's positional drift at
+`kRecoveryInwardSpeed`.
+
+### State machine and release condition
+
+```text
+Turning         -> Inactive         (headingSafe AND supportSafe)
+Turning         -> AdvancingInward  (headingSafe AND NOT supportSafe)
+AdvancingInward -> Turning          (NOT headingSafe - realign first)
+AdvancingInward -> Inactive         (headingSafe AND supportSafe)
+```
+
+`headingSafe` and `supportSafe` are computed once per `update()` call and
+used identically by both `Turning` and `AdvancingInward` - the exact same
+two-condition check governs both "may I stop turning and drive forward"
+and "may I stop entirely," just with different fallback behavior
+(`AdvancingInward` when only support is missing;  back to `Turning` when
+heading has drifted). `AdvancingInward`'s own wheel speeds
+(`kRecoveryInwardSpeed`, 0.6F, matching `kRecoveryTurnSpeed`'s magnitude
+so both "controlled maneuver" phases read consistently in the HUD) are
+deliberately slower than the initial emergency
+`kRecoveryLinearSpeed` (1.0F) - by this point the robot is not escaping
+an emergency, it is making a precise, already-oriented approach.
+
+### Why AdvancingInward re-checks heading instead of assuming it stays put
+
+`AdvancingInward` commands straight-line motion, but the ACTUAL committed
+pose still passes through `DifferentialDrive -> RobotCollision ->
+table-support guard` every frame, exactly like every other wheel-speed
+source (see "collision guard" below) - a proposed translation can be
+REJECTED (position held, heading unaffected) if it would collide with an
+obstacle, which cannot happen to heading. In principle heading should
+stay exactly at the target throughout AdvancingInward since it never
+commands a turn; the drift-check exists as a defensive, brief-mandated
+robustness measure (re-verify before committing to "just drive forward")
+rather than a condition expected to fire often in practice - cheap to
+check, and it directly satisfies the requirement that a future
+implementation change (e.g. adding drift/inertia) cannot silently regress
+into "driving inward at a poor angle."
+
+### Fail-safes remain layered, unweakened
+
+The hard table-support fail-safe inside `VirtualRobotHardware::update()`
+(rejects a proposed position only when `allCliff()` - the full footprint,
+not one corner) is untouched by this fix. Every new/updated integration
+test (`StraightEdgeRecoveryPositiveZ`/`NegativeZ`/`PositiveX`/`NegativeX`,
+`CornerRecoveryStillWorks`,
+`ScreenshotConditionAdvancingInwardEngagesThroughRealEventChain`, the
+manual and autonomous edge tests) asserts
+`tableEdgeRejectedLastUpdate()` stays false throughout - the soft
+recovery (now including `AdvancingInward`) continues to solve the problem
+before the hard guard would ever need to. `AdvancingInward`'s wheel
+speeds flow through the exact same
+`WheelSpeeds -> DifferentialDrive -> proposed pose -> RobotCollision ->
+table-support guard -> commit/reject` path as every other drive-authority
+source - Safety is never allowed to bypass collision protection.
+
+### What was NOT touched
+
+`RobotStateMachine` gained no new state or Event - `AdvancingInward`
+remains, like every other `TableEdgeSafetyController::RecoveryState`, an
+internal physical-safety-layer concept invisible to the mission FSM.
+`Safety > Manual > AutonomousAvoidance > Fsm` is unchanged; while
+`AdvancingInward` is active, `DriveAuthority` remains `Safety`, and
+manual/autonomous/FSM requests are still remembered underneath exactly
+as before - the existing manual- and avoidance-edge integration tests
+pass unmodified against the new state machine, proving the fall-through
+behavior on release is unaffected.
+
 ## Fail-safe / emergency stop
 
 The simulator implements a simplified software model of fail-safe

@@ -31,11 +31,23 @@ constexpr float kBaseDepth = 1.5F;
 constexpr float kBlockingObstacleX = kRobotStartX;
 constexpr float kBlockingObstacleZ = 4.3F;
 
+// Demo tabletop half-extent along X/Z (Phase 13S) - deliberately smaller
+// than VirtualRobotHardware's generic ~10-unit simulation-coordinate
+// bound, and comfortably larger than every existing obstacle/base-
+// platform placement above (largest reach: the base platform's far
+// corner at ~4.75, the blocking obstacle's far face at ~4.9), so none of
+// the pre-existing demo scene sits outside the table. Leaves a visible
+// margin between the table edge and the ~10-unit-half-extent ground/grid
+// Renderer3D draws, so "off the table" reads as genuinely empty space,
+// not a wall right at the grid's edge.
+constexpr float kTableHalfExtent = 6.0F;
+
 } // namespace
 
 VirtualWorld::VirtualWorld()
     : robotPose_{Vec3{kRobotStartX, kRobotStartY, kRobotStartZ}, 0.0F}
     , basePlatform_{Vec3{kBaseX, kBaseHeight / 2.0F, kBaseZ}, Vec3{kBaseWidth, kBaseHeight, kBaseDepth}}
+    , tableSurface_{-kTableHalfExtent, kTableHalfExtent, -kTableHalfExtent, kTableHalfExtent}
 {
     // Four scattered box obstacles, none overlapping the robot's start
     // position or the base platform.
@@ -58,6 +70,11 @@ const BasePlatform& VirtualWorld::basePlatform() const noexcept
 const std::vector<BoxObstacle>& VirtualWorld::obstacles() const noexcept
 {
     return obstacles_;
+}
+
+const TableSurface& VirtualWorld::tableSurface() const noexcept
+{
+    return tableSurface_;
 }
 
 void VirtualWorld::setRobotPosition(const Vec3& position)

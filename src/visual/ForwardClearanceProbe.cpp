@@ -97,6 +97,11 @@ ForwardClearanceProbe::ForwardClearanceProbe(const VirtualWorld& world)
 
 bool ForwardClearanceProbe::isForwardCorridorClear() const
 {
+    return isForwardCorridorClearWithinDistance(kLookaheadDistance);
+}
+
+bool ForwardClearanceProbe::isForwardCorridorClearWithinDistance(float lookaheadDistance) const
+{
     const RobotPose& pose = world_.robotPose();
     const Vec3& origin = pose.position;
     const Vec3 direction = forwardDirection(pose);
@@ -118,7 +123,7 @@ bool ForwardClearanceProbe::isForwardCorridorClear() const
         const float minZ = obstacle.position.z - (obstacle.size.z / 2.0F) - clearanceRadius;
         const float maxZ = obstacle.position.z + (obstacle.size.z / 2.0F) + clearanceRadius;
 
-        if (segmentIntersectsExpandedAabb(origin, direction, kLookaheadDistance, minX, maxX, minZ, maxZ))
+        if (segmentIntersectsExpandedAabb(origin, direction, lookaheadDistance, minX, maxX, minZ, maxZ))
         {
             return false;
         }

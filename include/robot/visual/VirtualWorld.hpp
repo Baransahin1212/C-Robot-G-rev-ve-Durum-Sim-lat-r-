@@ -53,6 +53,25 @@ struct BasePlatform
     Vec3 size;
 };
 
+// The rectangular safe tabletop surface the physical robot is confined to
+// (Phase 13S) - a distinct concept from any generic simulation-coordinate
+// bounds VirtualRobotHardware may also enforce (a much larger, purely
+// defensive numeric safety net, never the primary UX - see
+// VirtualRobotHardware.cpp). Anything outside this rectangle is NOT a
+// solid wall: it represents a drop off the edge of the table, so it is
+// deliberately never modeled via RobotCollision's obstacle-AABB
+// machinery. See VirtualCliffSensor.hpp (edge detection) and
+// TableEdgeSafetyController.hpp (recovery policy) for how this is
+// actually used, and docs/technical-decisions.md (Phase 13S) for the
+// full rationale.
+struct TableSurface
+{
+    float minX = 0.0F;
+    float maxX = 0.0F;
+    float minZ = 0.0F;
+    float maxZ = 0.0F;
+};
+
 // Deterministic, hard-coded demo scene (Phase 13M): a stationary robot, a
 // handful of box obstacles, and one base platform, all on the Y = 0
 // ground plane. VirtualWorld is pure data/state - it owns no raylib type
@@ -74,6 +93,13 @@ public:
     const RobotPose& robotPose() const noexcept;
     const BasePlatform& basePlatform() const noexcept;
     const std::vector<BoxObstacle>& obstacles() const noexcept;
+
+    // The fixed Phase 13S demo table surface - see TableSurface above.
+    // No production mutator exists (unlike setRobotPosition()/
+    // setObstaclePosition()/setObstacleEnabled()): the table's shape is
+    // deliberately fixed for the lifetime of one VirtualWorld, matching
+    // basePlatform()'s own no-mutator precedent.
+    const TableSurface& tableSurface() const noexcept;
 
     // Moves the robot to `position`, leaving headingDegrees unchanged - no
     // turning/differential-drive logic exists yet (Phase 13N). This is
@@ -116,6 +142,7 @@ private:
     RobotPose robotPose_;
     BasePlatform basePlatform_;
     std::vector<BoxObstacle> obstacles_;
+    TableSurface tableSurface_;
 };
 
 } // namespace robot::visual

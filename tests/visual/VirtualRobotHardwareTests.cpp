@@ -1,3 +1,5 @@
+#include <cmath>
+
 #include <gtest/gtest.h>
 
 #include "robot/CompositePollingEventSource.hpp"
@@ -9,8 +11,12 @@
 #include "robot/visual/DemoCommandSource.hpp"
 #include "robot/visual/ForwardClearanceProbe.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
+#include "robot/visual/TableEdgeSafetyController.hpp"
+#include "robot/visual/VirtualCliffSensor.hpp"
+#include "robot/visual/VirtualObstacleSensorArray.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
+#include "robot/visual/VisualMath.hpp"
 
 namespace
 {
@@ -24,8 +30,14 @@ using robot::RobotStateMachine;
 using robot::RuntimeStepResult;
 using robot::visual::DemoCommandSource;
 using robot::visual::DriveAuthority;
+using robot::visual::CliffSensorReadings;
 using robot::visual::ForwardClearanceProbe;
 using robot::visual::ReactiveObstacleAvoidance;
+using robot::visual::robotPositionCollidesWithObstacles;
+using robot::visual::shortestSignedHeadingErrorDegrees;
+using robot::visual::TableEdgeSafetyController;
+using robot::visual::TableSurface;
+using robot::visual::VirtualCliffSensor;
 using robot::visual::Vec3;
 using robot::visual::VirtualDriveCommand;
 using robot::visual::VirtualRobotHardware;
@@ -903,27 +915,50 @@ TEST(VirtualRobotHardwareTest, ReEnabledObstacleBlocksMovement)
     EXPECT_GT(world.robotPose().position.z, 3.4F);
 }
 
-// 35: WorldBoundsStillApplyWithCollisionGuardPresent
-TEST(VirtualRobotHardwareTest, WorldBoundsStillApplyWithCollisionGuardPresent)
+// 35: TableSupportGuardStopsRobotNearTableEdgeInsteadOfWorldBound
+//
+// Phase 13S superseded the old "robot reaches the world bound and gets
+// clamped/stuck at ~10" behavior (the "invisible wall" this phase's brief
+// explicitly requires removing) with the table-support fail-safe guard -
+// this test replaces the old WorldBoundsStillApplyWithCollisionGuardPresent,
+// whose assertion (position settling near the old 10-unit bound) directly
+// encoded the now-removed behavior. This test drives ONLY
+// VirtualRobotHardware::update()'s own guard directly (no
+// TableEdgeSafetyController wired up, matching the original test's
+// "collision guard present, nothing else engaged" spirit) - proving the
+// hard fail-safe alone, with no recovery steering, still keeps the robot
+// off the old 10-unit bound and near the table's own edge instead.
+TEST(VirtualRobotHardwareTest, TableSupportGuardStopsRobotNearTableEdgeInsteadOfWorldBound)
 {
-    // Arrange: no obstacles in the way - only the world-bounds clamp
-    // should limit movement.
+    // Arrange: no obstacles in the way - only the table-support guard
+    // should limit forward movement. Default world start position/heading
+    // (X -3, Z 1.0, heading 0) - straight line toward the table's +Z edge
+    // (tableSurface().maxZ, 6.0F by default).
     VirtualWorld world;
     disableAllObstacles(world);
     VirtualRobotHardware hardware(world);
     hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    const float initialZ = world.robotPose().position.z;
+    const float tableMaxZ = world.tableSurface().maxZ;
 
-    // Act: far more simulated time than needed to reach the ~10-unit
-    // world half-extent at 1.0 unit/second.
-    for (int i = 0; i < 100; ++i)
+    // Act: far more simulated time than needed to reach the table edge at
+    // 1.0 unit/second.
+    for (int i = 0; i < 400; ++i)
     {
-        hardware.update(1.0F);
+        hardware.update(0.05F);
     }
 
-    // Assert: clamped, not teleported off into infinity, and not stuck
-    // short of the bound by a false collision.
-    EXPECT_LE(world.robotPose().position.z, 10.0F);
-    EXPECT_GE(world.robotPose().position.z, 9.0F);
+    // Assert: genuine forward progress happened, the robot never reached
+    // anywhere near the old 10-unit world bound (proving the invisible-
+    // wall-at-10 behavior is gone), and it settled just past the table's
+    // edge boundary by at most half the robot's body length - exactly the
+    // allCliff() (all four corners off) condition the guard uses, not the
+    // old anyCliff()-at-any-single-corner behavior.
+    const float finalZ = world.robotPose().position.z;
+    EXPECT_GT(finalZ, initialZ + 1.0F);
+    EXPECT_LT(finalZ, 10.0F);
+    EXPECT_GT(finalZ, tableMaxZ - 0.1F);
+    EXPECT_LT(finalZ, tableMaxZ + 0.5F);
 }
 
 // --- DriveAuthority model (Phase 13Q) ---
@@ -1420,4 +1455,810 @@ TEST(VirtualRobotHardwareTest, ManualPriorityWhileAvoidanceLatched)
 
     // Assert: authority now falls through to the FSM command.
     EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+}
+
+// --- Safety authority (Phase 13S, section 20) ---
+//
+// Safety > Manual > AutonomousAvoidance > Fsm, fixed priority. Items 1-3
+// of the section-20 checklist (default authority is FSM, Autonomous >
+// FSM, Manual > Autonomous) are already covered, unmodified, by
+// DefaultAuthorityIsFsm/AutonomousOverrideTakesAuthorityFromFsm/
+// ManualOverrideTakesAuthorityFromAutonomous above - these tests cover
+// items 4-12, all newly added for Safety.
+
+// 47: SafetyOverridesManual
+TEST(VirtualRobotHardwareTest, SafetyOverridesManual)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // Act
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+    EXPECT_TRUE(hardware.manualOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, -1.0F);
+}
+
+// 48: SafetyOverridesAutonomous
+TEST(VirtualRobotHardwareTest, SafetyOverridesAutonomous)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    // Act
+    hardware.setSafetyWheelSpeeds(1.0F, 1.0F);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+    EXPECT_TRUE(hardware.autonomousOverrideActive());
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 1.0F);
+}
+
+// 49: SafetyOverridesFsm
+TEST(VirtualRobotHardwareTest, SafetyOverridesFsm)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+
+    // Act
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, -1.0F);
+}
+
+// 50: ClearingSafetyRestoresManualIfActive
+TEST(VirtualRobotHardwareTest, ClearingSafetyRestoresManualIfActive)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setManualWheelSpeeds(0.4F, 0.4F);
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act
+    hardware.clearSafetyWheelOverride();
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, 0.4F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.4F);
+}
+
+// 51: ClearingSafetyRestoresAutonomousIfNoManual
+TEST(VirtualRobotHardwareTest, ClearingSafetyRestoresAutonomousIfNoManual)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act
+    hardware.clearSafetyWheelOverride();
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.6F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.6F);
+}
+
+// 52: ClearingSafetyRestoresFsmIfNeitherExists
+TEST(VirtualRobotHardwareTest, ClearingSafetyRestoresFsmIfNeitherExists)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.moveForward();
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act
+    hardware.clearSafetyWheelOverride();
+
+    // Assert
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_GT(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// 53: FsmCommandsUnderSafetyRemainRemembered
+TEST(VirtualRobotHardwareTest, FsmCommandsUnderSafetyRemainRemembered)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+
+    // Act: RobotController-style calls continue to arrive while safety is
+    // active - exactly like the existing manual/autonomous equivalents.
+    hardware.moveForward();
+    hardware.stop();
+    hardware.returnToBase();
+
+    // Assert: currentCommand() reflects the latest FSM call, but physical
+    // wheel speeds are still the safety override's values.
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -1.0F);
+    EXPECT_FLOAT_EQ(speeds.right, -1.0F);
+}
+
+// 54: ManualRequestsUnderSafetyRemainRemembered
+TEST(VirtualRobotHardwareTest, ManualRequestsUnderSafetyRemainRemembered)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act: a manual command arrives while safety is active (e.g. the user
+    // is still holding UP when the table edge is reached).
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+
+    // Assert: recorded, but safety still physically wins.
+    EXPECT_TRUE(hardware.manualOverrideActive());
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+    const WheelSpeeds speedsWhileSafetyActive = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speedsWhileSafetyActive.left, -1.0F);
+    EXPECT_FLOAT_EQ(speedsWhileSafetyActive.right, -1.0F);
+
+    // Act: safety releases.
+    hardware.clearSafetyWheelOverride();
+
+    // Assert: the manual request was never lost - it takes over
+    // immediately.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    const WheelSpeeds speedsAfterClear = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speedsAfterClear.left, 1.0F);
+    EXPECT_FLOAT_EQ(speedsAfterClear.right, 1.0F);
+}
+
+// 55: AutonomousRequestsUnderSafetyRemainRemembered
+TEST(VirtualRobotHardwareTest, AutonomousRequestsUnderSafetyRemainRemembered)
+{
+    // Arrange
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setSafetyWheelSpeeds(-1.0F, -1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act: an autonomous-avoidance request arrives while safety is
+    // active.
+    hardware.setAutonomousWheelSpeeds(-0.6F, 0.6F);
+
+    // Assert: recorded, but safety still physically wins.
+    EXPECT_TRUE(hardware.autonomousOverrideActive());
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // Act: safety releases.
+    hardware.clearSafetyWheelOverride();
+
+    // Assert: the autonomous request was never lost.
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    const WheelSpeeds speeds = hardware.wheelSpeeds();
+    EXPECT_FLOAT_EQ(speeds.left, -0.6F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.6F);
+}
+
+// --- Full table-edge safety closed-loop integration test (Phase 13S,
+// section 21 - one of this phase's main acceptance tests) ---
+//
+// Drives the real production stack - VirtualWorld -> VirtualRobotHardware
+// -> HardwareEventSource -> CompositePollingEventSource -> RobotRuntime ->
+// RobotStateMachine -> RobotController, plus VirtualCliffSensor and
+// TableEdgeSafetyController - end to end, without ever setting
+// DriveAuthority directly. All obstacles are disabled so this test
+// isolates table-edge safety from obstacle avoidance entirely - the FSM
+// reaches Moving and, with no obstacle ever detected, simply stays
+// Moving/MoveForward for the whole test, exactly matching the brief's
+// framing: "RobotStateMachine may still say Moving while DriveAuthority =
+// SAFETY temporarily controls the actual wheels."
+namespace
+{
+
+// Shared closed-loop driver for the straight-edge/corner variation tests
+// below (Phase 13S manual-validation bugfix, sections 9-11): drives the
+// real production stack from a starting pose, through a full table-edge
+// safety recovery cycle, and for a further window afterward - so each
+// caller can assert both "recovery genuinely converged to a meaningful
+// inward heading" and "no repeated forward/back ping-pong afterward,"
+// without duplicating this ~40-line loop four-plus times.
+struct EdgeRecoveryOutcome
+{
+    bool everSafetyAuthority = false;
+    bool everBackingAwayOrForward = false;
+    bool everTurning = false;
+    bool everAdvancingInward = false;
+    bool everReleasedBackToFsm = false;
+    bool everReactivatedAfterRelease = false;
+    float headingAtSafetyStart = 0.0F;
+    float headingAtRelease = 0.0F;
+};
+
+EdgeRecoveryOutcome driveTowardEdgeAndRecover(const Vec3& startPosition, float startHeadingDegrees)
+{
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(startPosition);
+    world.setRobotHeading(startHeadingDegrees);
+
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    CompositePollingEventSource compositeSource(commandSource, hardwareEventSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+    VirtualCliffSensor cliffSensor(world);
+    TableEdgeSafetyController tableEdgeSafety;
+
+    runtime.step(); // Idle -> Ready
+    runtime.step(); // Ready -> Moving
+
+    EdgeRecoveryOutcome outcome{};
+    bool recordedHeadingAtStart = false;
+    int framesSinceRelease = -1;
+
+    for (int frame = 0; frame < 4000; ++frame)
+    {
+        runtime.step();
+
+        const CliffSensorReadings readings = cliffSensor.readings();
+        tableEdgeSafety.update(readings, world.robotPose(), world.tableSurface());
+
+        if (tableEdgeSafety.active())
+        {
+            if (!recordedHeadingAtStart)
+            {
+                outcome.headingAtSafetyStart = world.robotPose().headingDegrees;
+                recordedHeadingAtStart = true;
+            }
+            const WheelSpeeds recovery = tableEdgeSafety.recoveryWheelSpeeds();
+            hardware.setSafetyWheelSpeeds(recovery.left, recovery.right);
+        }
+        else if (hardware.safetyOverrideActive())
+        {
+            hardware.clearSafetyWheelOverride();
+        }
+
+        if (hardware.driveAuthority() == DriveAuthority::Safety)
+        {
+            outcome.everSafetyAuthority = true;
+        }
+        if (tableEdgeSafety.state() == TableEdgeSafetyController::RecoveryState::BackingAway ||
+            tableEdgeSafety.state() == TableEdgeSafetyController::RecoveryState::MovingForwardFromRearEdge)
+        {
+            outcome.everBackingAwayOrForward = true;
+        }
+        if (tableEdgeSafety.state() == TableEdgeSafetyController::RecoveryState::Turning)
+        {
+            outcome.everTurning = true;
+        }
+        if (tableEdgeSafety.state() == TableEdgeSafetyController::RecoveryState::AdvancingInward)
+        {
+            outcome.everAdvancingInward = true;
+        }
+
+        hardware.update(0.05F);
+        EXPECT_FALSE(hardware.tableEdgeRejectedLastUpdate());
+
+        if (!outcome.everReleasedBackToFsm && !tableEdgeSafety.active() &&
+            hardware.driveAuthority() == DriveAuthority::Fsm && outcome.everSafetyAuthority)
+        {
+            outcome.everReleasedBackToFsm = true;
+            outcome.headingAtRelease = world.robotPose().headingDegrees;
+            framesSinceRelease = 0;
+        }
+
+        if (outcome.everReleasedBackToFsm)
+        {
+            if (hardware.driveAuthority() == DriveAuthority::Safety)
+            {
+                outcome.everReactivatedAfterRelease = true;
+            }
+            ++framesSinceRelease;
+            if (framesSinceRelease >= 100)
+            {
+                break;
+            }
+        }
+    }
+
+    return outcome;
+}
+
+} // namespace
+
+// --- Full straight-edge/corner closed-loop integration tests (Phase 13S
+// manual-validation bugfix, sections 9-11) ---
+//
+// Drives the real production stack - VirtualWorld -> VirtualRobotHardware
+// -> HardwareEventSource -> CompositePollingEventSource -> RobotRuntime ->
+// RobotStateMachine -> RobotController, plus VirtualCliffSensor and
+// TableEdgeSafetyController - end to end, without ever setting
+// DriveAuthority directly. Each proves the exact defect the human manual
+// validation found is fixed: recovery must produce a MEANINGFUL heading
+// change (not a trivial single-step rotation) before releasing, and must
+// not immediately re-trigger against the same edge afterward.
+
+// +Z edge (also the phase's main FSM-driven acceptance scenario, section
+// 21/26 item 8).
+TEST(VirtualRobotHardwareTest, StraightEdgeRecoveryPositiveZ)
+{
+    const EdgeRecoveryOutcome outcome = driveTowardEdgeAndRecover(Vec3{0.0F, 0.125F, 5.0F}, 0.0F);
+
+    EXPECT_TRUE(outcome.everSafetyAuthority);
+    EXPECT_TRUE(outcome.everBackingAwayOrForward);
+    EXPECT_TRUE(outcome.everTurning);
+    ASSERT_TRUE(outcome.everReleasedBackToFsm);
+    EXPECT_GT(std::fabs(shortestSignedHeadingErrorDegrees(outcome.headingAtSafetyStart, outcome.headingAtRelease)),
+              90.0F);
+    EXPECT_FALSE(outcome.everReactivatedAfterRelease);
+}
+
+// -Z edge.
+TEST(VirtualRobotHardwareTest, StraightEdgeRecoveryNegativeZ)
+{
+    const EdgeRecoveryOutcome outcome = driveTowardEdgeAndRecover(Vec3{0.0F, 0.125F, -5.0F}, 180.0F);
+
+    EXPECT_TRUE(outcome.everSafetyAuthority);
+    EXPECT_TRUE(outcome.everBackingAwayOrForward);
+    EXPECT_TRUE(outcome.everTurning);
+    ASSERT_TRUE(outcome.everReleasedBackToFsm);
+    EXPECT_GT(std::fabs(shortestSignedHeadingErrorDegrees(outcome.headingAtSafetyStart, outcome.headingAtRelease)),
+              90.0F);
+    EXPECT_FALSE(outcome.everReactivatedAfterRelease);
+}
+
+// +X edge.
+TEST(VirtualRobotHardwareTest, StraightEdgeRecoveryPositiveX)
+{
+    const EdgeRecoveryOutcome outcome = driveTowardEdgeAndRecover(Vec3{5.0F, 0.125F, 0.0F}, 90.0F);
+
+    EXPECT_TRUE(outcome.everSafetyAuthority);
+    EXPECT_TRUE(outcome.everBackingAwayOrForward);
+    EXPECT_TRUE(outcome.everTurning);
+    ASSERT_TRUE(outcome.everReleasedBackToFsm);
+    EXPECT_GT(std::fabs(shortestSignedHeadingErrorDegrees(outcome.headingAtSafetyStart, outcome.headingAtRelease)),
+              90.0F);
+    EXPECT_FALSE(outcome.everReactivatedAfterRelease);
+}
+
+// -X edge.
+TEST(VirtualRobotHardwareTest, StraightEdgeRecoveryNegativeX)
+{
+    const EdgeRecoveryOutcome outcome = driveTowardEdgeAndRecover(Vec3{-5.0F, 0.125F, 0.0F}, 270.0F);
+
+    EXPECT_TRUE(outcome.everSafetyAuthority);
+    EXPECT_TRUE(outcome.everBackingAwayOrForward);
+    EXPECT_TRUE(outcome.everTurning);
+    ASSERT_TRUE(outcome.everReleasedBackToFsm);
+    EXPECT_GT(std::fabs(shortestSignedHeadingErrorDegrees(outcome.headingAtSafetyStart, outcome.headingAtRelease)),
+              90.0F);
+    EXPECT_FALSE(outcome.everReactivatedAfterRelease);
+}
+
+// Corner regression (section 11): approaching the +X/+Z corner
+// diagonally. Existing corner behavior (already better than the straight-
+// edge case, since clearing two edges' worth of sensors naturally demands
+// more rotation) must not regress - it still recovers, still eventually
+// releases, and still does not immediately re-trigger.
+TEST(VirtualRobotHardwareTest, CornerRecoveryStillWorks)
+{
+    const EdgeRecoveryOutcome outcome = driveTowardEdgeAndRecover(Vec3{0.0F, 0.125F, 0.0F}, 45.0F);
+
+    EXPECT_TRUE(outcome.everSafetyAuthority);
+    EXPECT_TRUE(outcome.everTurning);
+    ASSERT_TRUE(outcome.everReleasedBackToFsm);
+    EXPECT_FALSE(outcome.everReactivatedAfterRelease);
+}
+
+// --- Screenshot-condition full closed-loop test (table-edge recovery
+// bugfix #2, section 11) ---
+//
+// An off-axis approach heading (20 degrees, not perpendicular to the +Z
+// edge) reliably reproduces the real-physics version of the screenshot
+// condition: BackingAway reverses along the SAME (off-axis) heading it
+// had when triggered, so it only ever pulls the FRONT corners back - by
+// the time Turning rotates the robot to face the table center, a REAR
+// corner is frequently still marginal, requiring AdvancingInward to
+// actually translate the center to safety - exactly the defect class
+// TurningTransitionsToAdvancingInwardWhenHeadingSafeButCornerStillEdge
+// (TableEdgeSafetyControllerTests.cpp) proves in isolation, now proven
+// through the REAL FSM/hardware/DifferentialDrive/RobotCollision chain.
+TEST(VirtualRobotHardwareTest, ScreenshotConditionAdvancingInwardEngagesThroughRealEventChain)
+{
+    const EdgeRecoveryOutcome outcome = driveTowardEdgeAndRecover(Vec3{0.0F, 0.125F, 5.0F}, 20.0F);
+
+    EXPECT_TRUE(outcome.everSafetyAuthority);
+    EXPECT_TRUE(outcome.everBackingAwayOrForward);
+    EXPECT_TRUE(outcome.everTurning);
+
+    // The actual point of this test: the controller did not merely reach
+    // Turning and release directly - it genuinely needed to translate the
+    // center inward first (proving the fix is exercised by real physics,
+    // not just reachable in principle).
+    EXPECT_TRUE(outcome.everAdvancingInward);
+
+    ASSERT_TRUE(outcome.everReleasedBackToFsm);
+    EXPECT_FALSE(outcome.everReactivatedAfterRelease);
+}
+
+// --- Manual-edge integration test (Phase 13S, section 22; strengthened
+// in the manual-validation bugfix, section 12) ---
+TEST(VirtualRobotHardwareTest, ManualDriveTowardEdgeIsOverriddenBySafetyAndManualResumesAfterRecovery)
+{
+    // Arrange
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.0F});
+    world.setRobotHeading(0.0F);
+
+    VirtualRobotHardware hardware(world);
+    VirtualCliffSensor cliffSensor(world);
+    TableEdgeSafetyController tableEdgeSafety;
+
+    // Act: manual drive toward the table edge (UP held equivalent).
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+
+    bool everSafetyOverrodeManual = false;
+    bool everReleasedBackToManual = false;
+    bool everReactivatedAfterRelease = false;
+    float headingAtSafetyStart = 0.0F;
+    bool recordedHeadingAtStart = false;
+    float headingAtRelease = 0.0F;
+    int framesSinceRelease = -1;
+
+    for (int frame = 0; frame < 4000; ++frame)
+    {
+        const CliffSensorReadings readings = cliffSensor.readings();
+        tableEdgeSafety.update(readings, world.robotPose(), world.tableSurface());
+
+        if (tableEdgeSafety.active())
+        {
+            if (!recordedHeadingAtStart)
+            {
+                headingAtSafetyStart = world.robotPose().headingDegrees;
+                recordedHeadingAtStart = true;
+            }
+            const WheelSpeeds recovery = tableEdgeSafety.recoveryWheelSpeeds();
+            hardware.setSafetyWheelSpeeds(recovery.left, recovery.right);
+        }
+        else if (hardware.safetyOverrideActive())
+        {
+            hardware.clearSafetyWheelOverride();
+        }
+
+        if (hardware.driveAuthority() == DriveAuthority::Safety)
+        {
+            everSafetyOverrodeManual = true;
+        }
+
+        // The user is still holding UP throughout, exactly like
+        // main3d.cpp recomputing manual wheel speeds from currently-held
+        // keys every frame regardless of who currently has authority.
+        hardware.setManualWheelSpeeds(1.0F, 1.0F);
+
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.tableEdgeRejectedLastUpdate());
+
+        if (!everReleasedBackToManual && !tableEdgeSafety.active() &&
+            hardware.driveAuthority() == DriveAuthority::Manual && everSafetyOverrodeManual)
+        {
+            everReleasedBackToManual = true;
+            headingAtRelease = world.robotPose().headingDegrees;
+            framesSinceRelease = 0;
+        }
+
+        if (everReleasedBackToManual)
+        {
+            if (hardware.driveAuthority() == DriveAuthority::Safety)
+            {
+                everReactivatedAfterRelease = true;
+            }
+            ++framesSinceRelease;
+            if (framesSinceRelease >= 100)
+            {
+                break;
+            }
+        }
+    }
+
+    // Assert: safety genuinely took over from manual, the robot was never
+    // driveable off the table, manual control resumed afterward, the
+    // recovery turned the robot by a meaningful amount (not the trivial
+    // single-step rotation the pre-bugfix version would have accepted),
+    // and - still holding UP the whole time - it did not immediately
+    // re-trigger safety again.
+    ASSERT_TRUE(everSafetyOverrodeManual);
+    ASSERT_TRUE(everReleasedBackToManual);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    EXPECT_TRUE(hardware.manualOverrideActive());
+    EXPECT_GT(std::fabs(shortestSignedHeadingErrorDegrees(headingAtSafetyStart, headingAtRelease)), 90.0F);
+    EXPECT_FALSE(everReactivatedAfterRelease);
+}
+
+// --- Avoidance-edge integration test (Phase 13S, section 23) ---
+TEST(VirtualRobotHardwareTest, AvoidanceEdgeSafetyOverridesAutonomousAndAutonomousResumesIfStillActive)
+{
+    // Arrange: positioned so that avoidance's own in-place turn (the same
+    // deterministic direction ReactiveObstacleAvoidance always uses)
+    // immediately starts swinging a front corner past the table edge -
+    // avoidance's own trigger/release chain is already covered by Phase
+    // 13R's tests, so it is driven directly here (a real component, just
+    // not through the full FSM/obstacle chain) to isolate exactly the
+    // Safety-vs-Autonomous priority interaction this test exists for.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.6F}); // front corner exactly at the table edge
+    world.setRobotHeading(0.0F);
+
+    VirtualRobotHardware hardware(world);
+    VirtualCliffSensor cliffSensor(world);
+    TableEdgeSafetyController tableEdgeSafety;
+    ReactiveObstacleAvoidance avoidance;
+
+    // Force avoidance active and never let it release on its own (this
+    // test deliberately never satisfies its forwardCorridorClear release
+    // condition) - so it stays a real, active AUTONOMOUS request for the
+    // whole test, exercising the "if avoidance still active, control
+    // returns AUTONOMOUS" branch of section 23.
+    avoidance.update(/*enabled=*/true, /*triggerAvoidance=*/true, /*forwardCorridorClear=*/false);
+    ASSERT_TRUE(avoidance.active());
+    const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+    hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    bool everSafetyOverrodeAutonomous = false;
+    bool everReturnedToAutonomous = false;
+
+    for (int frame = 0; frame < 4000 && !everReturnedToAutonomous; ++frame)
+    {
+        const CliffSensorReadings readings = cliffSensor.readings();
+        tableEdgeSafety.update(readings, world.robotPose(), world.tableSurface());
+
+        if (tableEdgeSafety.active())
+        {
+            const WheelSpeeds recovery = tableEdgeSafety.recoveryWheelSpeeds();
+            hardware.setSafetyWheelSpeeds(recovery.left, recovery.right);
+        }
+        else if (hardware.safetyOverrideActive())
+        {
+            hardware.clearSafetyWheelOverride();
+        }
+
+        // Avoidance keeps wanting the wheels throughout (still active(),
+        // by construction) - kept in sync every frame exactly like
+        // main3d.cpp does, regardless of who currently has authority.
+        avoidance.update(true, true, false);
+        if (avoidance.active())
+        {
+            const WheelSpeeds speeds = avoidance.avoidanceWheelSpeeds();
+            hardware.setAutonomousWheelSpeeds(speeds.left, speeds.right);
+        }
+        else if (hardware.autonomousOverrideActive())
+        {
+            hardware.clearAutonomousWheelOverride();
+        }
+
+        if (hardware.driveAuthority() == DriveAuthority::Safety)
+        {
+            everSafetyOverrodeAutonomous = true;
+        }
+
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.tableEdgeRejectedLastUpdate());
+
+        if (!tableEdgeSafety.active() && hardware.driveAuthority() == DriveAuthority::AutonomousAvoidance &&
+            everSafetyOverrodeAutonomous)
+        {
+            everReturnedToAutonomous = true;
+        }
+    }
+
+    // Assert: safety genuinely overrode autonomous, the robot was never
+    // driveable off the table by an avoidance turn either, and control
+    // fell back through to AUTONOMOUS (not FSM) since avoidance was still
+    // active when safety released - the "otherwise falls through to FSM"
+    // branch is already covered directly by
+    // ClearingSafetyRestoresFsmIfNeitherExists above.
+    ASSERT_TRUE(everSafetyOverrodeAutonomous);
+    ASSERT_TRUE(everReturnedToAutonomous);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    EXPECT_TRUE(avoidance.active());
+}
+
+// --- Body-width-aware obstacle perception (manual-validation bugfix) ---
+//
+// Reproduces the exact human-observed blind spot geometrically: an
+// obstacle positioned so it does NOT intersect any of the three
+// FrontLeft/FrontCenter/FrontRight rays (X range [0.3, 1.0] excludes all
+// three ray origins at X -0.25/0.0/+0.25), yet still lies within the
+// robot's forward body-width corridor once the swept-body clearance
+// margin is accounted for. Obstacle index 3 (the narrowest demo
+// obstacle, 0.7 wide / half-width 0.35) is used since VirtualWorld's
+// obstacle sizes are fixed - only position/enabled are mutable.
+
+// CRITICAL REGRESSION TEST: proves the aggregate hazard - not any
+// individual ray - is what catches this geometry, at a position that is
+// not yet colliding (RobotCollision would not reject this exact pose).
+TEST(VirtualRobotHardwareTest, OffsetObstacleMissesAllThreeRaysButBodyCorridorDetectsIt)
+{
+    // Arrange
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(3, Vec3{0.65F, 0.4F, 1.5F});
+    world.setObstacleEnabled(3, true);
+    VirtualRobotHardware hardware(world);
+
+    // Act
+    const auto rayReadings = hardware.obstacleSensorReadings();
+    const bool corridorHazard = hardware.bodyCorridorObstacleHazard();
+
+    // Assert: no individual ray sees it...
+    EXPECT_FALSE(rayReadings.frontLeftDetected);
+    EXPECT_FALSE(rayReadings.frontCenterDetected);
+    EXPECT_FALSE(rayReadings.frontRightDetected);
+    EXPECT_FALSE(rayReadings.anyDetected());
+
+    // ...but the width-aware body corridor does...
+    EXPECT_TRUE(corridorHazard);
+
+    // ...so the aggregate IRobotHardware::obstacleDetected() is true.
+    EXPECT_TRUE(hardware.obstacleDetected());
+
+    // ...and this position is not yet an actual physical collision - the
+    // aggregate hazard fires BEFORE RobotCollision would ever need to
+    // reject a pose here.
+    EXPECT_FALSE(robotPositionCollidesWithObstacles(world.robotPose().position, world.obstacles()));
+}
+
+// FULL CLOSED-LOOP OFFSET-OBSTACLE TEST: drives the real production stack
+// - VirtualWorld -> VirtualRobotHardware -> HardwareEventSource ->
+// CompositePollingEventSource -> RobotRuntime -> RobotStateMachine ->
+// RobotController -> ReactiveObstacleAvoidance -> ForwardClearanceProbe ->
+// DifferentialDrive -> RobotCollision - end to end, toward the same
+// laterally-offset obstacle, without ever injecting
+// ObstacleDetected/ObstacleCleared or setting DriveAuthority directly.
+TEST(VirtualRobotHardwareTest, FullClosedLoopOffsetObstacleAvoidanceThroughRealEventChain)
+{
+    // Arrange: obstacle index 3 offset per the regression test above;
+    // robot approaches it from further back, straight along heading 0 (X
+    // stays 0 the whole approach, so no ray - old or new - would EVER see
+    // this obstacle; only the body corridor can).
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, -2.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(3, Vec3{0.65F, 0.4F, 1.5F});
+    world.setObstacleEnabled(3, true);
+
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    CompositePollingEventSource compositeSource(commandSource, hardwareEventSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+    ReactiveObstacleAvoidance avoidance;
+    ForwardClearanceProbe clearanceProbe(world);
+
+    // Act / Assert: reach Moving through real FSM transitions.
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Moving);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::MoveForward);
+
+    bool everCenterRayDetected = false;
+    bool everObstacleDetectedNaturally = false;
+    bool everWaitingForObstacleClear = false;
+    bool everAvoidanceActive = false;
+    bool everClearedNaturally = false;
+    RobotState currentState = stateMachine.currentState();
+
+    for (int frame = 0; frame < 3000 && currentState != RobotState::WaitingForObstacleClear; ++frame)
+    {
+        runtime.step();
+        currentState = stateMachine.currentState();
+        if (hardware.obstacleSensorReadings().frontCenterDetected)
+        {
+            everCenterRayDetected = true;
+        }
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+    }
+    everObstacleDetectedNaturally = (currentState == RobotState::WaitingForObstacleClear);
+    everWaitingForObstacleClear = everObstacleDetectedNaturally;
+    ASSERT_TRUE(everObstacleDetectedNaturally);
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+
+    // Drive the real Phase 13R per-frame avoidance policy toward release.
+    // Loops until avoidance has both engaged AND fully released
+    // (DriveAuthority genuinely back to Fsm) - NOT merely until
+    // currentState first reads Moving: the aggregate obstacle hazard
+    // (this fix's shorter, detection-purpose corridor) can - and in this
+    // exact scenario does - clear before avoidance's own longer release
+    // corridor does, so the FSM's natural ObstacleCleared can fire while
+    // the avoidance latch correctly remains active for several more
+    // frames (the same Phase 13R latch behavior, unchanged by this fix -
+    // see ClearanceAwareAvoidanceClosedLoopThroughRealEventChain above
+    // for the original proof of this interplay).
+    for (int frame = 0; frame < 3000 && !everClearedNaturally; ++frame)
+    {
+        runtime.step();
+        currentState = stateMachine.currentState();
+
+        const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
+        const bool triggerAvoidance =
+            currentState == RobotState::WaitingForObstacleClear && hardware.obstacleDetected();
+        avoidance.update(true, triggerAvoidance, forwardCorridorClear);
+        if (avoidance.active())
+        {
+            everAvoidanceActive = true;
+            const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+            hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
+        }
+        else if (hardware.autonomousOverrideActive())
+        {
+            hardware.clearAutonomousWheelOverride();
+        }
+
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+
+        if (everAvoidanceActive && currentState == RobotState::Moving &&
+            hardware.driveAuthority() == DriveAuthority::Fsm)
+        {
+            everClearedNaturally = true;
+        }
+    }
+
+    // Assert: the whole sequence genuinely happened through the real
+    // chain, with no manual Event injection anywhere in this test.
+    EXPECT_FALSE(everCenterRayDetected); // confirms this really was an
+                                          // offset-obstacle scenario, not
+                                          // accidentally a centered one
+    EXPECT_TRUE(everWaitingForObstacleClear);
+    EXPECT_TRUE(everAvoidanceActive);
+    ASSERT_TRUE(everClearedNaturally);
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::MoveForward);
+    EXPECT_FALSE(hardware.autonomousOverrideActive());
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+
+    // No physical collision occurred anywhere in the sequence, and the
+    // robot resumes safe forward travel afterward.
+    for (int i = 0; i < 20; ++i)
+    {
+        hardware.update(0.05F);
+        EXPECT_FALSE(hardware.collidedLastUpdate());
+    }
 }

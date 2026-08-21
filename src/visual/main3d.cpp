@@ -11,7 +11,10 @@
 #include "robot/visual/ManualDriveInput.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
+#include "robot/visual/TableEdgeSafetyController.hpp"
+#include "robot/visual/VirtualCliffSensor.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
+#include "robot/visual/VirtualObstacleSensorArray.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
@@ -55,7 +58,12 @@ constexpr float kManualWheelSpeed = 1.0F;
 // stay engaged for several frames after the FSM has already returned to
 // Moving, if ForwardClearanceProbe still reports the robot's physical
 // body corridor as blocked - see the frame-order block below and
-// docs/technical-decisions.md (Phase 13R).
+// docs/technical-decisions.md (Phase 13R). As of Phase 13S, a fourth,
+// HIGHEST-priority authority - Safety - sits above even manual driving:
+// TableEdgeSafetyController, driven by VirtualCliffSensor's four corner
+// readings, takes the wheels the instant the robot's footprint nears the
+// table's edge, regardless of what manual/autonomous/FSM currently want -
+// see docs/technical-decisions.md (Phase 13S).
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -96,12 +104,33 @@ int main()
     // unconditional last-resort guard inside VirtualRobotHardware::update().
     robot::visual::ForwardClearanceProbe clearanceProbe(world);
 
+    // Table-edge safety (Phase 13S) - VirtualCliffSensor reads the same
+    // live VirtualWorld pose/table data every frame; TableEdgeSafetyController
+    // is the small stateful recovery latch that converts its readings
+    // into emergency wheel speeds. Both are raylib-free and have no FSM/
+    // IRobotHardware knowledge of their own - the decision of *whether*
+    // safety authority applies each frame lives entirely here in
+    // main3d.cpp, exactly like avoidance's own caller contract. Unlike
+    // avoidance, there is no enable/disable toggle - table-edge safety is
+    // a physical safety layer, always active.
+    robot::visual::VirtualCliffSensor cliffSensor(world);
+    robot::visual::TableEdgeSafetyController tableEdgeSafety;
+
     // Display-only sensor handle (Phase 13O): reads the exact same
     // VirtualWorld state VirtualRobotHardware's own internal sensor does, so
     // the HUD/ray-visualization telemetry it produces is always identical to
     // what actually drove obstacleDetected() this frame. It never influences
     // FSM/hardware behavior - it only feeds Renderer3D's VisualTelemetry.
     robot::visual::VirtualDistanceSensor sensor(world);
+
+    // Display-only three-ray perception array handle (manual-validation
+    // bugfix): reads the exact same VirtualWorld state
+    // VirtualRobotHardware's own internal array does, so the HUD/ray-
+    // visualization telemetry is always identical to what actually feeds
+    // obstacleDetected() this frame. It never influences FSM/hardware
+    // behavior on its own - it only feeds Renderer3D's VisualTelemetry,
+    // exactly like `sensor` above.
+    robot::visual::VirtualObstacleSensorArray obstacleSensorArray(world);
 
     // Camera mouse capture starts enabled, so the mouse immediately
     // drives the camera without an extra keypress; DisableCursor() also
@@ -147,6 +176,13 @@ int main()
     // on manual mode, which always takes priority regardless of this
     // setting (see VirtualRobotHardware::driveAuthority()).
     bool avoidanceEnabled = true;
+
+    // HUD detail level (UX polish) - `H` toggles Full <-> Compact.
+    // Presentation-only: read by Renderer3D's drawHud() alone, never
+    // consulted by any FSM/hardware/safety/avoidance decision below.
+    // Starts Full so RobotSimulator3D shows full engineering telemetry
+    // immediately, matching every other toggle's own documented default.
+    robot::visual::HudMode hudMode = robot::visual::HudMode::Full;
 
     while (!WindowShouldClose())
     {
@@ -207,6 +243,15 @@ int main()
             avoidanceEnabled = !avoidanceEnabled;
         }
 
+        if (IsKeyPressed(KEY_H))
+        {
+            // Edge-triggered (IsKeyPressed, not IsKeyDown) so holding H
+            // toggles exactly once, not every frame - presentation-only,
+            // see the hudMode declaration above.
+            hudMode =
+                (hudMode == robot::visual::HudMode::Full) ? robot::visual::HudMode::Compact : robot::visual::HudMode::Full;
+        }
+
         // Exactly one RobotRuntime::step() per rendered frame - the render
         // loop itself is the scheduler (see RobotRuntime's own docs). If
         // VirtualRobotHardware::obstacleDetected() has newly become true,
@@ -243,14 +288,39 @@ int main()
                                        hardware.obstacleDetected();
         avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear);
 
-        // Apply drive authority (Manual > AutonomousAvoidance > Fsm - see
-        // VirtualRobotHardware::driveAuthority()). The autonomous override
-        // is kept in sync with the latch unconditionally, even while
-        // manual mode is active: manual still physically wins (driveAuthority()
-        // always prefers it), but the avoidance request stays logically
-        // latched underneath, exactly as it did in Phase 13Q, and is
-        // restored automatically the instant manual mode ends without
-        // needing to be re-triggered.
+        // Compute this frame's cliff-sensor readings and advance the
+        // table-edge safety recovery latch (Phase 13S) - runs
+        // unconditionally every frame, exactly like avoidance's own
+        // update() above, so it stays in sync with the real robot pose
+        // regardless of manual/autonomous/FSM state.
+        const robot::visual::CliffSensorReadings cliffReadings = cliffSensor.readings();
+        tableEdgeSafety.update(cliffReadings, world.robotPose(), world.tableSurface());
+
+        // Apply drive authority (Safety > Manual > AutonomousAvoidance >
+        // Fsm - see VirtualRobotHardware::driveAuthority()). Safety is
+        // synced first and unconditionally, exactly like the avoidance
+        // override below: even while manual mode is active, this keeps
+        // firing so a table edge reached under manual control is caught
+        // immediately - VirtualRobotHardware::applyEffectiveWheelSpeeds()
+        // is the one place final priority is actually resolved, so this
+        // code never needs to reason about ordering itself.
+        if (tableEdgeSafety.active())
+        {
+            const robot::visual::WheelSpeeds recoverySpeeds = tableEdgeSafety.recoveryWheelSpeeds();
+            hardware.setSafetyWheelSpeeds(recoverySpeeds.left, recoverySpeeds.right);
+        }
+        else if (hardware.safetyOverrideActive())
+        {
+            hardware.clearSafetyWheelOverride();
+        }
+
+        // The autonomous override is kept in sync with the avoidance
+        // latch unconditionally, even while manual mode is active: manual
+        // still physically wins over it (driveAuthority() always prefers
+        // Manual over AutonomousAvoidance), but the avoidance request
+        // stays logically latched underneath, exactly as it did in Phase
+        // 13Q, and is restored automatically the instant manual mode ends
+        // without needing to be re-triggered.
         if (avoidance.active())
         {
             const robot::visual::WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
@@ -310,6 +380,33 @@ int main()
         telemetry.avoidanceActive = avoidance.active();
         telemetry.forwardClearanceClear = forwardCorridorClear;
         telemetry.clearanceLookahead = robot::visual::ForwardClearanceProbe::kLookaheadDistance;
+        telemetry.cliffFrontLeft = cliffReadings.frontLeft;
+        telemetry.cliffFrontRight = cliffReadings.frontRight;
+        telemetry.cliffRearLeft = cliffReadings.rearLeft;
+        telemetry.cliffRearRight = cliffReadings.rearRight;
+        telemetry.edgeSafetyActive = tableEdgeSafety.active();
+        telemetry.edgeRecoveryStateText = robot::visual::toString(tableEdgeSafety.state());
+        telemetry.edgeTargetHeadingDegrees = tableEdgeSafety.targetRecoveryHeadingDegrees();
+        telemetry.edgeHeadingErrorDegrees = tableEdgeSafety.currentHeadingErrorDegrees();
+
+        // Manual-validation bugfix: left/right ray telemetry - center
+        // reuses telemetry.sensorOrigin/obstacleDistance/obstacleDetected
+        // above (geometrically identical to the array's FrontCenter ray,
+        // never recomputed twice). bodyCorridorObstacleHazard mirrors the
+        // exact same hazard signal hardware.obstacleDetected() itself ORs
+        // in - see VirtualRobotHardware::bodyCorridorObstacleHazard().
+        const robot::visual::ObstacleSensorArrayReadings obstacleRays = obstacleSensorArray.readings();
+        telemetry.obstacleRayLeftOrigin =
+            obstacleSensorArray.rayOrigin(robot::visual::ObstacleRayPosition::FrontLeft);
+        telemetry.obstacleRayRightOrigin =
+            obstacleSensorArray.rayOrigin(robot::visual::ObstacleRayPosition::FrontRight);
+        telemetry.obstacleRayLeftDistance = obstacleRays.frontLeftDistance;
+        telemetry.obstacleRayRightDistance = obstacleRays.frontRightDistance;
+        telemetry.obstacleRayLeftDetected = obstacleRays.frontLeftDetected;
+        telemetry.obstacleRayRightDetected = obstacleRays.frontRightDetected;
+        telemetry.bodyCorridorObstacleHazard = hardware.bodyCorridorObstacleHazard();
+        telemetry.obstacleHazard = hardware.obstacleDetected();
+        telemetry.hudMode = hudMode;
 
         // Camera updates (mouse-look and CAMERA_FREE's own arrow-key
         // pitch/yaw) are suppressed while manual drive mode is active -

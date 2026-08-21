@@ -446,6 +446,14 @@ target_link_libraries(robot_visual PUBLIC
 # condition; it answers a different question than VirtualDistanceSensor's
 # single-point ray (perception) and is never a substitute for
 # RobotCollision's own unconditional final penetration guard.
+# VirtualCliffSensor/TableEdgeSafetyController (Phase 13S) are the
+# raylib-free table-edge safety layer: four downward-looking corner
+# sensors modeling supporting-tabletop presence/absence, and the small
+# stateful V1 recovery policy that converts their readings into emergency
+# wheel speeds via VirtualRobotHardware's new highest-priority Safety
+# override (setSafetyWheelSpeeds()/clearSafetyWheelOverride()) - entirely
+# separate from solid-obstacle collision/avoidance, since a table edge is
+# not a solid obstacle.
 add_library(robot_visual_simulation STATIC
     src/visual/VirtualRobotHardware.cpp
     src/visual/VirtualDistanceSensor.cpp
@@ -454,6 +462,9 @@ add_library(robot_visual_simulation STATIC
     src/visual/ManualDriveInput.cpp
     src/visual/ReactiveObstacleAvoidance.cpp
     src/visual/ForwardClearanceProbe.cpp
+    src/visual/VirtualCliffSensor.cpp
+    src/visual/TableEdgeSafetyController.cpp
+    src/visual/VirtualObstacleSensorArray.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -933,6 +944,56 @@ target_link_libraries(ForwardClearanceProbeTests PRIVATE
 
 gtest_discover_tests(ForwardClearanceProbeTests)
 
+# --- VirtualCliffSensorTests: four-corner table-edge detection geometry
+# (Phase 13S) - corner sensor positions, heading rotation, per-corner
+# isolation, boundary determinism, and multi-sensor detection. Links only
+# robot_visual_simulation - never robot_visual/raylib - genuinely
+# headless, no window is ever created by this target.
+add_executable(VirtualCliffSensorTests
+    tests/visual/VirtualCliffSensorTests.cpp
+)
+
+target_link_libraries(VirtualCliffSensorTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(VirtualCliffSensorTests)
+
+# --- TableEdgeSafetyControllerTests: stateful V1 table-edge emergency-
+# recovery policy (Phase 13S) - Inactive/BackingAway/
+# MovingForwardFromRearEdge/Turning transitions, recovery wheel speeds,
+# and the latch-until-safe lifecycle. Links only robot_visual_simulation -
+# never robot_visual/raylib - genuinely headless, no window is ever
+# created by this target.
+add_executable(TableEdgeSafetyControllerTests
+    tests/visual/TableEdgeSafetyControllerTests.cpp
+)
+
+target_link_libraries(TableEdgeSafetyControllerTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(TableEdgeSafetyControllerTests)
+
+# --- VirtualObstacleSensorArrayTests: body-width-aware three-ray forward
+# obstacle perception (manual-validation bugfix) - per-ray/aggregate
+# detection, heading rotation, disabled/behind-robot handling, and body-
+# dimension reuse. Links only robot_visual_simulation - never
+# robot_visual/raylib - genuinely headless, no window is ever created by
+# this target.
+add_executable(VirtualObstacleSensorArrayTests
+    tests/visual/VirtualObstacleSensorArrayTests.cpp
+)
+
+target_link_libraries(VirtualObstacleSensorArrayTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(VirtualObstacleSensorArrayTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -953,7 +1014,8 @@ if (MSVC)
         SerialRobotTransportTests VirtualWorldTests VirtualRobotHardwareTests
         VirtualDistanceSensorTests DifferentialDriveTests
         RobotCollisionTests ManualDriveInputTests ReactiveObstacleAvoidanceTests
-        ForwardClearanceProbeTests
+        ForwardClearanceProbeTests VirtualCliffSensorTests TableEdgeSafetyControllerTests
+        VirtualObstacleSensorArrayTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

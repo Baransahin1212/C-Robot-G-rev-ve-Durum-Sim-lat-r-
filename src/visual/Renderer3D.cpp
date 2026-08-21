@@ -1,6 +1,7 @@
 #include "robot/visual/Renderer3D.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 
 #include "robot/visual/VisualRobot.hpp"
@@ -25,6 +26,17 @@ constexpr Color kObstacleColor = ORANGE;
 constexpr Color kObstacleOutlineColor = MAROON;
 constexpr Color kBaseColor = Color{80, 140, 220, 255};
 constexpr Color kBaseOutlineColor = DARKBLUE;
+
+// Table surface visualization (Phase 13S): a simple raised rectangular
+// platform, never a vertical wall - the whole point is that the ground
+// plane/grid remains visible beyond its edges, reading as open space
+// (conceptually a drop) rather than a barrier. Top surface sits at
+// kTableTopY, slightly above the ground plane's own Y 0.0, so the two
+// never Z-fight where the table's footprint overlaps the ground.
+constexpr Color kTableColor = Color{180, 140, 90, 255};
+constexpr Color kTableOutlineColor = Color{110, 80, 40, 255};
+constexpr float kTableTopY = 0.02F;
+constexpr float kTableThickness = 0.06F;
 
 // Sensor ray colors (Phase 13O): red once the reading is within
 // VirtualDistanceSensor::kDetectionDistance (obstacleDetected() true), amber
@@ -91,6 +103,19 @@ void Renderer3D::drawScene(const VirtualWorld& world, const VisualTelemetry& tel
     DrawPlane(Vector3{0.0F, 0.0F, 0.0F}, Vector2{kGroundHalfExtent * 2.0F, kGroundHalfExtent * 2.0F}, kGroundColor);
     DrawGrid(kGridSlices, kGridSpacing);
 
+    // Table surface (Phase 13S) - Renderer3D only ever reads
+    // world.tableSurface()'s already-computed rectangle; it never decides
+    // safety behavior itself (that is VirtualCliffSensor/
+    // TableEdgeSafetyController's job, entirely outside this class).
+    const TableSurface& table = world.tableSurface();
+    const float tableCenterX = (table.minX + table.maxX) / 2.0F;
+    const float tableCenterZ = (table.minZ + table.maxZ) / 2.0F;
+    const float tableWidth = table.maxX - table.minX;
+    const float tableDepth = table.maxZ - table.minZ;
+    const Vector3 tableCenter{tableCenterX, kTableTopY - (kTableThickness / 2.0F), tableCenterZ};
+    DrawCube(tableCenter, tableWidth, kTableThickness, tableDepth, kTableColor);
+    DrawCubeWires(tableCenter, tableWidth, kTableThickness, tableDepth, kTableOutlineColor);
+
     for (const BoxObstacle& obstacle : world.obstacles())
     {
         if (!obstacle.enabled)
@@ -109,20 +134,30 @@ void Renderer3D::drawScene(const VirtualWorld& world, const VisualTelemetry& tel
 
     drawVisualRobot(world.robotPose());
 
-    // Sensor ray (Phase 13O): origin/direction/length come straight from
-    // `telemetry`, which main3d fills from the same VirtualDistanceSensor
-    // instance driving obstacleDetected()/obstacleDistance() - never
-    // recomputed here, so the drawn ray always matches the actual sensor
-    // reading exactly.
-    const float rayLength = telemetry.obstacleDistance.value_or(telemetry.sensorMaximumRange);
-    const Vector3 rayStart = toRaylibVector3(telemetry.sensorOrigin);
-    const Vector3 rayEnd = Vector3{telemetry.sensorOrigin.x + (telemetry.sensorDirection.x * rayLength),
-                                    telemetry.sensorOrigin.y + (telemetry.sensorDirection.y * rayLength),
-                                    telemetry.sensorOrigin.z + (telemetry.sensorDirection.z * rayLength)};
-    const Color rayColor = telemetry.obstacleDetected
-                                ? kSensorRayDetectedColor
-                                : (telemetry.obstacleDistance.has_value() ? kSensorRayHitColor : kSensorRayClearColor);
-    DrawLine3D(rayStart, rayEnd, rayColor);
+    // Three perception rays - left/center/right (manual-validation
+    // bugfix; center is unchanged from Phase 13O). Origin/distance/
+    // detected for each come straight from `telemetry`, which main3d
+    // fills from the exact same VirtualObstacleSensorArray/
+    // VirtualDistanceSensor instances driving
+    // VirtualRobotHardware::obstacleDetected() - never recomputed here,
+    // so the drawn rays always match the actual sensor readings exactly.
+    // Renderer3D only ever draws already-computed geometry/state; it
+    // never decides detection itself.
+    const auto drawObstacleRay = [&](const Vec3& origin, const std::optional<float>& distance, bool detected) {
+        const float rayLength = distance.value_or(telemetry.sensorMaximumRange);
+        const Vector3 rayStart = toRaylibVector3(origin);
+        const Vector3 rayEnd = Vector3{origin.x + (telemetry.sensorDirection.x * rayLength), origin.y,
+                                        origin.z + (telemetry.sensorDirection.z * rayLength)};
+        const Color rayColor =
+            detected ? kSensorRayDetectedColor : (distance.has_value() ? kSensorRayHitColor : kSensorRayClearColor);
+        DrawLine3D(rayStart, rayEnd, rayColor);
+    };
+
+    drawObstacleRay(telemetry.obstacleRayLeftOrigin, telemetry.obstacleRayLeftDistance,
+                     telemetry.obstacleRayLeftDetected);
+    drawObstacleRay(telemetry.sensorOrigin, telemetry.obstacleDistance, telemetry.obstacleDetected);
+    drawObstacleRay(telemetry.obstacleRayRightOrigin, telemetry.obstacleRayRightDistance,
+                     telemetry.obstacleRayRightDetected);
 }
 
 void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const
@@ -146,20 +181,46 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     char obstaclesLine[64];
     std::snprintf(obstaclesLine, sizeof(obstaclesLine), "Obstacles: %d", static_cast<int>(world.obstacles().size()));
 
-    char obstacleDistanceLine[64];
-    if (telemetry.obstacleDistance.has_value())
+    // Manual-validation bugfix: one line per perception ray - "CLEAR"
+    // when that ray has not detected (whether or not it merely has a
+    // distant hit), or its distance when it has - plus the width-aware
+    // corridor hazard signal, replacing the old single "Obstacle
+    // distance"/"Obstacle detected" pair (which only ever reflected the
+    // center ray alone).
+    char obstacleLeftLine[64];
+    if (telemetry.obstacleRayLeftDetected)
     {
-        std::snprintf(obstacleDistanceLine, sizeof(obstacleDistanceLine), "Obstacle distance: %.2f",
-                       *telemetry.obstacleDistance);
+        std::snprintf(obstacleLeftLine, sizeof(obstacleLeftLine), "Obstacle L: %.2f", *telemetry.obstacleRayLeftDistance);
     }
     else
     {
-        std::snprintf(obstacleDistanceLine, sizeof(obstacleDistanceLine), "Obstacle distance: No hit");
+        std::snprintf(obstacleLeftLine, sizeof(obstacleLeftLine), "Obstacle L: CLEAR");
     }
 
-    char obstacleDetectedLine[64];
-    std::snprintf(obstacleDetectedLine, sizeof(obstacleDetectedLine), "Obstacle detected: %s",
-                   telemetry.obstacleDetected ? "YES" : "NO");
+    char obstacleCenterLine[64];
+    if (telemetry.obstacleDetected)
+    {
+        std::snprintf(obstacleCenterLine, sizeof(obstacleCenterLine), "Obstacle C: %.2f", *telemetry.obstacleDistance);
+    }
+    else
+    {
+        std::snprintf(obstacleCenterLine, sizeof(obstacleCenterLine), "Obstacle C: CLEAR");
+    }
+
+    char obstacleRightLine[64];
+    if (telemetry.obstacleRayRightDetected)
+    {
+        std::snprintf(obstacleRightLine, sizeof(obstacleRightLine), "Obstacle R: %.2f",
+                       *telemetry.obstacleRayRightDistance);
+    }
+    else
+    {
+        std::snprintf(obstacleRightLine, sizeof(obstacleRightLine), "Obstacle R: CLEAR");
+    }
+
+    char bodyCorridorObstacleLine[64];
+    std::snprintf(bodyCorridorObstacleLine, sizeof(bodyCorridorObstacleLine), "Body corridor: %s",
+                   telemetry.bodyCorridorObstacleHazard ? "BLOCKED" : "CLEAR");
 
     char leftWheelLine[64];
     std::snprintf(leftWheelLine, sizeof(leftWheelLine), "Left wheel:  %.2f", telemetry.leftWheelSpeed);
@@ -186,13 +247,96 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     std::snprintf(clearanceLookaheadLine, sizeof(clearanceLookaheadLine), "Clearance lookahead: %.2f",
                    telemetry.clearanceLookahead);
 
+    char cliffFrontLeftLine[64];
+    std::snprintf(cliffFrontLeftLine, sizeof(cliffFrontLeftLine), "Cliff FL: %s",
+                   telemetry.cliffFrontLeft ? "EDGE" : "SAFE");
+
+    char cliffFrontRightLine[64];
+    std::snprintf(cliffFrontRightLine, sizeof(cliffFrontRightLine), "Cliff FR: %s",
+                   telemetry.cliffFrontRight ? "EDGE" : "SAFE");
+
+    char cliffRearLeftLine[64];
+    std::snprintf(cliffRearLeftLine, sizeof(cliffRearLeftLine), "Cliff RL: %s",
+                   telemetry.cliffRearLeft ? "EDGE" : "SAFE");
+
+    char cliffRearRightLine[64];
+    std::snprintf(cliffRearRightLine, sizeof(cliffRearRightLine), "Cliff RR: %s",
+                   telemetry.cliffRearRight ? "EDGE" : "SAFE");
+
+    char edgeSafetyLine[64];
+    std::snprintf(edgeSafetyLine, sizeof(edgeSafetyLine), "Edge safety: %s",
+                   telemetry.edgeSafetyActive ? "ACTIVE" : "INACTIVE");
+
+    char edgeRecoveryStateLine[96];
+    std::snprintf(edgeRecoveryStateLine, sizeof(edgeRecoveryStateLine), "Edge recovery state: %.*s",
+                   static_cast<int>(telemetry.edgeRecoveryStateText.size()), telemetry.edgeRecoveryStateText.data());
+
+    char edgeTargetHeadingLine[64];
+    std::snprintf(edgeTargetHeadingLine, sizeof(edgeTargetHeadingLine), "Edge target heading: %.1f",
+                   telemetry.edgeTargetHeadingDegrees);
+
+    char edgeHeadingErrorLine[64];
+    std::snprintf(edgeHeadingErrorLine, sizeof(edgeHeadingErrorLine), "Edge heading error: %.1f",
+                   telemetry.edgeHeadingErrorDegrees);
+
     char collisionLine[64];
     std::snprintf(collisionLine, sizeof(collisionLine), "Collision: %s", telemetry.collidedLastUpdate ? "YES" : "NO");
 
+    // --- Compact-mode lines (UX polish) ---
+    //
+    // A small, high-value operational subset - never hides an active
+    // safety condition (section 6 of the brief): Authority reuses
+    // driveAuthorityText verbatim, so it reads "SAFETY" the instant
+    // DriveAuthority::Safety is active, exactly like Full mode does.
+    char compactSafetyLine[32];
+    std::snprintf(compactSafetyLine, sizeof(compactSafetyLine), "Safety: %s",
+                   telemetry.edgeSafetyActive ? "ACTIVE" : "SAFE");
+
+    char compactAvoidanceLine[32];
+    if (!telemetry.avoidanceEnabled)
+    {
+        std::snprintf(compactAvoidanceLine, sizeof(compactAvoidanceLine), "Avoidance: OFF");
+    }
+    else if (telemetry.avoidanceActive)
+    {
+        std::snprintf(compactAvoidanceLine, sizeof(compactAvoidanceLine), "Avoidance: AVOIDING");
+    }
+    else
+    {
+        std::snprintf(compactAvoidanceLine, sizeof(compactAvoidanceLine), "Avoidance: IDLE");
+    }
+
+    char compactObstacleLine[32];
+    std::snprintf(compactObstacleLine, sizeof(compactObstacleLine), "Obstacle: %s",
+                   telemetry.obstacleHazard ? "DETECTED" : "CLEAR");
+
+    // Selects display text from four already-computed booleans - pure
+    // presentation (which line to show), never a cliff/edge-safety
+    // decision of its own (that remains entirely
+    // VirtualCliffSensor/TableEdgeSafetyController's job).
+    const bool anyCliffEdge =
+        telemetry.cliffFrontLeft || telemetry.cliffFrontRight || telemetry.cliffRearLeft || telemetry.cliffRearRight;
+    char compactEdgeLine[32];
+    if (telemetry.edgeSafetyActive)
+    {
+        std::snprintf(compactEdgeLine, sizeof(compactEdgeLine), "Edge: RECOVERING");
+    }
+    else if (anyCliffEdge)
+    {
+        std::snprintf(compactEdgeLine, sizeof(compactEdgeLine), "Edge: EDGE");
+    }
+    else
+    {
+        std::snprintf(compactEdgeLine, sizeof(compactEdgeLine), "Edge: SAFE");
+    }
+
     // A small table of {text, fontSize, color} rather than hand-tracked Y
     // offsets per line - adding/removing a HUD line only ever touches this
-    // array, and panel sizing/text drawing below stay generic.
-    const HudLine lines[] = {
+    // array, and panel sizing/text drawing below stay generic. Which
+    // array is used - and therefore the panel's size - depends entirely
+    // on telemetry.hudMode; this is the only behavioral difference
+    // between Full and Compact.
+    const HudLine fullLines[] = {
         {"Robot Simulator 3D", 20, kHudTitleColor},
         {stateLine, 18, kHudTextColor},
         {commandLine, 18, kHudTextColor},
@@ -204,26 +348,54 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {positionLine, 18, kHudTextColor},
         {headingLine, 18, kHudTextColor},
         {obstaclesLine, 18, kHudTextColor},
-        {obstacleDistanceLine, 18, kHudTextColor},
-        {obstacleDetectedLine, 18, kHudTextColor},
+        {obstacleLeftLine, 18, kHudTextColor},
+        {obstacleCenterLine, 18, kHudTextColor},
+        {obstacleRightLine, 18, kHudTextColor},
+        {bodyCorridorObstacleLine, 18, kHudTextColor},
+        {cliffFrontLeftLine, 18, kHudTextColor},
+        {cliffFrontRightLine, 18, kHudTextColor},
+        {cliffRearLeftLine, 18, kHudTextColor},
+        {cliffRearRightLine, 18, kHudTextColor},
+        {edgeSafetyLine, 18, kHudTextColor},
+        {edgeRecoveryStateLine, 18, kHudTextColor},
+        {edgeTargetHeadingLine, 18, kHudTextColor},
+        {edgeHeadingErrorLine, 18, kHudTextColor},
         {leftWheelLine, 18, kHudTextColor},
         {rightWheelLine, 18, kHudTextColor},
         {collisionLine, 18, kHudTextColor},
         {"TAB: capture/release mouse   F11: fullscreen/windowed   SPACE: pause   O: toggle obstacle   Mouse/WASD: camera",
          16, kHudControlsColor},
         {"M: manual drive mode   Arrows: manual forward/reverse/turn   X: stop manual wheels", 16, kHudControlsColor},
-        {"A: toggle autonomous obstacle avoidance", 16, kHudControlsColor},
+        {"A: toggle autonomous obstacle avoidance      H: Compact HUD", 16, kHudControlsColor},
     };
+
+    const HudLine compactLines[] = {
+        {"Robot Simulator 3D", 20, kHudTitleColor},
+        {stateLine, 18, kHudTextColor},
+        {driveAuthorityLine, 18, kHudTextColor},
+        {compactSafetyLine, 18, kHudTextColor},
+        {compactAvoidanceLine, 18, kHudTextColor},
+        {compactObstacleLine, 18, kHudTextColor},
+        {compactEdgeLine, 18, kHudTextColor},
+        {"H: Expand HUD", 16, kHudControlsColor},
+    };
+
+    const bool compact = telemetry.hudMode == HudMode::Compact;
+    const HudLine* lines = compact ? compactLines : fullLines;
+    const std::size_t lineCount = compact ? (sizeof(compactLines) / sizeof(compactLines[0]))
+                                           : (sizeof(fullLines) / sizeof(fullLines[0]));
 
     // Panel sized to fully contain the widest line so contrast holds
     // regardless of content length - a fixed guessed width could leave a
-    // line's tail spilling back onto the unshaded scene.
+    // line's tail spilling back onto the unshaded scene. Compact mode's
+    // much shorter array naturally yields a much smaller panel here, with
+    // no separate size-mode logic needed.
     int panelWidth = 0;
     int contentHeight = 0;
-    for (const HudLine& line : lines)
+    for (std::size_t i = 0; i < lineCount; ++i)
     {
-        panelWidth = std::max(panelWidth, MeasureText(line.text, line.fontSize));
-        contentHeight += line.fontSize + kHudLineSpacing;
+        panelWidth = std::max(panelWidth, MeasureText(lines[i].text, lines[i].fontSize));
+        contentHeight += lines[i].fontSize + kHudLineSpacing;
     }
     panelWidth += 2 * kHudPadding;
     const int panelHeight = contentHeight + (2 * kHudPadding) - kHudLineSpacing;
@@ -232,10 +404,10 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
 
     const int textX = kHudMarginX + kHudPadding;
     int textY = kHudMarginY + kHudPadding;
-    for (const HudLine& line : lines)
+    for (std::size_t i = 0; i < lineCount; ++i)
     {
-        DrawText(line.text, textX, textY, line.fontSize, line.color);
-        textY += line.fontSize + kHudLineSpacing;
+        DrawText(lines[i].text, textX, textY, lines[i].fontSize, lines[i].color);
+        textY += lines[i].fontSize + kHudLineSpacing;
     }
 
     DrawFPS(10, GetScreenHeight() - 30);

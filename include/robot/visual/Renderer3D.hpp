@@ -10,6 +10,35 @@
 namespace robot::visual
 {
 
+// Presentation-only HUD detail level (UX polish) - toggled by `H` in
+// main3d.cpp, has ZERO effect on RobotStateMachine, RobotController,
+// RobotRuntime, VirtualRobotHardware, obstacle detection, avoidance,
+// table-edge safety, wheel commands, physics, or collision: it only
+// changes which already-computed VisualTelemetry fields Renderer3D
+// chooses to draw. Deliberately lives here (the presentation layer),
+// never in a core robot/domain header.
+enum class HudMode
+{
+    Full,
+    Compact
+};
+
+// Visual-only, raylib-free - mirrors VirtualDriveCommand/DriveAuthority's
+// own toString() shape. Not used by drawHud() itself (which switches on
+// the enum directly), but kept as a small, genuinely headless unit in
+// case a caller/test wants a display string without depending on
+// raylib - see docs/technical-decisions.md (UX polish) for why a two-
+// state UI toggle does not otherwise warrant dedicated unit tests.
+constexpr std::string_view toString(HudMode mode) noexcept
+{
+    switch (mode)
+    {
+        case HudMode::Full: return "Full";
+        case HudMode::Compact: return "Compact";
+    }
+    return "Unknown";
+}
+
 // Plain, raylib-free display/telemetry values passed into renderFrame() -
 // main3d converts the real RobotState/VirtualDriveCommand/
 // VirtualDistanceSensor readings into this struct so Renderer3D never needs
@@ -79,6 +108,77 @@ struct VisualTelemetry
     // the HUD can display it - Renderer3D never computes clearance
     // geometry itself, it only ever displays already-computed telemetry.
     float clearanceLookahead = 0.0F;
+
+    // Phase 13S: this frame's CliffSensorReadings, already computed by
+    // main3d.cpp's VirtualCliffSensor - true = cliff detected (that
+    // corner is off the table), matching CliffSensorReadings' own
+    // documented convention exactly. Renderer3D never computes cliff
+    // geometry itself.
+    bool cliffFrontLeft = false;
+    bool cliffFrontRight = false;
+    bool cliffRearLeft = false;
+    bool cliffRearRight = false;
+
+    // Phase 13S: whether TableEdgeSafetyController's recovery latch is
+    // currently engaged this frame (main3d.cpp's tableEdgeSafety.active()) -
+    // the same active()-vs-driveAuthorityText relationship
+    // avoidanceActive already has with ReactiveObstacleAvoidance.
+    bool edgeSafetyActive = false;
+
+    // Phase 13S: already-formatted TableEdgeSafetyController::state()
+    // text (TableEdgeSafetyController.hpp's toString()) - "Inactive"/
+    // "BackingAway"/"MovingForwardFromRearEdge"/"Turning". Renderer3D
+    // never has any notion of the recovery state machine itself.
+    std::string_view edgeRecoveryStateText;
+
+    // Phase 13S bugfix: TableEdgeSafetyController's current recovery
+    // target heading (degrees, this project's 0 = +Z / 90 = +X
+    // convention) and the live signed error from the robot's current
+    // heading to it - already computed by
+    // TableEdgeSafetyController::targetRecoveryHeadingDegrees()/
+    // currentHeadingErrorDegrees(). Only meaningful while
+    // edgeSafetyActive is true; Renderer3D displays them unconditionally
+    // regardless (matching every other HUD line's always-shown style),
+    // never computing the heading math itself.
+    float edgeTargetHeadingDegrees = 0.0F;
+    float edgeHeadingErrorDegrees = 0.0F;
+
+    // Manual-validation bugfix: left/right perception-ray telemetry -
+    // the CENTER ray reuses sensorOrigin/sensorDirection/obstacleDistance/
+    // obstacleDetected above (geometrically identical to
+    // VirtualObstacleSensorArray's FrontCenter ray - never recomputed
+    // twice). All three rays share sensorDirection (they are parallel,
+    // only their origins differ). Renderer3D never computes this
+    // geometry itself.
+    Vec3 obstacleRayLeftOrigin;
+    Vec3 obstacleRayRightOrigin;
+    std::optional<float> obstacleRayLeftDistance;
+    std::optional<float> obstacleRayRightDistance;
+    bool obstacleRayLeftDetected = false;
+    bool obstacleRayRightDetected = false;
+
+    // Manual-validation bugfix: VirtualRobotHardware::bodyCorridorObstacleHazard()
+    // - the width-aware corridor hazard signal that, ORed with the three
+    // rays above, is what obstacleDetected() itself is actually built
+    // from. Distinct from forwardClearanceClear above (Phase 13R's
+    // avoidance-release corridor, a different, longer lookahead) - see
+    // docs/technical-decisions.md (manual-validation bugfix) for why the
+    // two must not be conflated.
+    bool bodyCorridorObstacleHazard = false;
+
+    // UX polish: VirtualRobotHardware::obstacleDetected()'s own aggregate
+    // result (range rays OR body corridor - the exact same value that
+    // actually drives HardwareEventSource/the FSM), supplied directly
+    // rather than re-derived here so Renderer3D never needs to OR
+    // together obstacleDetected/obstacleRayLeftDetected/
+    // obstacleRayRightDetected/bodyCorridorObstacleHazard itself - it
+    // only ever selects which already-computed fields to display.
+    bool obstacleHazard = false;
+
+    // UX polish: which HUD detail level to draw - Full (default,
+    // unchanged existing telemetry) or Compact (a small, high-value
+    // operational subset). Presentation-only; see HudMode's own docs.
+    HudMode hudMode = HudMode::Full;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,

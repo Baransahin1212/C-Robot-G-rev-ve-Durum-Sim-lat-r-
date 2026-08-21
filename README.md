@@ -358,10 +358,12 @@ hard-coded demo world: a ground plane and grid, a two-wheel robot model
 base/docking platform, viewed through a perspective camera you can orbit
 with the mouse (`TAB` toggles mouse capture, drag to rotate, scroll to
 zoom - raylib's built-in `CAMERA_FREE` mode) and an on-screen HUD showing
-the robot's live FSM state/command, (Phase 13Q) drive authority
-(`FSM`/`AUTONOMOUS`/`MANUAL`) and whether reactive avoidance is enabled,
-(Phase 13R) whether the avoidance latch is currently active and whether
-the forward BODY-clearance corridor is clear or blocked, position,
+the robot's live FSM state/command, (Phase 13Q/13S) drive authority
+(`FSM`/`AUTONOMOUS`/`MANUAL`/`SAFETY`) and whether reactive avoidance is
+enabled, (Phase 13R) whether the avoidance latch is currently active and
+whether the forward BODY-clearance corridor is clear or blocked, (Phase
+13S) each of the four cliff sensors' SAFE/EDGE reading plus whether
+table-edge safety is currently active and its recovery state, position,
 heading, obstacle count, (Phase 13O) the forward distance sensor's live
 reading, (Phase 13P) the current left/right wheel speeds and whether the
 last movement was rejected by the obstacle-collision guard (`Collision:
@@ -373,7 +375,14 @@ see below); while it is on, arrow keys drive the wheels directly
 (`UP`/`DOWN` forward/reverse, `LEFT`/`RIGHT` turn) and holding `X` stops
 them immediately and takes priority over every other key, for as long as
 it is held. `A` toggles reactive obstacle avoidance (Phase 13Q, ON by
-default). Close the window normally to exit.
+default). `H` toggles the HUD between **Full** (the detailed engineering
+telemetry described above, the default) and **Compact** (a genuinely
+smaller panel showing only high-value operational/safety state: `State`,
+`Authority`, `Safety`, `Avoidance`, `Obstacle`, `Edge` - never hiding an
+active `SAFETY` authority, an obstacle hazard, or edge recovery). This is
+a presentation-only toggle - it has no effect on robot behavior in either
+mode; see `docs/technical-decisions.md` (UX polish) for the full Compact-
+mode field list and why. Close the window normally to exit.
 
 **As of Phase 13N, the on-screen robot is actually driven by the real,
 unmodified robot-control stack** - the same `RobotStateMachine`/
@@ -665,9 +674,142 @@ ON/OFF` enable toggle above it) and `Forward clearance: CLEAR/BLOCKED`
 lookahead` showing the constant in use. See `docs/technical-decisions.md`
 (Phase 13R) for the full geometry derivation and latch semantics.
 
+**As of Phase 13S, the physical robot is modeled as sitting on a finite
+tabletop, not an unbounded plane - the old ~10x10 "invisible wall" that
+simply clamped the robot in place at the world bound is gone.** Outside
+`VirtualWorld::tableSurface()`'s rectangle is not a solid wall - it
+represents a drop off the edge of the table, so it is deliberately never
+represented as a `RobotCollision` obstacle AABB. Four new pieces work
+together:
+
+```text
+VirtualDistanceSensor          -> solid-obstacle perception (unchanged)
+ForwardClearanceProbe          -> safe obstacle-avoidance corridor (unchanged)
+RobotCollision                 -> solid-obstacle penetration guard (unchanged)
+VirtualCliffSensor             -> supporting-surface / table-edge detection (new)
+TableEdgeSafetyController      -> emergency edge-recovery policy (new)
+```
+
+`VirtualCliffSensor` (`include/robot/visual/VirtualCliffSensor.hpp`,
+raylib-free, headless) models four downward-looking corner sensors -
+`FrontLeft`/`FrontRight`/`RearLeft`/`RearRight` - placed exactly at the
+robot's rectangular footprint corners (`RobotDimensions::kBodyWidth`/
+`kBodyLength`, the same source of truth every other geometry component
+uses), rotated with `pose.headingDegrees` via a new `rightDirection()`
+helper alongside the existing `forwardDirection()` (`VisualMath.hpp`).
+Each reports `true` ("cliff detected," documented explicitly given how
+dangerous an inverted convention would be here) when its corner's X/Z
+position falls outside the table rectangle. `TableEdgeSafetyController`
+(raylib-free, stateful) converts those readings into emergency wheel
+speeds through a small V1 recovery state machine - these are internal
+recovery states, entirely separate from `RobotStateMachine`:
+
+```text
+Inactive -> BackingAway (front cliff)              -> Turning -> AdvancingInward -> Inactive
+Inactive -> MovingForwardFromRearEdge (rear cliff)  -> Turning -> AdvancingInward -> Inactive
+```
+
+Two separate conditions gate release, never collapsed into one boolean:
+**heading alignment** (is the robot pointed toward the table center?) and
+**support margin** (is the WHOLE footprint robustly - not just barely -
+back on the table?). Human manual validation of the first version of this
+phase found "all sensors safe" alone was not sufficient - on a straight
+edge, a single simulation step's rotation was frequently enough to
+satisfy it, releasing safety with an almost-unchanged, still-edge-facing
+heading (a visible back-and-forth ping-pong at the edge). That was fixed
+by adding the heading-alignment requirement
+(`|shortestSignedHeadingErrorDegrees(pose.headingDegrees, target)| <=
+10.0F`) - but a **second** manual-validation finding then showed heading
+alignment alone is not sufficient either: a robot can reach its target
+heading while one corner (typically a rear one, since rotating never
+translates the center) is still off the table, and `Turning`'s only
+action is an in-place turn - which cannot fix a purely positional
+problem, so the robot could spin in place indefinitely with the heading
+already correct. The fix: a new `AdvancingInward` state drives straight
+forward (the one thing pure rotation cannot do) whenever heading is
+already safe but `areAllCornersSafelyInsideTable()` (all four corners
+inside the table by a `kRecoverySupportMargin` of `0.15F`, stricter than
+the actual physical edge) is not yet satisfied - re-entering `Turning` if
+heading drifts outside tolerance while advancing. Both fixes are
+geometric completion conditions, not timers, so they are correct by
+construction for every approach angle and every edge with no per-scenario
+tuning. See `docs/technical-decisions.md` (table-edge recovery bugfixes)
+for the full root-cause analyses and fixes. Authority is extended to a
+fourth, now HIGHEST-priority level:
+
+```text
+Safety  >  Manual  >  AutonomousAvoidance  >  Fsm
+```
+
+**Safety overrides even manual driving** - `VirtualRobotHardware` gained
+`setSafetyWheelSpeeds()`/`clearSafetyWheelOverride()`/
+`safetyOverrideActive()`, the same override shape as the manual/
+autonomous overrides but ranked above all of them. Holding `UP` in manual
+mode right up to the table edge is safely overridden the instant a cliff
+sensor trips; the manual request is never lost - it resumes automatically
+once the recovery completes, exactly like avoidance resuming after a
+manual override ends. `RobotState` can legitimately still read `Moving`
+the entire time (`RobotStateMachine`/`RobotController`/`HardwareEventSource`/
+`CompositePollingEventSource` are completely unmodified by this phase) -
+this is the same command-vs-effective-actuator distinction Phase 13Q/13R
+already established for `DriveAuthority`. A final table-support fail-safe
+guard inside `VirtualRobotHardware::update()` backstops an unusually large
+frame time tunneling past the edge before the recovery controller gets a
+chance to react - but it only rejects a proposed position when **all
+four** corners are off the table (a genuine full-footprint fall), not
+merely one overhanging corner, since a partial overhang is the normal,
+expected state while the recovery controller is actively backing away.
+The HUD gained `Cliff FL/FR/RL/RR: SAFE/EDGE`, `Edge safety: ACTIVE/
+INACTIVE`, and `Edge recovery state: ...`; `Drive authority` now also
+shows `SAFETY`. `Renderer3D` draws the table as a simple raised
+rectangular platform - never a vertical wall - so the ground/grid remains
+visible beyond its edges as open space. See `docs/technical-decisions.md`
+(Phase 13S) for the full state-machine transition table, the exact
+corner-sensor geometry, and the known limitation around a simultaneous
+front-and-rear-edge corner case.
+
+**Manual validation also found a second, independent defect: obstacle
+perception was body-width-blind.** `VirtualRobotHardware::obstacleDetected()`
+- the one signal `HardwareEventSource` polls to produce `ObstacleDetected`/
+`ObstacleCleared` - was backed by exactly one thing: `VirtualDistanceSensor`'s
+single center-line ray. A solid obstacle offset enough to miss that one
+ray, but still within the robot's actual body-width forward path, was
+invisible to perception - the robot would keep receiving `MoveForward`
+until `RobotCollision` (a last-resort pose guard, never meant to be the
+primary obstacle signal) finally rejected a pose at the last moment. The
+fix widens perception in two complementary ways: `VirtualObstacleSensorArray`
+(new, raylib-free) casts three parallel rays - `FrontLeft`/`FrontCenter`/
+`FrontRight`, offset by `(RobotDimensions::kBodyWidth / 2) - kLateralInset`
+either side of center (`FrontCenter` geometrically identical to the
+existing single ray) - and a new `ForwardClearanceProbe::isForwardCorridorClearWithinDistance()`
+overload lets `VirtualRobotHardware` reuse the SAME swept-body corridor
+`ReactiveObstacleAvoidance` already uses for its release condition, as a
+secondary hazard signal closing the gaps three discrete rays still leave,
+with its own independently-derived, deliberately SHORTER lookahead
+(`kBodyCorridorHazardLookahead`, 0.82F) so a centered obstacle still
+triggers at exactly the pre-existing distance - reusing avoidance's own
+1.4F lookahead for detection too would have changed existing centered-
+obstacle detection distances and risked event oscillation (see
+`docs/technical-decisions.md`, manual-validation bugfix, for the full
+derivation and the worked regression-test example that first caught
+this). `HardwareEventSource` is completely unmodified - it still observes
+only the one aggregate `obstacleDetected()` edge, exactly as before. Three
+responsibilities remain distinct: range rays (perception/distance
+telemetry), the body corridor (swept-body forward safety, now also a
+detection-hazard input, not only an avoidance-release one), and
+`RobotCollision` (the unconditional final penetration guard, which should
+never be the FIRST signal that an obstacle exists - the whole point of
+this fix). The HUD replaced its old single `Obstacle distance`/`Obstacle
+detected` pair with `Obstacle L/C/R: CLEAR` or a detected distance, plus
+`Body corridor: CLEAR/BLOCKED`; `Renderer3D` now draws all three
+perception rays.
+
 **Still deliberately simple - not full robotics simulation.** The robot's
-position is only clamped to the demo world's ~10x10 bounds so it cannot
-drift away indefinitely (`DifferentialDrive` itself is world-bounds- and
+position is clamped to a generic ~10x10 simulation-coordinate bound (a
+purely defensive numeric safety net, never expected to be reached in
+practice now that the table-edge safety system keeps the robot on the
+much smaller ~12x12 table well before that) so it cannot drift away
+indefinitely (`DifferentialDrive` itself is world-bounds- and
 obstacle-agnostic - both clamping and collision-checking stay in
 `VirtualRobotHardware`); wheel speeds change instantly with no
 acceleration/inertia/friction model; and `ReturnToBase` is accepted as a
@@ -859,7 +1001,7 @@ Matches [`CMakeLists.txt`](CMakeLists.txt) exactly:
 | `RobotSimulator` | The executable — `src/main.cpp` is a ~10-line composition root that calls into `robot_app`. |
 | `robot_visual_world` | `VirtualWorld`/`RobotPose`/`BoxObstacle`/`BasePlatform` (Phase 13M) - plain demo-scene data using this project's own `Vec3`, deliberately raylib-free. `VirtualWorld::setRobotPosition()`/`setRobotHeading()` (Phase 13N) and `setObstaclePosition()`/`setObstacleEnabled()` (Phase 13O) are its only mutation entry points. Depends only on `robot_domain` for the include directory. |
 | `robot_visual` | `VisualRobot`/`Renderer3D` (Phase 13M), the raylib-based 3D drawing layer. Depends on `robot_visual_world` and `raylib`. This is the **only** point where this project depends on raylib - the dependency points inward, never the other way, and no robot-core/domain/hardware target links it. `Renderer3D` receives a plain `VisualTelemetry` struct (state/command text plus sensor readings, Phase 13N/13O) rather than depending on any FSM/hardware/sensor type. |
-| `robot_visual_simulation` | `VirtualRobotHardware` (Phase 13N) - the `IRobotHardware` implementation that is the visual simulator's FSM-driven actuator/sensor boundary, translating `RobotController` commands into wheel speeds and, once per frame, `VirtualWorld` pose changes via `update()` - plus `VirtualDistanceSensor` (Phase 13O), the raylib-free geometry-based forward distance sensor `obstacleDetected()`/`obstacleDistance()` are backed by, and `DifferentialDrive`/`RobotCollision`/`ManualDriveInput` (Phase 13P) - the raylib-free differential-drive kinematic model `VirtualRobotHardware::update()` delegates movement to, the raylib-free circle-vs-AABB obstacle collision query that same `update()` validates a proposed pose against before committing it, and the pure X/UP/DOWN/LEFT/RIGHT wheel-speed decision function behind `RobotSimulator3D`'s manual drive mode (only caller: `main3d.cpp`), respectively, and `ReactiveObstacleAvoidance` (Phase 13Q; a stateful latch as of Phase 13R) - the raylib-free "what wheel speeds does an avoidance turn use, and is the turn still active" policy behind `RobotSimulator3D`'s reactive obstacle avoidance, with `VirtualRobotHardware::driveAuthority()`/`setAutonomousWheelSpeeds()`/`clearAutonomousWheelOverride()` implementing its fixed Manual > AutonomousAvoidance > Fsm priority, plus `ForwardClearanceProbe` (Phase 13R) - the raylib-free swept-body forward-corridor clearance query (expanded-AABB-vs-segment, reusing `RobotCollision`'s own collision radius) that drives the avoidance latch's release condition, distinct from `VirtualDistanceSensor`'s single-point-ray perception and never a substitute for `RobotCollision`'s own unconditional final penetration guard. Depends on `robot_visual_world`, `robot_hardware`, `robot_controller`, `robot_runtime`, and `robot_domain` - the same real FSM/controller/runtime stack the CLI uses. Deliberately has no raylib dependency, and is a sibling of `robot_visual` (neither depends on the other) under `RobotSimulator3D`. |
+| `robot_visual_simulation` | `VirtualRobotHardware` (Phase 13N) - the `IRobotHardware` implementation that is the visual simulator's FSM-driven actuator/sensor boundary, translating `RobotController` commands into wheel speeds and, once per frame, `VirtualWorld` pose changes via `update()` - plus `VirtualDistanceSensor` (Phase 13O), the raylib-free geometry-based forward distance sensor `obstacleDetected()`/`obstacleDistance()` are backed by, and `DifferentialDrive`/`RobotCollision`/`ManualDriveInput` (Phase 13P) - the raylib-free differential-drive kinematic model `VirtualRobotHardware::update()` delegates movement to, the raylib-free circle-vs-AABB obstacle collision query that same `update()` validates a proposed pose against before committing it, and the pure X/UP/DOWN/LEFT/RIGHT wheel-speed decision function behind `RobotSimulator3D`'s manual drive mode (only caller: `main3d.cpp`), respectively, and `ReactiveObstacleAvoidance` (Phase 13Q; a stateful latch as of Phase 13R) - the raylib-free "what wheel speeds does an avoidance turn use, and is the turn still active" policy behind `RobotSimulator3D`'s reactive obstacle avoidance, with `VirtualRobotHardware::driveAuthority()`/`setAutonomousWheelSpeeds()`/`clearAutonomousWheelOverride()` implementing its fixed Manual > AutonomousAvoidance > Fsm priority, plus `ForwardClearanceProbe` (Phase 13R) - the raylib-free swept-body forward-corridor clearance query (expanded-AABB-vs-segment, reusing `RobotCollision`'s own collision radius) that drives the avoidance latch's release condition, distinct from `VirtualDistanceSensor`'s single-point-ray perception and never a substitute for `RobotCollision`'s own unconditional final penetration guard, plus `VirtualCliffSensor`/`TableEdgeSafetyController` (Phase 13S) - the raylib-free four-corner table-edge detection sensor and the small stateful V1 emergency-recovery policy (`Inactive`/`BackingAway`/`MovingForwardFromRearEdge`/`Turning`) built on it, with `VirtualRobotHardware::driveAuthority()`/`setSafetyWheelSpeeds()`/`clearSafetyWheelOverride()` now implementing the full Safety > Manual > AutonomousAvoidance > Fsm priority (Safety highest), plus a table-support fail-safe guard inside `VirtualRobotHardware::update()` distinct from `RobotCollision`'s solid-obstacle guard - a table edge is never modeled as a solid obstacle, plus `VirtualObstacleSensorArray` (manual-validation bugfix) - the raylib-free three-ray (`FrontLeft`/`FrontCenter`/`FrontRight`) body-width-aware forward obstacle-perception array `VirtualRobotHardware::obstacleDetected()` now ORs together with a second, independently-derived-lookahead `ForwardClearanceProbe` query (`isForwardCorridorClearWithinDistance()`), closing the single-center-ray blind spot a laterally-offset obstacle could otherwise slip through undetected until `RobotCollision` caught it at the last moment. Depends on `robot_visual_world`, `robot_hardware`, `robot_controller`, `robot_runtime`, and `robot_domain` - the same real FSM/controller/runtime stack the CLI uses. Deliberately has no raylib dependency, and is a sibling of `robot_visual` (neither depends on the other) under `RobotSimulator3D`. |
 | `RobotSimulator3D` | The interactive 3D visual simulator executable. Depends on `robot_visual` (rendering), `robot_visual_simulation` (FSM-driven movement/sensing), and (Phase 13O) `robot_hardware_events`/`robot_polling_composite` directly, since `main3d.cpp` constructs a real `HardwareEventSource`/`CompositePollingEventSource` - never links `robot_app`, and `RobotSimulator` never links any of these or raylib. `main3d.cpp` constructs the real `RobotStateMachine`/`RobotController`/`RobotRuntime` plus a tiny visual-only `DemoCommandSource` to reach `Moving` through real FSM transitions, and (Phase 13O) the real `HardwareEventSource` to reach `WaitingForObstacleClear`/back to `Moving` through the same real transition rules. |
 
 Dependencies flow one way only: `RobotStateMachine` never depends on
