@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cmath>
+#include <optional>
 
 #include <gtest/gtest.h>
 
@@ -36,6 +38,7 @@ using robot::RobotState;
 using robot::RobotStateMachine;
 using robot::RuntimeStepResult;
 using robot::TransitionResult;
+using robot::visual::AvoidanceState;
 using robot::visual::BasePlatform;
 using robot::visual::DemoCommandSource;
 using robot::visual::DriveAuthority;
@@ -45,6 +48,7 @@ using robot::visual::HomeArrivalEventSource;
 using robot::visual::HomeNavigationOutput;
 using robot::visual::HomeNavigationState;
 using robot::visual::HomeNavigator;
+using robot::visual::ObstacleHazardSample;
 using robot::visual::ReactiveObstacleAvoidance;
 using robot::visual::ReturnHomeRequestSource;
 using robot::visual::robotPositionCollidesWithObstacles;
@@ -54,6 +58,7 @@ using robot::visual::TableSurface;
 using robot::visual::VirtualCliffSensor;
 using robot::visual::Vec3;
 using robot::visual::VirtualDriveCommand;
+using robot::visual::VirtualObstacleSensorArray;
 using robot::visual::VirtualRobotHardware;
 using robot::visual::VirtualWorld;
 using robot::visual::WheelSpeeds;
@@ -1199,7 +1204,10 @@ TEST(VirtualRobotHardwareTest, ManualPriorityIntegrationAcrossAvoidanceAndFsm)
     VirtualRobotHardware hardware(world);
     hardware.stop();
     ReactiveObstacleAvoidance avoidance;
-    const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+    avoidance.update(/*enabled=*/true, /*triggerAvoidance=*/true, /*forwardCorridorClear=*/false, world.robotPose(),
+                      {});
+    ASSERT_TRUE(avoidance.active());
+    const WheelSpeeds turnSpeeds = avoidance.wheelSpeeds();
     hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
     ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
 
@@ -1353,7 +1361,7 @@ TEST(VirtualRobotHardwareTest, ClearanceAwareAvoidanceClosedLoopThroughRealEvent
         const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
         const bool triggerAvoidance =
             currentState == RobotState::WaitingForObstacleClear && hardware.obstacleDetected();
-        avoidance.update(/*enabled=*/true, triggerAvoidance, forwardCorridorClear);
+        avoidance.update(/*enabled=*/true, triggerAvoidance, forwardCorridorClear, world.robotPose(), {});
         if (avoidance.active())
         {
             everActivated = true;
@@ -1361,7 +1369,7 @@ TEST(VirtualRobotHardwareTest, ClearanceAwareAvoidanceClosedLoopThroughRealEvent
 
         if (avoidance.active())
         {
-            const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+            const WheelSpeeds turnSpeeds = avoidance.wheelSpeeds();
             hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
         }
         else if (hardware.autonomousOverrideActive())
@@ -1424,43 +1432,64 @@ TEST(VirtualRobotHardwareTest, ClearanceAwareAvoidanceClosedLoopThroughRealEvent
 // ---
 TEST(VirtualRobotHardwareTest, ManualPriorityWhileAvoidanceLatched)
 {
-    // Arrange: latch active, clearance still blocked - equivalent to a
-    // mid-turn snapshot of the closed-loop test above, constructed
-    // directly against the latch/hardware APIs rather than driving the
-    // full FSM chain again.
+    // Arrange: latch active (TurnAway), clearance still blocked -
+    // equivalent to a mid-turn snapshot of the closed-loop test above,
+    // constructed directly against the state machine/hardware APIs rather
+    // than driving the full FSM chain again.
     VirtualWorld world;
     VirtualRobotHardware hardware(world);
     ReactiveObstacleAvoidance avoidance;
-    avoidance.update(/*enabled=*/true, /*triggerAvoidance=*/true, /*forwardCorridorClear=*/false);
+    avoidance.update(/*enabled=*/true, /*triggerAvoidance=*/true, /*forwardCorridorClear=*/false, world.robotPose(),
+                      {});
     ASSERT_TRUE(avoidance.active());
-    const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+    ASSERT_EQ(avoidance.state(), AvoidanceState::TurnAway);
+    const WheelSpeeds turnSpeeds = avoidance.wheelSpeeds();
     hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
     ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
 
     // Act: engage manual override mid-turn (main3d.cpp's `M` key).
     hardware.setManualWheelSpeeds(1.0F, -1.0F);
 
-    // Assert: manual physically wins; the latch remains logically active
-    // underneath (main3d.cpp keeps calling avoidance.update() every frame
-    // regardless of manual mode - simulated here directly).
+    // Assert: manual physically wins; the incident remains logically
+    // active underneath (main3d.cpp keeps calling avoidance.update() every
+    // frame regardless of manual mode - simulated here directly).
     ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
-    avoidance.update(true, /*triggerAvoidance=*/false, /*forwardCorridorClear=*/false);
+    avoidance.update(true, /*triggerAvoidance=*/false, /*forwardCorridorClear=*/false, world.robotPose(), {});
     EXPECT_TRUE(avoidance.active());
 
     // Act: leave manual mode while clearance is still blocked.
     hardware.clearManualWheelOverride();
     if (avoidance.active())
     {
-        const WheelSpeeds resumedTurnSpeeds = avoidance.avoidanceWheelSpeeds();
+        const WheelSpeeds resumedTurnSpeeds = avoidance.wheelSpeeds();
         hardware.setAutonomousWheelSpeeds(resumedTurnSpeeds.left, resumedTurnSpeeds.right);
     }
 
-    // Assert: authority returns to AUTONOMOUS, not FSM, since the latch
+    // Assert: authority returns to AUTONOMOUS, not FSM, since the incident
     // is still active.
     EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
 
-    // Act: clearance becomes safe while manual is no longer active.
-    avoidance.update(true, false, /*forwardCorridorClear=*/true);
+    // Act: clearance becomes safe while manual is no longer active. Phase
+    // 13V human-validation fix: this no longer releases immediately - it
+    // moves TurnAway -> AdvanceClear (still active()), the direct fix for
+    // the human-observed oscillation ("corridor clear" is not "physically
+    // bypassed" - see ReactiveObstacleAvoidance's own class docs).
+    avoidance.update(true, false, /*forwardCorridorClear=*/true, world.robotPose(), {});
+    EXPECT_TRUE(avoidance.active());
+    EXPECT_EQ(avoidance.state(), AvoidanceState::AdvanceClear);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    // Act: the robot physically advances (AdvanceClear's own straight-
+    // ahead wheel speeds) far enough to satisfy the minimum bypass
+    // distance, corridor still clear - only now does the incident
+    // actually release.
+    const Vec3 advancedPosition{world.robotPose().position.x,
+                                 world.robotPose().position.y,
+                                 world.robotPose().position.z +
+                                     ReactiveObstacleAvoidance::kMinimumBypassDistanceWorldUnits + 0.5F};
+    robot::visual::RobotPose advancedPose = world.robotPose();
+    advancedPose.position = advancedPosition;
+    avoidance.update(true, false, /*forwardCorridorClear=*/true, advancedPose, {});
     EXPECT_FALSE(avoidance.active());
     if (!avoidance.active() && hardware.autonomousOverrideActive())
     {
@@ -2308,9 +2337,10 @@ TEST(VirtualRobotHardwareTest, AvoidanceEdgeSafetyOverridesAutonomousAndAutonomo
     // condition) - so it stays a real, active AUTONOMOUS request for the
     // whole test, exercising the "if avoidance still active, control
     // returns AUTONOMOUS" branch of section 23.
-    avoidance.update(/*enabled=*/true, /*triggerAvoidance=*/true, /*forwardCorridorClear=*/false);
+    avoidance.update(/*enabled=*/true, /*triggerAvoidance=*/true, /*forwardCorridorClear=*/false, world.robotPose(),
+                      {});
     ASSERT_TRUE(avoidance.active());
-    const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+    const WheelSpeeds turnSpeeds = avoidance.wheelSpeeds();
     hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
     ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
 
@@ -2335,10 +2365,10 @@ TEST(VirtualRobotHardwareTest, AvoidanceEdgeSafetyOverridesAutonomousAndAutonomo
         // Avoidance keeps wanting the wheels throughout (still active(),
         // by construction) - kept in sync every frame exactly like
         // main3d.cpp does, regardless of who currently has authority.
-        avoidance.update(true, true, false);
+        avoidance.update(true, true, false, world.robotPose(), {});
         if (avoidance.active())
         {
-            const WheelSpeeds speeds = avoidance.avoidanceWheelSpeeds();
+            const WheelSpeeds speeds = avoidance.wheelSpeeds();
             hardware.setAutonomousWheelSpeeds(speeds.left, speeds.right);
         }
         else if (hardware.autonomousOverrideActive())
@@ -2498,11 +2528,11 @@ TEST(VirtualRobotHardwareTest, FullClosedLoopOffsetObstacleAvoidanceThroughRealE
         const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
         const bool triggerAvoidance =
             currentState == RobotState::WaitingForObstacleClear && hardware.obstacleDetected();
-        avoidance.update(true, triggerAvoidance, forwardCorridorClear);
+        avoidance.update(true, triggerAvoidance, forwardCorridorClear, world.robotPose(), {});
         if (avoidance.active())
         {
             everAvoidanceActive = true;
-            const WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+            const WheelSpeeds turnSpeeds = avoidance.wheelSpeeds();
             hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
         }
         else if (hardware.autonomousOverrideActive())
@@ -2747,6 +2777,287 @@ TEST(VirtualRobotHardwareTest, ObstacleDuringReturnHomeInterruptsThenResumesNavi
     ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
     EXPECT_EQ(stateMachine.returnHomeReason(), ReturnHomeReason::None);
     EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+}
+
+// --- Human-validation-blocker regression test (Phase 13V oscillation fix)
+// ---
+//
+// Reproduces the exact human-GUI-observed bug this fix exists for: with
+// Return Home requested, an obstacle sitting on (or very near) the direct
+// line from the robot's current position to base made the robot oscillate
+// in place - turning, "releasing" avoidance the instant the forward
+// corridor read clear along its CURRENT heading, HomeNavigator immediately
+// re-aiming back toward base (it recomputes its target fresh every frame
+// from the current pose - see HomeNavigator.hpp), re-triggering avoidance,
+// forever, with zero net translation. Deliberately NOT the older Phase
+// 13T/13U pattern (ObstacleDuringReturnHomeInterruptsThenResumesNavigation
+// above): that test toggles its obstacle OFF via
+// world.setObstacleEnabled(...) rather than ever proving the robot
+// actually steers itself around a real, permanently-enabled obstacle - the
+// task this regression test exists to prove is precisely that a real
+// bypass now happens. The obstacle here stays enabled for the ENTIRE test.
+//
+// Drives the full real production stack end to end - VirtualWorld ->
+// VirtualRobotHardware -> [DemoCommandSource + ReturnHomeRequestSource] /
+// [HardwareEventSource + HomeArrivalEventSource], nested via
+// CompositePollingEventSource exactly like main3d.cpp -> RobotRuntime ->
+// RobotStateMachine -> RobotController, plus ReactiveObstacleAvoidance,
+// ForwardClearanceProbe, VirtualObstacleSensorArray, HomeNavigator, and
+// TableEdgeSafetyController/VirtualCliffSensor (kept in the loop, exactly
+// like main3d.cpp, even though this geometry never triggers them) - never
+// setting DriveAuthority directly, never injecting
+// ObstacleDetected/ObstacleCleared/HomeReached directly, never
+// teleporting the robot.
+TEST(VirtualRobotHardwareTest, ReturnHomeBypassesObstacleOnDirectPathWithoutOscillating)
+{
+    // Arrange: robot starts well away from base, on the SAME X as base, an
+    // obstacle sits squarely on the direct (straight +Z) line between
+    // them, and stays enabled for the whole test - exactly the human-
+    // reported geometry ("robot near obstacle, base visible beyond it").
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
+    world.setRobotHeading(0.0F);
+    world.setObstaclePosition(0, Vec3{4.0F, 0.4F, 1.5F}); // 0.8 cube, squarely between robot and base
+    world.setObstacleEnabled(0, true);
+    const BasePlatform& base = world.basePlatform(); // (4.0, ., 4.0) - see VirtualWorld.cpp
+
+    VirtualRobotHardware hardware(world);
+    HardwareEventSource hardwareEventSource(hardware);
+    DemoCommandSource commandSource;
+    ReturnHomeRequestSource returnHomeRequestSource;
+    HomeNavigator homeNavigator;
+    HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
+    CompositePollingEventSource innerCommandSource(commandSource, returnHomeRequestSource);
+    CompositePollingEventSource innerHardwareSource(hardwareEventSource, homeArrivalEventSource);
+    CompositePollingEventSource compositeSource(innerCommandSource, innerHardwareSource);
+    RobotStateMachine stateMachine;
+    RobotController controller(hardware);
+    RobotRuntime runtime(compositeSource, stateMachine, controller);
+    ReactiveObstacleAvoidance avoidance;
+    ForwardClearanceProbe clearanceProbe(world);
+    VirtualObstacleSensorArray obstacleSensorArray(world);
+    VirtualCliffSensor cliffSensor(world);
+    TableEdgeSafetyController tableEdgeSafety;
+
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Idle -> Ready
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Ready -> Moving
+    returnHomeRequestSource.requestReturnHome();
+    ASSERT_EQ(runtime.step(), RuntimeStepResult::TransitionAccepted); // Moving -> ReturningHome
+    ASSERT_EQ(hardware.currentCommand(), VirtualDriveCommand::ReturnToBase);
+
+    const float distanceAtStart = [&] {
+        const float dx = base.position.x - world.robotPose().position.x;
+        const float dz = base.position.z - world.robotPose().position.z;
+        return std::sqrt((dx * dx) + (dz * dz));
+    }();
+
+    // Anti-oscillation tracking state (see this test's own docs above for
+    // what each assertion below proves).
+    bool everAvoidanceActive = false;
+    bool everTurnAway = false;
+    bool everAdvanceClear = false;
+    bool everReleasedAfterActivating = false;
+    bool everNavigationOverriddenByAvoidance = false;
+    bool everNavigationResumedAfterRelease = false;
+    bool everFlippedDirectionWithinIncident = false;
+    std::optional<float> incidentTurnSign;
+    float totalAdvanceClearDistance = 0.0F;
+    Vec3 previousAdvancePosition{};
+    bool wasAdvanceClearLastFrame = false;
+    Vec3 stuckAnchorPosition = world.robotPose().position;
+    int framesSinceMeaningfulMovement = 0;
+    int maxFramesSinceMeaningfulMovement = 0;
+    float distanceAfterRelease = -1.0F;
+    bool released = false;
+
+    for (int frame = 0; frame < 6000 && stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        runtime.step();
+
+        const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
+        const auto obstacleRays = obstacleSensorArray.readings();
+        const bool triggerAvoidance =
+            stateMachine.currentState() == RobotState::WaitingForObstacleClear && hardware.obstacleDetected();
+        const ObstacleHazardSample hazard{obstacleRays.frontLeftDistance, obstacleRays.frontCenterDistance,
+                                           obstacleRays.frontRightDistance};
+        avoidance.update(/*enabled=*/true, triggerAvoidance, forwardCorridorClear, world.robotPose(), hazard);
+
+        const CliffSensorReadings cliffReadings = cliffSensor.readings();
+        tableEdgeSafety.update(cliffReadings, world.robotPose(), world.tableSurface());
+
+        const bool navigationEnabled = hardware.currentCommand() == VirtualDriveCommand::ReturnToBase;
+        const HomeNavigationOutput nav = homeNavigator.update(world.robotPose(), base, navigationEnabled);
+
+        if (tableEdgeSafety.active())
+        {
+            const WheelSpeeds recovery = tableEdgeSafety.recoveryWheelSpeeds();
+            hardware.setSafetyWheelSpeeds(recovery.left, recovery.right);
+        }
+        else if (hardware.safetyOverrideActive())
+        {
+            hardware.clearSafetyWheelOverride();
+        }
+
+        if (avoidance.active())
+        {
+            everAvoidanceActive = true;
+            const WheelSpeeds turn = avoidance.wheelSpeeds();
+            hardware.setAutonomousWheelSpeeds(turn.left, turn.right);
+        }
+        else if (hardware.autonomousOverrideActive())
+        {
+            hardware.clearAutonomousWheelOverride();
+        }
+
+        const bool navigationDriving =
+            nav.state == HomeNavigationState::Aligning || nav.state == HomeNavigationState::Driving;
+        if (navigationDriving)
+        {
+            hardware.setNavigationWheelSpeeds(nav.wheelSpeeds.left, nav.wheelSpeeds.right);
+        }
+        else if (hardware.navigationOverrideActive())
+        {
+            hardware.clearNavigationWheelOverride();
+        }
+
+        hardware.update(0.05F);
+        ASSERT_FALSE(hardware.collidedLastUpdate());
+
+        // --- Tracking (post-hardware.update(), so pose/authority reflect
+        // this frame's final result) ---
+        const RobotState currentState = stateMachine.currentState();
+        const DriveAuthority authority = hardware.driveAuthority();
+
+        if (avoidance.state() == AvoidanceState::TurnAway)
+        {
+            everTurnAway = true;
+            const float sign = (avoidance.wheelSpeeds().right > 0.0F) ? 1.0F : -1.0F;
+            if (incidentTurnSign.has_value())
+            {
+                if (*incidentTurnSign != sign)
+                {
+                    everFlippedDirectionWithinIncident = true;
+                }
+            }
+            else
+            {
+                incidentTurnSign = sign;
+            }
+        }
+        if (avoidance.state() == AvoidanceState::AdvanceClear)
+        {
+            everAdvanceClear = true;
+            if (wasAdvanceClearLastFrame)
+            {
+                const float dx = world.robotPose().position.x - previousAdvancePosition.x;
+                const float dz = world.robotPose().position.z - previousAdvancePosition.z;
+                totalAdvanceClearDistance += std::sqrt((dx * dx) + (dz * dz));
+            }
+            previousAdvancePosition = world.robotPose().position;
+            wasAdvanceClearLastFrame = true;
+        }
+        else
+        {
+            wasAdvanceClearLastFrame = false;
+        }
+        if (avoidance.state() == AvoidanceState::Inactive)
+        {
+            if (everAvoidanceActive && !released)
+            {
+                everReleasedAfterActivating = true;
+                released = true;
+                const float dx = base.position.x - world.robotPose().position.x;
+                const float dz = base.position.z - world.robotPose().position.z;
+                distanceAfterRelease = std::sqrt((dx * dx) + (dz * dz));
+            }
+            incidentTurnSign.reset();
+        }
+
+        if (currentState == RobotState::ReturningHome && authority == DriveAuthority::AutonomousAvoidance)
+        {
+            everNavigationOverriddenByAvoidance = true;
+        }
+        if (released && currentState == RobotState::ReturningHome && authority == DriveAuthority::Navigation)
+        {
+            everNavigationResumedAfterRelease = true;
+        }
+
+        // "Stuck in place" tracking - a genuine bypass must, at some point,
+        // physically move the robot; this catches the human-observed
+        // failure mode directly (heading changing every frame while
+        // position barely moves) rather than only inferring it indirectly
+        // from state transitions.
+        const float dxAnchor = world.robotPose().position.x - stuckAnchorPosition.x;
+        const float dzAnchor = world.robotPose().position.z - stuckAnchorPosition.z;
+        const float distanceFromAnchor = std::sqrt((dxAnchor * dxAnchor) + (dzAnchor * dzAnchor));
+        if (distanceFromAnchor > 0.05F)
+        {
+            stuckAnchorPosition = world.robotPose().position;
+            framesSinceMeaningfulMovement = 0;
+        }
+        else
+        {
+            ++framesSinceMeaningfulMovement;
+            maxFramesSinceMeaningfulMovement = std::max(maxFramesSinceMeaningfulMovement, framesSinceMeaningfulMovement);
+        }
+    }
+
+    // --- Assertions (Phase 13V oscillation-fix regression proof) ---
+
+    // 1/3: avoidance activated and chose a turn direction for this
+    // obstacle.
+    ASSERT_TRUE(everAvoidanceActive);
+    ASSERT_TRUE(everTurnAway);
+
+    // 2: Navigation was genuinely, physically overridden by avoidance
+    // (proven through real DriveAuthority arbitration, not merely
+    // avoidance.active()).
+    EXPECT_TRUE(everNavigationOverriddenByAvoidance);
+
+    // 4/13: the latched turn direction never flipped frame-to-frame within
+    // a single continuous incident (re-blocks during AdvanceClear return
+    // to TurnAway with the SAME direction preserved).
+    EXPECT_FALSE(everFlippedDirectionWithinIncident);
+
+    // 5/6: AdvanceClear was entered, and the robot travelled a real,
+    // meaningful distance while in it (not merely rotating) - at least the
+    // class' own minimum bypass distance, proving genuine physical
+    // bypass, not just a corridor-angle trick.
+    ASSERT_TRUE(everAdvanceClear);
+    EXPECT_GE(totalAdvanceClearDistance, ReactiveObstacleAvoidance::kMinimumBypassDistanceWorldUnits);
+
+    // 7: avoidance eventually released.
+    ASSERT_TRUE(everReleasedAfterActivating);
+
+    // 8: Navigation authority resumed afterward, still within the same
+    // Return Home mission.
+    EXPECT_TRUE(everNavigationResumedAfterRelease);
+
+    // 9: distance to base genuinely decreased after the bypass, compared
+    // to where the mission started - real progress, not a wash.
+    ASSERT_GE(distanceAfterRelease, 0.0F);
+    EXPECT_LT(distanceAfterRelease, distanceAtStart);
+
+    // 10: the robot was never stuck within a tiny position radius for
+    // hundreds of frames - the direct anti-oscillation guarantee. 100
+    // frames at this loop's 0.05s step is 5 simulated seconds; TurnAway's
+    // own in-place rotation legitimately holds position for a handful of
+    // frames each incident, but never anywhere near that long.
+    EXPECT_LT(maxFramesSinceMeaningfulMovement, 100);
+
+    // 12: the mission actually completed - HomeReached, through the real
+    // HomeArrivalEventSource edge, never injected directly.
+    ASSERT_EQ(stateMachine.currentState(), RobotState::Ready);
+    EXPECT_EQ(hardware.currentCommand(), VirtualDriveCommand::Stopped);
+    const float dxFinal = base.position.x - world.robotPose().position.x;
+    const float dzFinal = base.position.z - world.robotPose().position.z;
+    const float finalDistance = std::sqrt((dxFinal * dxFinal) + (dzFinal * dzFinal));
+    EXPECT_LE(finalDistance, HomeNavigator::kHomeArrivalRadius);
+
+    // The obstacle was never disabled anywhere in this test - confirms the
+    // bypass was real, not a toggled-off shortcut.
+    EXPECT_TRUE(world.obstacles()[0].enabled);
 }
 
 // --- Table-edge-during-Return-Home integration test (Phase 13T) ---

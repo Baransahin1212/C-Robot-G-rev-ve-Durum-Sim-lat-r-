@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <optional>
 
+#include "robot/visual/RangeObservation.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
@@ -101,6 +103,17 @@ public:
     // World-space forward direction shared by all three rays - they are
     // parallel, not fanned out; only their origins differ.
     Vec3 rayDirection() const;
+
+    // Phase 13V: the same three rays as readings()/rayOrigin() above,
+    // repackaged as RangeObservation values (origin/direction/distance/
+    // maxRange/hit) in FrontLeft, FrontCenter, FrontRight order - the one
+    // sensor-observation surface ExplorationMapper is allowed to consume
+    // (see RangeObservation.hpp and ExplorationMapper.hpp's own docs).
+    // Reuses this class's own existing ray/AABB intersection computation
+    // internally (the same private helper readings() already calls) -
+    // never a second, duplicated implementation of the intersection math,
+    // and never a new one added inside ExplorationMapper.
+    std::array<RangeObservation, 3> observations() const;
 
 private:
     const VirtualWorld& world_;

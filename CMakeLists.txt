@@ -381,13 +381,60 @@ FetchContent_MakeAvailable(raylib)
 # BasePlatform use only this project's own Vec3, never raylib's Vector3,
 # so this target - and anything testing it - never needs to link raylib.
 # Depends only on robot_domain for the shared include directory; it uses
-# no domain type (Event/RobotState/...).
+# no domain type (Event/RobotState/...). ExecutableDirectory (final font
+# delivery fix / Phase 13V) is a single small Windows-API utility function
+# with two callers - Renderer3D.cpp (robot_visual) and main3d.cpp
+# (RobotSimulator3D), both of which already depend on this target
+# transitively - kept here rather than a new single-function target of
+# its own; still raylib-free, just <windows.h>.
 add_library(robot_visual_world STATIC
     src/visual/VirtualWorld.cpp
+    src/visual/ExecutableDirectory.cpp
 )
 
 target_link_libraries(robot_visual_world PUBLIC
     robot_domain
+)
+
+# --- robot_exploration: ExplorationMap + ExplorationMapper + CoverageTrail
+# + ExplorationMapStorage, the progressive robot-vacuum-style exploration
+# map (Phase 13V) ---
+# Entirely raylib-free, exactly like robot_visual_simulation's own sensor/
+# safety/navigation components - Renderer3D (robot_visual, declared right
+# below) is the only place any of this is ever drawn. ExplorationMap is
+# pure grid storage + deterministic world<->cell conversions, with no
+# sensing logic of its own. ExplorationMapper is the ONLY component
+# allowed to mutate an ExplorationMap's cells, and deliberately takes a
+# plain RobotPose plus a std::vector<RangeObservation> - never a `const
+# VirtualWorld&` anywhere in its public API - so it is architecturally
+# incapable of reading VirtualWorld::obstacles() directly and "cheating"
+# a complete map into existence; every observation it traces must come
+# from a real sensor ray cast elsewhere
+# (VirtualObstacleSensorArray::observations(), in robot_visual_simulation
+# below - see main3d.cpp for the production wiring). CoverageTrail
+# independently records the actual travelled path via distance-sampled
+# RobotPose updates, with no FSM/MissionTask knowledge. ExplorationMapStorage
+# is simple version-1 JSON persistence for both (nlohmann/json, PRIVATE -
+# never appears in this target's public headers, matching robot_scenario's
+# own JsonScenarioSource.cpp precedent). Depends only on robot_visual_world
+# (Vec3/RobotPose/TableSurface, and VisualMath.hpp/VisualRobot.hpp's
+# header-only heading/RobotDimensions utilities already reachable through
+# robot_domain's shared include directory) - never robot_visual_simulation,
+# robot_hardware, or robot_core: mapping only ever OBSERVES, it never
+# commands the robot or touches FSM/hardware/DriveAuthority state (Phase
+# 13V brief, "Mapping never commands the robot"). Declared before
+# robot_visual since robot_visual links it PUBLIC (renderFrame() takes an
+# ExplorationMap/CoverageTrail by const reference - see below).
+add_library(robot_exploration STATIC
+    src/visual/ExplorationMap.cpp
+    src/visual/ExplorationMapper.cpp
+    src/visual/CoverageTrail.cpp
+    src/visual/ExplorationMapStorage.cpp
+)
+
+target_link_libraries(robot_exploration
+    PUBLIC robot_visual_world
+    PRIVATE nlohmann_json::nlohmann_json
 )
 
 # --- robot_visual: VisualRobot + Renderer3D, the raylib-based 3D drawing
@@ -401,8 +448,18 @@ add_library(robot_visual STATIC
     src/visual/Renderer3D.cpp
 )
 
+# Phase 13V: robot_exploration (ExplorationMap/CoverageTrail) is PUBLIC
+# because renderFrame() takes both by const reference directly - the same
+# pattern already established for robot_visual_world's own VirtualWorld
+# (also a plain data container passed straight into renderFrame(), never
+# routed through VisualTelemetry). Both remain read-only data Renderer3D
+# displays; it never mutates either, and robot_exploration itself has no
+# raylib dependency of its own - this is the only place raylib meets
+# exploration-map data, exactly matching robot_visual's existing sole-
+# raylib-touchpoint role for VirtualWorld.
 target_link_libraries(robot_visual PUBLIC
     robot_visual_world
+    robot_exploration
     raylib
 )
 
@@ -506,6 +563,7 @@ target_link_libraries(RobotSimulator3D PRIVATE
     robot_visual_simulation
     robot_hardware_events
     robot_polling_composite
+    robot_exploration
 )
 
 # Final font delivery fix: copy the repository-local Turkish-capable font
@@ -1130,6 +1188,103 @@ target_link_libraries(MissionControlIntegrationTests PRIVATE
 
 gtest_discover_tests(MissionControlIntegrationTests)
 
+# --- ExplorationMapTests: Phase 13V - grid storage, world<->cell
+# conversions, Occupied precedence, and explored-percentage bookkeeping in
+# isolation. Links only robot_exploration - never robot_visual/raylib -
+# genuinely headless, no window is ever created by this target.
+add_executable(ExplorationMapTests
+    tests/visual/ExplorationMapTests.cpp
+)
+
+target_link_libraries(ExplorationMapTests PRIVATE
+    robot_exploration
+    GTest::gtest_main
+)
+
+gtest_discover_tests(ExplorationMapTests)
+
+# --- ExplorationMapperTests: Phase 13V - Bresenham ray tracing (no-hit
+# vs. hit endpoints), heading-convention correctness, and robot-footprint
+# marking, driven entirely through RobotPose/RangeObservation - proves
+# ExplorationMapper never needs a VirtualWorld reference (see
+# MapperDoesNotRequireVirtualWorldReference). Links only robot_exploration
+# - never robot_visual/raylib - genuinely headless.
+add_executable(ExplorationMapperTests
+    tests/visual/ExplorationMapperTests.cpp
+)
+
+target_link_libraries(ExplorationMapperTests PRIVATE
+    robot_exploration
+    GTest::gtest_main
+)
+
+gtest_discover_tests(ExplorationMapperTests)
+
+# --- CoverageTrailTests: Phase 13V - distance-based sampling, first-point
+# recording, turning-in-place not spamming points, and trail-lifecycle
+# behavior (clear()/loadPoints() only, never implicitly reset). Links
+# only robot_exploration - never robot_visual/raylib - genuinely
+# headless.
+add_executable(CoverageTrailTests
+    tests/visual/CoverageTrailTests.cpp
+)
+
+target_link_libraries(CoverageTrailTests PRIVATE
+    robot_exploration
+    GTest::gtest_main
+)
+
+gtest_discover_tests(CoverageTrailTests)
+
+# --- ExplorationMapStorageTests: Phase 13V - version-1 JSON save/load
+# round-tripping, missing/corrupt/incompatible-version failure modes (all
+# fail safely, never throw/crash), and resolution/bounds/occupied-cell/
+# trail preservation. Writes only to TEST_OUTPUT_DIR-rooted temporary
+# files - never the real runtime map path. Links only robot_exploration -
+# never robot_visual/raylib - genuinely headless.
+add_executable(ExplorationMapStorageTests
+    tests/visual/ExplorationMapStorageTests.cpp
+)
+
+target_link_libraries(ExplorationMapStorageTests PRIVATE
+    robot_exploration
+    GTest::gtest_main
+)
+
+target_compile_definitions(ExplorationMapStorageTests PRIVATE
+    TEST_OUTPUT_DIR="${CMAKE_BINARY_DIR}/test_output/"
+)
+
+gtest_discover_tests(ExplorationMapStorageTests)
+
+# --- ExplorationIntegrationTests: Phase 13V - closed-loop tests through
+# the real production stack (MissionControlEventSource, RobotRuntime,
+# RobotStateMachine, RobotController, VirtualRobotHardware,
+# VirtualObstacleSensorArray, ExplorationMapper, CoverageTrail) proving
+# the map genuinely reveals itself from real sensor observations (never
+# VirtualWorld::obstacles() directly), Start Explore/Stop Task/Start
+# Explore again never resets the map or trail, and the Return Home route
+# is recorded. Links robot_visual_simulation plus
+# robot_hardware_events/robot_polling_composite/robot_controller/
+# robot_core for the same reasons MissionControlIntegrationTests does,
+# plus robot_exploration. Never links robot_visual/raylib - genuinely
+# headless.
+add_executable(ExplorationIntegrationTests
+    tests/visual/ExplorationIntegrationTests.cpp
+)
+
+target_link_libraries(ExplorationIntegrationTests PRIVATE
+    robot_visual_simulation
+    robot_exploration
+    robot_controller
+    robot_core
+    robot_hardware_events
+    robot_polling_composite
+    GTest::gtest_main
+)
+
+gtest_discover_tests(ExplorationIntegrationTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -1140,7 +1295,7 @@ if (MSVC)
         robot_runtime_runner robot_sensor_script robot_scripted_runtime
         robot_command_script robot_command_events robot_polling_composite
         robot_real_hardware robot_serial_transport
-        robot_visual_world robot_visual robot_visual_simulation
+        robot_visual_world robot_visual robot_visual_simulation robot_exploration
         RobotSimulator RobotSimulator3D RobotSimulatorTests ScenarioSourceTests
         RobotHardwareTests RobotControllerTests HardwareEventSourceTests
         RobotRuntimeTests LiveRuntimeRunnerTests ScenarioIntegrationTests
@@ -1154,6 +1309,8 @@ if (MSVC)
         VirtualObstacleSensorArrayTests HomeNavigatorTests
         HomeArrivalEventSourceTests MissionControlEventSourceTests
         HomeZoneMonitorTests MissionControlIntegrationTests
+        ExplorationMapTests ExplorationMapperTests CoverageTrailTests
+        ExplorationMapStorageTests ExplorationIntegrationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

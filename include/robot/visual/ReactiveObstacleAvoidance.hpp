@@ -1,87 +1,194 @@
 #pragma once
 
+#include <optional>
+#include <string_view>
+
 #include "robot/visual/DifferentialDrive.hpp"
+#include "robot/visual/RobotCollision.hpp"
 
 namespace robot::visual
 {
 
-// Deterministic, raylib-free reactive obstacle-avoidance policy. As of
-// Phase 13R this is a small stateful LATCH, not the stateless Phase 13Q
-// "turn while WaitingForObstacleClear + sensor detected" snapshot check -
-// see docs/technical-decisions.md (Phase 13R) for why: a single forward
-// sensor ray clearing does not mean the robot's physical BODY has a safe
-// forward corridor (ForwardClearanceProbe.hpp), so the FSM returning to
-// `Moving` on the real `ObstacleCleared` edge must NOT, by itself, hand
-// the wheels back to the FSM if the body corridor is still blocked - the
-// robot needs to keep turning past that point. This class owns exactly
-// that "keep turning until it is actually safe" lifecycle; it still knows
-// nothing about RobotStateMachine, Event, IRobotHardware,
-// VirtualDistanceSensor, ForwardClearanceProbe, or VirtualWorld - the
-// caller (main3d.cpp) computes the three plain booleans update() takes
-// and decides *when* to apply avoidanceWheelSpeeds() via
-// VirtualRobotHardware::setAutonomousWheelSpeeds()/
-// clearAutonomousWheelOverride(), exactly like Phase 13Q. This is still
-// REACTIVE avoidance only - not pathfinding, not A*, not waypoint
-// planning, not SLAM/mapping, not full navigation: "turn until the
-// forward BODY corridor clears, then continue" is the entire policy, and
-// it may permanently change the robot's heading with no attempt to
-// return to its original trajectory.
+// Phase 13V human-validation fix: the three internal phases one avoidance
+// incident moves through - see ReactiveObstacleAvoidance's own class docs
+// below for the full "why" (the Phase 13R latch alone was not sufficient:
+// releasing the instant the sensor/corridor reads clear let HomeNavigator
+// immediately re-aim back into the very obstacle avoidance had only
+// ROTATED away from, without ever having TRANSLATED past it). `active()`
+// is true for both TurnAway and AdvanceClear - main3d.cpp's own "does
+// avoidance currently want the wheels" caller contract is unchanged.
+enum class AvoidanceState
+{
+    Inactive,
+    TurnAway,
+    AdvanceClear
+};
+
+// Visual-only, not part of any FSM/RobotState convention - mirrors every
+// other visual-simulation enum's own toString() shape in this codebase.
+constexpr std::string_view toString(AvoidanceState state) noexcept
+{
+    switch (state)
+    {
+        case AvoidanceState::Inactive: return "Inactive";
+        case AvoidanceState::TurnAway: return "TurnAway";
+        case AvoidanceState::AdvanceClear: return "AdvanceClear";
+    }
+    return "Unknown";
+}
+
+// Phase 13V human-validation fix: the per-ray hazard snapshot
+// ReactiveObstacleAvoidance uses ONLY to choose a turn direction, once,
+// when a new incident begins - deliberately a small plain struct (matching
+// this codebase's RangeObservation precedent) rather than a dependency on
+// VirtualObstacleSensorArray.hpp/ObstacleSensorArrayReadings directly, so
+// this class still knows nothing about VirtualDistanceSensor,
+// VirtualObstacleSensorArray, ForwardClearanceProbe, or VirtualWorld - the
+// caller (main3d.cpp) repackages already-computed
+// VirtualObstacleSensorArray::readings() distances into this shape, never
+// duplicating the ray/AABB math itself. `std::nullopt` means that ray/side
+// reported no hit, matching ObstacleSensorArrayReadings' own
+// std::optional<float> convention exactly.
+struct ObstacleHazardSample
+{
+    std::optional<float> leftDistance;
+    std::optional<float> centerDistance;
+    std::optional<float> rightDistance;
+};
+
+// Deterministic, raylib-free reactive obstacle-avoidance policy - a
+// stateful three-phase incident lifecycle (Phase 13V human-validation
+// fix), replacing the Phase 13R two-phase latch (Inactive/active-with-a-
+// single-fixed-turn-direction).
+//
+// THE BUG THIS FIXES (human GUI validation, Phase 13V): pressing `2`/`R`
+// (Return Home) with an obstacle sitting close to the direct line to base
+// made the robot oscillate in place indefinitely - turning, "releasing"
+// the instant ForwardClearanceProbe reported clear, HomeNavigator
+// immediately re-aiming (it recomputes its target from the CURRENT pose
+// every single frame - see HomeNavigator.hpp) back toward the still-
+// nearby obstacle, re-triggering avoidance, forever, with zero net
+// translation. Root cause: "the forward corridor reads clear along the
+// robot's CURRENT heading" is a fact about ROTATION, not about whether the
+// robot has physically TRANSLATED far enough to no longer be sitting
+// right next to the obstacle's footprint - Phase 13R's latch already knew
+// the difference between "a ray is clear" and "the body corridor is
+// clear," but never distinguished "the corridor is clear" from "the robot
+// has actually moved past the obstacle." This class now tracks that third,
+// separate fact explicitly (AdvanceClear's own distance-travelled
+// bookkeeping below).
+//
+// THE FIX: TurnAway (rotate only, zero linear velocity, exactly like the
+// old single-phase latch) -> AdvanceClear (drive forward once the corridor
+// is clear, tracking real displacement from where AdvanceClear began) ->
+// Inactive, only once BOTH the corridor is (still) clear AND the robot has
+// translated at least kMinimumBypassDistanceWorldUnits. Re-blocked during
+// AdvanceClear returns to TurnAway, preserving (never recomputing) the
+// turn direction chosen for this incident. Still REACTIVE avoidance only -
+// not pathfinding, not A*, not waypoint planning, not SLAM/mapping, not
+// full navigation: this remains local, single-obstacle bypass, with no
+// memory of any incident once it ends, and no guaranteed solution for two
+// or more obstacles forming an actual enclosure (documented as a known V1
+// limitation, unchanged from before this fix - see
+// docs/technical-decisions.md).
+//
+// Still has no knowledge of RobotStateMachine, Event, IRobotHardware,
+// VirtualDistanceSensor, VirtualObstacleSensorArray, or VirtualWorld
+// itself - the caller (main3d.cpp) computes ObstacleHazardSample/
+// forwardCorridorClear/the current RobotPose and decides *when* to apply
+// wheelSpeeds() via VirtualRobotHardware::setAutonomousWheelSpeeds()/
+// clearAutonomousWheelOverride(), exactly like every prior phase.
 class ReactiveObstacleAvoidance
 {
 public:
     // Fixed in-place turn wheel-speed magnitude, in world units/second -
-    // deliberately smaller than VirtualRobotHardware::kForwardWheelSpeed
-    // (1.0F) so an avoidance turn reads as a distinct maneuver, not a
-    // full-speed spin. left = -kTurnWheelSpeed, right = +kTurnWheelSpeed:
-    // by DifferentialDrive's omega = (vRight - vLeft) / wheelTrack
-    // convention (verified against TurningDirectionMatchesConvention in
-    // DifferentialDriveTests.cpp), this makes omega > 0, which increases
-    // headingDegrees - rotating the front marker from +Z toward +X, this
-    // project's one heading convention (VisualMath.hpp). Always turns
-    // this one deterministic direction - no obstacle-side clearance
-    // probing, no randomness, unchanged from Phase 13Q.
+    // unchanged from Phase 13Q/13R. Direction is now chosen per-incident
+    // (see chooseTurnSign() in the .cpp) rather than always the same
+    // fixed sign, but the magnitude itself, and the fact that it produces
+    // zero linear velocity (pure rotation), are unchanged.
     static constexpr float kTurnWheelSpeed = 0.6F;
 
-    // Advances the latch by one frame/step. Semantics (Phase 13R):
-    //   - `enabled` false (the `A` toggle off) forces the latch inactive
-    //     immediately, regardless of the other two arguments - this is
-    //     the only way to force-exit early, matching the brief's
-    //     requirement that turning `A` off while active must clear the
-    //     override on the spot.
-    //   - `triggerAvoidance` true activates the latch (idempotent if
-    //     already active). The caller's normal trigger condition (Phase
-    //     13Q, unchanged): avoidance enabled AND the FSM is actually
-    //     WaitingForObstacleClear AND the forward sensor still reports
-    //     the obstacle.
-    //   - Once active, the latch stays active across calls - including
-    //     calls where `triggerAvoidance` has already gone false, e.g. the
-    //     instant the real `ObstacleCleared` edge returns the FSM to
-    //     `Moving` - until `forwardCorridorClear` is observed true, at
-    //     which point it deactivates. This is the fix for the Phase 13Q
-    //     limitation: the FSM reaching `Moving` no longer by itself hands
-    //     wheel authority back to the FSM.
-    // Deliberately has no knowledge of *why* forwardCorridorClear is
-    // true/false - the caller is expected to pass
-    // ForwardClearanceProbe::isForwardCorridorClear() each frame.
-    void update(bool enabled, bool triggerAvoidance, bool forwardCorridorClear) noexcept;
+    // Forward wheel speed while AdvanceClear, in world units/second -
+    // deliberately less than VirtualRobotHardware::kForwardWheelSpeed
+    // (1.0F), matching this codebase's existing convention that a
+    // controlled reactive maneuver (HomeNavigator::kNavigationForwardSpeed
+    // 0.8F, TableEdgeSafetyController::kRecoveryInwardSpeed 0.6F) reads as
+    // deliberate, not a full-speed dash.
+    static constexpr float kAdvanceWheelSpeed = 0.8F;
 
-    // True while the latch is currently engaged - the caller's cue to
-    // hold VirtualRobotHardware's autonomous-avoidance wheel override
-    // active (see main3d.cpp). False initially (the latch starts
-    // inactive) and after any update() call that deactivates it.
+    // Minimum straight-line distance (world units) the robot must
+    // translate from the pose where AdvanceClear began before this class
+    // will release back to Inactive - the fix for "clear corridor" not
+    // implying "physically bypassed." Derived, not blindly hardcoded:
+    // twice RobotCollision.hpp's own kRobotCollisionRadius (the same
+    // collision-footprint source of truth ForwardClearanceProbe's own
+    // clearance margin already uses) - i.e. the robot's full collision
+    // DIAMETER, a natural, already-justified-elsewhere V1 measure of "far
+    // enough to no longer be straddling roughly the same footprint area
+    // it got stuck at." At this project's actual RobotDimensions (0.5F
+    // radius), this is 1.0F - inside the brief's own suggested 0.6F-1.0F
+    // range. Declared here, defined out-of-line in the .cpp (after
+    // kRobotCollisionRadius is guaranteed already constructed within that
+    // one translation unit) rather than as an in-class initializer, to
+    // avoid any static-initialization-order ambiguity between two inline
+    // variables defined in different headers.
+    static const float kMinimumBypassDistanceWorldUnits;
+
+    // Advances the incident by one frame/step.
+    //   - `enabled` false (the `A` toggle off) forces Inactive
+    //     immediately, regardless of every other argument - unchanged
+    //     from Phase 13R.
+    //   - `triggerAvoidance` true while Inactive begins a NEW incident:
+    //     enters TurnAway and chooses (once, from `hazard`) the turn
+    //     direction latched for the remainder of this incident - see
+    //     chooseTurnSign()'s own docs in the .cpp. Ignored while an
+    //     incident is already in progress (TurnAway/AdvanceClear) - the
+    //     latch, once started, is driven by `forwardCorridorClear` and
+    //     displacement alone, exactly like Phase 13R's own "trigger going
+    //     false mid-incident does not release" behavior.
+    //   - TurnAway -> AdvanceClear the instant `forwardCorridorClear`
+    //     becomes true (`pose` is captured as the AdvanceClear start
+    //     point).
+    //   - AdvanceClear -> TurnAway if `forwardCorridorClear` goes false
+    //     again (re-blocked) - the latched turn direction from this same
+    //     incident is preserved, never recomputed.
+    //   - AdvanceClear -> Inactive once `forwardCorridorClear` is (still)
+    //     true AND `pose` has moved at least
+    //     kMinimumBypassDistanceWorldUnits from the AdvanceClear start
+    //     point.
+    // `pose` should be the robot's current, real RobotPose every call
+    // (world.robotPose() in main3d.cpp) - this class never mutates it,
+    // only reads position for its own displacement bookkeeping.
+    void update(bool enabled, bool triggerAvoidance, bool forwardCorridorClear, const RobotPose& pose,
+                const ObstacleHazardSample& hazard) noexcept;
+
+    // True while TurnAway or AdvanceClear - the caller's cue to hold
+    // VirtualRobotHardware's autonomous-avoidance wheel override active
+    // (see main3d.cpp), unchanged in meaning from Phase 13R's own
+    // active().
     bool active() const noexcept;
 
-    // Always returns {-kTurnWheelSpeed, +kTurnWheelSpeed}, independent of
-    // active() - deterministic and stateless in its own right, so calling
-    // it is always safe; the caller is responsible for only applying it
-    // while active() is true. (left + right) / 2 == 0, so
-    // DifferentialDrive integrates this as pure in-place rotation: zero
-    // linear velocity, non-zero angular velocity - the robot's center
-    // stays fixed while its heading changes.
-    WheelSpeeds avoidanceWheelSpeeds() const noexcept;
+    // The current phase - Inactive/TurnAway/AdvanceClear. Exposed for
+    // telemetry (Ayrıntılı HUD) and tests; main3d.cpp's own authority-
+    // sync logic only ever needs active(), not this.
+    AvoidanceState state() const noexcept;
+
+    // Deterministic wheel speeds for the CURRENT state: {0, 0} while
+    // Inactive; {-kTurnWheelSpeed, +kTurnWheelSpeed} or the mirrored pair
+    // while TurnAway, depending on the latched direction for this
+    // incident; {kAdvanceWheelSpeed, kAdvanceWheelSpeed} (straight,
+    // deterministic forward motion - no arc/steering) while AdvanceClear.
+    // Safe to call regardless of active() - the caller is still
+    // responsible for only applying it while active() is true, exactly
+    // like Phase 13R's own avoidanceWheelSpeeds() contract.
+    WheelSpeeds wheelSpeeds() const noexcept;
 
 private:
-    bool active_ = false;
+    float chooseTurnSign(const ObstacleHazardSample& hazard) const noexcept;
+
+    AvoidanceState state_ = AvoidanceState::Inactive;
+    float latchedTurnSign_ = 1.0F;
+    Vec3 advanceStartPosition_{};
 };
 
 } // namespace robot::visual

@@ -1,29 +1,14 @@
 #include "robot/visual/Renderer3D.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#include "robot/visual/ExecutableDirectory.hpp"
 #include "robot/visual/VisualRobot.hpp"
-
-// Final font delivery fix: GetModuleFileNameA() resolves RobotSimulator3D's
-// own executable directory at runtime (see exeDirectory() below), replacing
-// the earlier absolute compile-time FONT_PATH (which baked this developer
-// machine's source-tree location into the binary - not portable to a
-// checkout built elsewhere). raylib.h is already included above (via
-// Renderer3D.hpp), so windows.h must come after it; NOGDI/NOUSER avoid the
-// well-known raylib/Windows.h symbol clashes (Rectangle, CloseWindow,
-// ShowCursor, DrawText, ...) - GetModuleFileNameA lives outside both the
-// GDI and USER subsystems, so neither macro affects it. NOMINMAX prevents
-// windows.h's own min/max macros from shadowing std::max() used below in
-// drawHud()/drawMissionControlPanel(). Scoped to this one translation unit
-// only, never a project-wide Windows dependency.
-#define NOGDI
-#define NOUSER
-#define NOMINMAX
-#include <windows.h>
 
 namespace robot::visual
 {
@@ -94,6 +79,24 @@ constexpr int kMissionControlMarginRight = 20;
 constexpr int kMissionControlMarginY = 20;
 constexpr Color kMissionControlTaskColor = Color{255, 220, 100, 255};
 
+// Exploration map panel (Phase 13V): bottom-right, deliberately separate
+// from the engineering HUD panel (top-left) and Mission Control panel
+// (top-right) above - all three are sized/placed independently and never
+// overlap at this project's fixed 1280x720 window size (and stay
+// bottom-right-anchored the same way in borderless-fullscreen). Top-down,
+// fixed orientation - never rotated by robot heading (Phase 13V brief).
+constexpr int kExplorationPanelMarginRight = 20;
+constexpr int kExplorationPanelMarginBottom = 20;
+constexpr int kExplorationGridPixelSize = 220;
+constexpr Color kExplorationUnknownColor = kHudPanelBackground; // "not yet observed" reads as the panel's own background
+constexpr Color kExplorationFreeColor = Color{70, 90, 70, 255};
+constexpr Color kExplorationOccupiedColor = Color{200, 70, 60, 255};
+constexpr Color kExplorationTrailColor = Color{80, 220, 220, 255}; // matches kHomeGuideColor's cyan - "where the robot has been"
+constexpr Color kExplorationBoundaryColor = LIGHTGRAY;
+constexpr Color kExplorationRobotColor = Color{255, 220, 100, 255}; // matches kMissionControlTaskColor
+constexpr Color kExplorationHeadingColor = RED;
+constexpr Color kExplorationBaseColor = Color{80, 140, 220, 255}; // matches kBaseColor
+
 struct HudLine
 {
     const char* text;
@@ -142,27 +145,6 @@ std::vector<int> buildFontCodepoints()
     return codepoints;
 }
 
-// Final font delivery fix: the directory RobotSimulator3D.exe itself is
-// running from - GetModuleFileNameA(nullptr, ...) asks Windows for the
-// current process's own module (.exe) path, so this works regardless of
-// the process's current working directory or where the source tree
-// happens to live on this machine. Returns an empty string (never throws
-// or crashes) if the OS call fails for any reason - the constructor below
-// treats that exactly like a missing font file and falls back to the
-// default font.
-std::string exeDirectory()
-{
-    char buffer[MAX_PATH] = {};
-    const DWORD length = GetModuleFileNameA(nullptr, buffer, MAX_PATH);
-    if (length == 0 || length == MAX_PATH)
-    {
-        return std::string();
-    }
-    const std::string path(buffer, length);
-    const std::size_t lastSlash = path.find_last_of("\\/");
-    return (lastSlash == std::string::npos) ? std::string() : path.substr(0, lastSlash);
-}
-
 } // namespace
 
 Renderer3D::Renderer3D()
@@ -186,7 +168,7 @@ Renderer3D::Renderer3D()
     // resolved or the file cannot be read - Renderer3D must never fail to
     // construct over a missing font asset.
     std::vector<int> codepoints = buildFontCodepoints();
-    const std::string exeDir = exeDirectory();
+    const std::string exeDir = executableDirectory();
     if (!exeDir.empty())
     {
         const std::string fontPath = exeDir + "\\assets\\fonts\\anonymous_pro_bold.ttf";
@@ -231,7 +213,8 @@ int Renderer3D::measureTextWidth(const char* text, int fontSize) const
     return static_cast<int>(size.x);
 }
 
-void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry)
+void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry,
+                              const ExplorationMap& map, const CoverageTrail& trail)
 {
     if (updateCamera)
     {
@@ -247,6 +230,7 @@ void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, const
 
     drawHud(world, telemetry);
     drawMissionControlPanel(telemetry);
+    drawExplorationMapPanel(world, map, trail, telemetry);
 
     EndDrawing();
 }
@@ -412,6 +396,10 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     std::snprintf(avoidanceActiveLine, sizeof(avoidanceActiveLine), "Engel kaçınma aktif: %s",
                    telemetry.avoidanceActive ? "EVET" : "HAYIR");
 
+    char avoidanceStateLine[80];
+    std::snprintf(avoidanceStateLine, sizeof(avoidanceStateLine), "Kaçınma durumu: %.*s",
+                   static_cast<int>(telemetry.avoidanceStateText.size()), telemetry.avoidanceStateText.data());
+
     char forwardClearanceLine[64];
     std::snprintf(forwardClearanceLine, sizeof(forwardClearanceLine), "Ön açıklık: %s",
                    telemetry.forwardClearanceClear ? "AÇIK" : "ENGELLİ");
@@ -482,6 +470,7 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {driveAuthorityLine, 18, kHudTextColor},
         {avoidanceLine, 18, kHudTextColor},
         {avoidanceActiveLine, 18, kHudTextColor},
+        {avoidanceStateLine, 18, kHudTextColor},
         {forwardClearanceLine, 18, kHudTextColor},
         {clearanceLookaheadLine, 18, kHudTextColor},
         {positionLine, 18, kHudTextColor},
@@ -632,13 +621,15 @@ void Renderer3D::drawMissionControlPanel(const VisualTelemetry& telemetry) const
     // would be duplicate telemetry, which the brief explicitly calls out
     // to avoid). taskLine reuses telemetry.missionTaskText verbatim - it
     // is already Turkish (main3d.cpp's turkishText(MissionTask) call).
+    // Phase 13V human-validation fix: the former "Ev bölgesi: İçeride/
+    // Dışarıda" line is removed - it no longer affects any behavior
+    // (HomeZoneMonitor's automatic-return wiring was removed entirely),
+    // so keeping it would only be presentation clutter, not a decision
+    // in scope of the panel's own preferred appearance (see main3d.cpp's
+    // own docs and docs/technical-decisions.md for the full rationale).
     char taskLine[48];
     std::snprintf(taskLine, sizeof(taskLine), "Görev: %.*s", static_cast<int>(telemetry.missionTaskText.size()),
                    telemetry.missionTaskText.data());
-
-    char homeZoneLine[48];
-    std::snprintf(homeZoneLine, sizeof(homeZoneLine), "Ev bölgesi: %s",
-                   telemetry.homeZoneInside ? "İçeride" : "Dışarıda");
 
     const HudLine lines[] = {
         {"GÖREV KONTROLÜ", 20, kHudTitleColor},
@@ -647,7 +638,6 @@ void Renderer3D::drawMissionControlPanel(const VisualTelemetry& telemetry) const
         {"2  Eve Dön", 16, kHudControlsColor},
         {"3  Görevi Durdur", 16, kHudControlsColor},
         {"R  Eve Dön", 16, kHudControlsColor},
-        {homeZoneLine, 16, kHudTextColor},
     };
     constexpr std::size_t lineCount = sizeof(lines) / sizeof(lines[0]);
 
@@ -672,6 +662,131 @@ void Renderer3D::drawMissionControlPanel(const VisualTelemetry& telemetry) const
         drawText(lines[i].text, textX, textY, lines[i].fontSize, lines[i].color);
         textY += lines[i].fontSize + kHudLineSpacing;
     }
+}
+
+void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const ExplorationMap& map,
+                                          const CoverageTrail& trail, const VisualTelemetry& telemetry) const
+{
+    char exploredLine[48];
+    std::snprintf(exploredLine, sizeof(exploredLine), "Keşfedilen: %%%d", static_cast<int>(map.exploredPercentage()));
+
+    char statusLine[48];
+    std::snprintf(statusLine, sizeof(statusLine), "Durum: %s", telemetry.mapWasLoaded ? "Yüklendi" : "Oluşturuluyor");
+
+    const HudLine headerLines[] = {
+        {"HARİTA", 20, kHudTitleColor},
+        {exploredLine, 16, kHudTextColor},
+        {statusLine, 16, kHudTextColor},
+    };
+    constexpr std::size_t headerLineCount = sizeof(headerLines) / sizeof(headerLines[0]);
+
+    int panelWidth = kExplorationGridPixelSize;
+    int headerHeight = 0;
+    for (std::size_t i = 0; i < headerLineCount; ++i)
+    {
+        panelWidth = std::max(panelWidth, measureTextWidth(headerLines[i].text, headerLines[i].fontSize));
+        headerHeight += headerLines[i].fontSize + kHudLineSpacing;
+    }
+    panelWidth += 2 * kHudPadding;
+    const int panelHeight = headerHeight + kExplorationGridPixelSize + (3 * kHudPadding);
+
+    const int panelX = GetScreenWidth() - kExplorationPanelMarginRight - panelWidth;
+    const int panelY = GetScreenHeight() - kExplorationPanelMarginBottom - panelHeight;
+    DrawRectangle(panelX, panelY, panelWidth, panelHeight, kHudPanelBackground);
+
+    const int textX = panelX + kHudPadding;
+    int textY = panelY + kHudPadding;
+    for (std::size_t i = 0; i < headerLineCount; ++i)
+    {
+        drawText(headerLines[i].text, textX, textY, headerLines[i].fontSize, headerLines[i].color);
+        textY += headerLines[i].fontSize + kHudLineSpacing;
+    }
+
+    // --- Grid: top-down, fixed orientation (never rotates with the
+    // robot) - column increases with world X (left->right), row
+    // increases with world Z (top->bottom), matching
+    // ExplorationMap::worldToCell()'s own convention exactly (Phase 13V
+    // brief: "do not accidentally mirror or rotate the map"). Only
+    // Free/Occupied cells are drawn - Unknown cells are left as the
+    // panel's own background color (kExplorationUnknownColor IS
+    // kHudPanelBackground), both correctly representing "not observed
+    // yet" and avoiding ~10000 redundant background-colored draw calls
+    // every frame for a freshly-started map.
+    const int gridX = textX;
+    const int gridY = textY + kHudPadding;
+    const TableSurface& bounds = map.bounds();
+    const float worldWidth = bounds.maxX - bounds.minX;
+    const float worldHeight = bounds.maxZ - bounds.minZ;
+    const float pixelsPerCellX = static_cast<float>(kExplorationGridPixelSize) / static_cast<float>(map.width());
+    const float pixelsPerCellZ = static_cast<float>(kExplorationGridPixelSize) / static_cast<float>(map.height());
+
+    const auto worldToPanel = [&](float worldX, float worldZ) {
+        const float normX = (worldX - bounds.minX) / worldWidth;
+        const float normZ = (worldZ - bounds.minZ) / worldHeight;
+        return Vector2{static_cast<float>(gridX) + (normX * static_cast<float>(kExplorationGridPixelSize)),
+                        static_cast<float>(gridY) + (normZ * static_cast<float>(kExplorationGridPixelSize))};
+    };
+
+    const std::vector<MapCell>& cells = map.cells();
+    for (int row = 0; row < map.height(); ++row)
+    {
+        for (int col = 0; col < map.width(); ++col)
+        {
+            const MapCell cell = cells[(static_cast<std::size_t>(row) * static_cast<std::size_t>(map.width())) +
+                                        static_cast<std::size_t>(col)];
+            if (cell == MapCell::Unknown)
+            {
+                continue;
+            }
+            const Color cellColor = (cell == MapCell::Occupied) ? kExplorationOccupiedColor : kExplorationFreeColor;
+            const int cellX = gridX + static_cast<int>(static_cast<float>(col) * pixelsPerCellX);
+            const int cellY = gridY + static_cast<int>(static_cast<float>(row) * pixelsPerCellZ);
+            // ceil-rounded width/height so adjacent cells fully tile the
+            // grid with no visible seam from float->int truncation.
+            const int cellWidth = static_cast<int>(std::ceil(pixelsPerCellX));
+            const int cellHeight = static_cast<int>(std::ceil(pixelsPerCellZ));
+            DrawRectangle(cellX, cellY, cellWidth, cellHeight, cellColor);
+        }
+    }
+
+    // --- Travel trail: the actual physical path recorded by
+    // CoverageTrail, drawn as connected line segments between
+    // consecutive sampled points - Explore/Return Home/Safety-recovery/
+    // Avoidance/manual movement all contribute to the same one trail
+    // (Phase 13V brief, "trail lifecycle").
+    const std::vector<Vec3>& trailPoints = trail.points();
+    for (std::size_t i = 1; i < trailPoints.size(); ++i)
+    {
+        const Vector2 from = worldToPanel(trailPoints[i - 1].x, trailPoints[i - 1].z);
+        const Vector2 to = worldToPanel(trailPoints[i].x, trailPoints[i].z);
+        DrawLineEx(from, to, 2.0F, kExplorationTrailColor);
+    }
+
+    // --- Base marker: BasePlatform's own live position - never a
+    // duplicated coordinate (Phase 13V brief, "do not duplicate its
+    // coordinates").
+    const Vector2 basePanel = worldToPanel(world.basePlatform().position.x, world.basePlatform().position.z);
+    DrawRectangle(static_cast<int>(basePanel.x) - 4, static_cast<int>(basePanel.y) - 4, 8, 8, kExplorationBaseColor);
+
+    // --- Robot marker: small filled circle at the current position plus
+    // a short heading-direction line, using this project's one heading
+    // convention (0 = +Z, +90 = +X - VisualMath.hpp's forwardDirection(),
+    // matching the grid's own row/column axes exactly, so the marker
+    // never visually disagrees with which way the grid itself is
+    // oriented).
+    const RobotPose& pose = world.robotPose();
+    const Vector2 robotPanel = worldToPanel(pose.position.x, pose.position.z);
+    DrawCircleV(robotPanel, 4.0F, kExplorationRobotColor);
+    constexpr float kHeadingMarkerLengthPixels = 10.0F;
+    constexpr float kPi = 3.14159265358979323846F;
+    const float headingRadians = pose.headingDegrees * (kPi / 180.0F);
+    const Vector2 headingEnd{robotPanel.x + (std::sin(headingRadians) * kHeadingMarkerLengthPixels),
+                              robotPanel.y + (std::cos(headingRadians) * kHeadingMarkerLengthPixels)};
+    DrawLineEx(robotPanel, headingEnd, 2.0F, kExplorationHeadingColor);
+
+    // --- Table boundary outline, drawn last so it stays visible over any
+    // cell/trail/marker drawing near the grid's own edge.
+    DrawRectangleLines(gridX, gridY, kExplorationGridPixelSize, kExplorationGridPixelSize, kExplorationBoundaryColor);
 }
 
 } // namespace robot::visual

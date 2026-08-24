@@ -3563,6 +3563,11 @@ implementations - though the class remains, still exercised directly by
 
 ### A real V1 limitation, discovered while testing this phase
 
+*(Status: fixed - see "Phase 13V human-validation fix: Return Home
+obstacle-avoidance oscillation" below, later in this document, for the
+resolution. The description below is left as-written, as the original
+discovery record - only this status line was added.)*
+
 While writing the automatic-Return-Home-with-obstacle closed-loop test,
 genuine `ReactiveObstacleAvoidance` turning was found to be able to
 resonate indefinitely against `HomeNavigator`'s continuous re-aiming, for
@@ -3580,13 +3585,538 @@ direct `world.setObstacleEnabled()` mutation (identical to the `O` key),
 sidestepping the interaction entirely. `MissionControlIntegrationTests.cpp`'s
 `ObstacleDuringAutomaticHomeZoneReturnIntegrationTest` follows that exact
 same established precedent rather than depending on convergence this
-codebase has never actually verified. This is flagged here as a genuine,
-currently-unfixed V1 limitation - not attempted to be fixed in this phase,
-since a real fix would likely require some form of obstacle-aware
-approach-angle memory in `HomeNavigator`, which is explicitly out of scope
-("V1 reactive navigation only... NOT global path planning"). It is not
+codebase has never actually verified. This was flagged here as a genuine,
+then-unfixed V1 limitation, not attempted to be fixed in this phase, since
+a real fix would likely require some form of obstacle-aware approach-angle
+memory in `HomeNavigator`, which was believed to be out of scope ("V1
+reactive navigation only... NOT global path planning"). It was not
 expected to be common in the fixed demo scene (the four demo obstacles are
 not positioned exactly on the direct line from anywhere reachable back to
-base), but a future phase that wants to hard-guarantee Return Home
-completion in the presence of arbitrary obstacle placement should treat
-this as the starting point.
+base) - but human GUI validation of the shipped Return Home feature hit it
+directly, which is what prompted the fix below: it turned out the fix did
+not require path planning or approach-angle memory in `HomeNavigator` at
+all, only teaching `ReactiveObstacleAvoidance` itself the difference
+between "turned away" and "physically bypassed."
+
+## Phase 13V: Exploration Map
+
+Adds a progressive, robot-vacuum-style 2D occupancy map
+(`ExplorationMap`/`ExplorationMapper`), a travelled-route trail
+(`CoverageTrail`), and simple JSON persistence
+(`ExplorationMapStorage`) to `RobotSimulator3D` - entirely new
+`robot_exploration` static library, raylib-free, with a bottom-right
+inset panel in `Renderer3D`. **Not full SLAM** - see the README's own
+explicit statement and the "future physical implementation" note below.
+
+### Sensor-observation boundary - why the mapper cannot read world obstacles
+
+The brief's central rule: `ExplorationMapper` must never read
+`VirtualWorld::obstacles()` and paint a complete, ready-made map -
+every cell it ever marks must trace back to a real sensor observation.
+This is enforced architecturally, not just by convention:
+`ExplorationMapper::update(const RobotPose&, const
+std::vector<RangeObservation>&)` is the class's *entire* public mutating
+surface, and neither parameter type carries any reference to
+`VirtualWorld` or its obstacle list - `RobotPose` is plain position +
+heading, `RangeObservation` is plain origin/direction/distance/maxRange/
+hit. `ExplorationMapper.hpp` never includes anything beyond
+`ExplorationMap.hpp`/`RangeObservation.hpp`/`VirtualWorld.hpp` (the last
+one purely for the `Vec3`/`RobotPose`/`TableSurface` *types*, never for
+the `VirtualWorld` *class* itself - no constructor or method of
+`ExplorationMapper` ever takes one). `tests/visual/
+ExplorationMapperTests.cpp`'s `MapperDoesNotRequireVirtualWorldReference`
+makes this a compile-time `static_assert` (`std::is_invocable_v`
+checking `update()` rejects a `VirtualWorld` argument), not merely a
+runtime behavior that could silently regress.
+
+Production observations come from a new `VirtualObstacleSensorArray::
+observations()` method (`std::array<RangeObservation, 3>`,
+FrontLeft/FrontCenter/FrontRight) that reuses the array's own existing
+private ray/AABB intersection function - the exact same one
+`readings()` already calls to drive `VirtualRobotHardware::
+obstacleDetected()` - never a second, independently-written copy of
+that math inside the mapper or anywhere else. A disabled obstacle is
+already invisible to that intersection test (skipped entirely, per its
+existing `enabled`-only convention), so a disabled obstacle naturally
+produces a `hit = false` observation, which `ExplorationMapper` traces
+identically to "genuinely nothing within range" - it has no separate
+concept of "disabled."
+
+### Occupancy-grid resolution and world/grid conversion
+
+`ExplorationMap::kCellSizeWorldUnits = 0.12F`, chosen against the actual
+demo `TableSurface` (12x12 world units, `VirtualWorld.cpp`'s
+`kTableHalfExtent = 6.0F`) rather than picked blind: 12 / 0.12 = 100
+exactly, landing at the center of the brief's own target ranges (80x80-
+120x120 cells, 0.10F-0.15F world units/cell) with zero rounding
+remainder. Grid `width()`/`height()` are still *derived* from whatever
+`TableSurface` the constructor is given (`std::lround(worldSize /
+kCellSizeWorldUnits)`, clamped to at least 1), never hardcoded to 100 -
+a future table-size change keeps working correctly, just at whatever
+cell count that produces.
+
+Coordinate convention matches this project's one existing X/Z
+convention exactly (`VisualMath.hpp`'s `forwardDirection()`/
+`rightDirection()`, heading 0 = +Z, +90 = +X): column increases with
+world X, row increases with world Z, with no mirroring or rotation
+anywhere in `worldToCell()`/`cellToWorld()`. `worldToCell()` uses a
+half-open `[min, max)` interval per axis (so every world position maps
+to exactly one cell, with no double-counted boundary), and
+`cellToWorld()` returns each cell's world-space *center*, giving a
+deterministic round-trip for any position genuinely inside bounds
+(`ExplorationMapTests.cpp`'s `CellToWorldRoundTrip`).
+
+### DDA/Bresenham choice
+
+Ray tracing uses an integer Bresenham line algorithm over grid (col,
+row) coordinates, not continuous-space micro-stepping keyed to frame
+rate or an arbitrary step size - the brief explicitly asks for this
+("do NOT use arbitrary frame-dependent micro-step sampling if
+avoidable"). Bresenham was preferred over a true DDA/voxel-traversal-
+in-continuous-space technique (e.g. Amanatides & Woo) specifically
+because it operates entirely in integer cell coordinates from the
+start, with no floating-point step-accumulation drift to reason about -
+simpler to get exactly right for a 2D grid this size (at most ~21 cells
+per ray, `VirtualDistanceSensor::kMaximumRange` 2.5F /
+`kCellSizeWorldUnits` 0.12F), and it is what makes `RepeatedObservationIsIdempotent`
+true by construction: the same `(origin, endpoint)` pair always walks
+the exact same integer cell sequence, regardless of how many times or
+how often `update()` runs. A ray's endpoint is excluded from the
+Free-marking pass and marked `Occupied` separately (only when `hit` is
+true) - never both on the same cell in the same call, though this is
+harmless either way under `ExplorationMap`'s own Occupied-wins
+precedence.
+
+**Occupancy precedence**: `Occupied > Free > Unknown`, and once a cell
+is `Occupied`, `ExplorationMap`'s public API (`markFree()`/
+`markOccupied()`) can never move it back to `Free`/`Unknown` - only a
+full-grid `setCells()` replacement (`ExplorationMapStorage::load()`'s
+own job) can. A conservative choice, explicitly sanctioned by the brief
+("For V1, conservative Occupied precedence is acceptable") over a more
+sophisticated confidence-decay/re-clearing scheme: a real obstacle
+should never be erased from the map merely because a later ray grazed
+past its edge at an angle that technically traced through the same
+cell before entering it.
+
+**Robot footprint**: marked `Free` every `update()` call via a rotated-
+rectangle point-containment test (candidate cells within a small
+bounding search radius, each projected into the robot's own local
+forward/right frame and checked against half-`kBodyWidth`/half-
+`kBodyLength`) - deliberately not a circle (brief: "do NOT paint a huge
+circle around the robot"), and deliberately not `RobotCollision`'s own
+collision radius (a different, unrelated concept - collision uses a
+conservative *enclosing* circle specifically so it needs no heading;
+the footprint here needs the *exact* rectangle, since the whole point
+is not to over-reveal cells the body does not actually occupy).
+
+### Trail sampling distance
+
+`CoverageTrail::kTrailSampleDistanceWorldUnits = 0.15F` - close to
+`ExplorationMap::kCellSizeWorldUnits` (0.12F) so the trail's visual
+density roughly matches the map's own grid resolution: dense enough to
+read as a continuous line at this project's scale, sparse enough that a
+multi-minute Explore/Return Home session does not accumulate an
+unbounded point count. Distance-only sampling (heading is never read)
+is what makes `TurningWithoutTranslationDoesNotSpam` true - turning in
+place changes only `headingDegrees`, so position-based distance stays
+at 0 and no new point is ever appended no matter how many `update()`
+calls occur.
+
+`CoverageTrail` has no `MissionTask`/FSM/Event knowledge whatsoever -
+`main3d.cpp` calls `coverageTrail.update(world.robotPose())`
+*unconditionally* every frame, regardless of which task or drive
+authority currently owns the wheels (Explore/`Moving`, Return Home/
+`ReturningHome`, `TableEdgeSafetyController` recovery, `ReactiveObstacleAvoidance`,
+or manual drive mode) - this is *why* Stop Task/Start Explore/Return
+Home/`HomeReached`/manual mode all naturally never clear the trail:
+there is no code path in this class that clears it except the explicit
+`clear()` method, which no production caller ever invokes.
+
+### Persistence format/version
+
+`ExplorationMapStorage` writes/reads one JSON object (nlohmann/json,
+the same library `JsonScenarioSource.cpp` already uses, `PRIVATE` to
+`robot_exploration`'s own `.cpp` - never in a public header, matching
+that existing precedent): `version` (int, currently `1`), `width`/
+`height` (int), `resolution` (float), `bounds` (`minX`/`maxX`/`minZ`/
+`maxZ`), `cells` (flat row-major int array, `0`=`Unknown`/`1`=`Free`/
+`2`=`Occupied`), and an optional `trail` (array of `{x, y, z}`).
+Compatibility is checked *before any mutation* - `version` must equal
+`kFormatVersion` exactly, and `width`/`height`/`resolution`/`bounds`
+must all match the in-memory `ExplorationMap`'s own construction (the
+resolution/bounds comparison uses a small float tolerance, 0.0001F, not
+exact equality) - a version or shape mismatch returns
+`MapLoadResult::Incompatible` and leaves the caller's map/trail
+completely untouched, never silently reinterpreted against a different
+grid. A missing file returns `MissingFile`; malformed JSON, a missing
+required field, or a cell-count mismatch against the file's own stated
+width/height all return `Corrupt` - every failure path prints exactly
+one `stderr` warning (load only happens once, at startup, so this can
+never spam per-frame) and the caller is left with whatever fresh map it
+already had.
+
+**Save policy**: both `ExplorationMap` and `CoverageTrail` carry a
+private `dirty_` flag (set only when a mutation actually changes
+something - `markFree()`/`markOccupied()` on an already-correct cell,
+or a distance-sampled `update()` that does not clear the threshold,
+never sets it), consumed via `consumeDirty()`. `main3d.cpp` accumulates
+`GetFrameTime()` into a timer and only calls `ExplorationMapStorage::
+save()` once every `kMapSaveIntervalSeconds` (5.0F) *and* only if
+either flag was actually dirty - never once per frame. One additional
+unconditional save runs after the render loop exits, before
+`CloseWindow()`, so a session ending less than 5 seconds after its last
+change is never silently lost to a clean shutdown.
+
+**Path**: `<RobotSimulator3D.exe's own directory>\runtime\maps\
+exploration_map.json`, resolved via a new `executableDirectory()`
+helper (`GetModuleFileNameA()`) - extracted out of `Renderer3D.cpp`
+(where the font-loading fix originally introduced it) into its own
+`ExecutableDirectory.hpp`/`.cpp` in `robot_visual_world`, specifically
+so both the font path and this map path share one implementation
+instead of two copies. Never a source-tree-relative path, for exactly
+the same portability reasoning as the font asset. If
+`executableDirectory()` returns empty (the OS call failed), persistence
+is skipped entirely for that session - the map still works purely
+in-memory, it just is not saved or loaded, rather than writing to a
+malformed path. `runtime/` is gitignored - generated data, never
+source-controlled.
+
+### Future physical implementation
+
+Everything in this phase reads `VirtualWorld::robotPose()` as ground
+truth - a real physical robot has no such oracle. The architecture is
+already shaped for that substitution: `ExplorationMapper::update()`
+only ever needs *a* `RobotPose` (from wherever it comes) and *a* list of
+`RangeObservation`s (from wherever they come) - swapping the simulator's
+authoritative pose for a real odometry/localization estimate, and
+`VirtualObstacleSensorArray::observations()` for a real physical range
+sensor's readings converted into the same `RangeObservation` shape,
+requires no change to `ExplorationMap`, `ExplorationMapper`,
+`CoverageTrail`, or `ExplorationMapStorage` at all - only to what
+main3d.cpp-equivalent composition code feeds them. This is deliberately
+the same boundary `IRobotHardware` already establishes for actuation
+(`SimulatedRobotHardware`/`VirtualRobotHardware`/`RealRobotHardware` all
+implement one interface); this phase does not introduce an equivalent
+formal interface for *pose estimation* specifically, since V1 has
+exactly one pose source and inventing an abstraction for a single
+implementation would be premature - a real port's first task would be
+introducing that seam.
+
+## Phase 13V human-validation fix: Home-Zone auto-return removal
+
+Human validation of the Phase 13V exploration map found that pressing `1`
+(Gezinme/Start Roam) mapped roughly 20-30% of the table before the robot
+automatically returned home - `HomeZoneMonitor`'s Phase 13U hysteresis
+trigger (`kHomeZoneExitRadius` 9.0F) was firing exactly as originally
+designed, but the *product requirement* changed once a genuine reason to
+stay out exploring existed: prematurely abandoning an in-progress
+mapping session purely because the robot is far from base defeats the
+whole point of progressive exploration.
+
+### The product decision
+
+**Distance-from-base is not inherently a safety condition.** It is a
+convenience heuristic that made sense in Phase 13U (when Roam had no
+purpose beyond demonstrating the reactive layers and there was no reason
+*not* to bring the robot home once it wandered off) and stopped making
+sense the moment Phase 13V gave Roam an actual objective (build a map)
+that distance-based interruption directly worked against. Meaningful
+reasons to end a mission remain exactly the ones that already existed
+independently of Home Zone: `BatteryCritical` (an actual resource
+constraint), an explicit user `2`/`R` request, `StopTaskRequested`, or a
+future explicit mapping-complete signal. **Cliff/table-edge safety
+already protects the tabletop boundary independently** -
+`TableEdgeSafetyController`/`VirtualCliffSensor`/`RobotCollision` are
+completely unrelated to `HomeZoneMonitor` and are not weakened by this
+change in any way; Home Zone was never a safety mechanism, only a
+convenience one.
+
+### What changed
+
+`HomeZoneMonitor.hpp`/`.cpp` and `HomeZoneMonitorTests.cpp` are
+**entirely unmodified** - the class still correctly implements the exact
+hysteresis geometry it always did, and is still compiled and unit-tested
+in isolation (12 tests, unchanged). Per the brief's own preferred option
+ordering, keeping a small, harmless, already-correct geometry component
+in the codebase (rather than deleting it) was chosen over Option A's
+"retain as inert telemetry" - once the "Ev bölgesi: İçeride/Dışarıda"
+Mission Control panel line was also removed (see "UI" below, since it no
+longer affects any behavior and would only be presentation clutter with
+no accompanying purpose), there was no remaining telemetry role either,
+so Option B ("remove entirely from production `main3d.cpp`") was the
+correct choice: only its **production wiring** was removed, in exactly
+three places:
+
+1. `main3d.cpp` no longer constructs a `HomeZoneMonitor`, no longer
+   calls its `update()` once per frame, and no longer reads
+   `kHomeZoneExitRadius` for a `telemetry.homeZoneInside` boolean (that
+   `VisualTelemetry` field was removed from `Renderer3D.hpp` entirely -
+   Sade/Ayrıntılı HUD content is otherwise unaffected).
+2. The event-source composition simplified from three nested sources
+   (`missionControl`, (`hardwareEventSource`, `homeArrivalEventSource`),
+   `homeZone`) to two (`missionControl`, (`hardwareEventSource`,
+   `homeArrivalEventSource`)) - a **wiring-only** simplification of which
+   sources `main3d.cpp` composes together, never a change to
+   `CompositePollingEventSource` itself, which remains exactly the
+   unmodified two-source-at-a-time class it always was.
+3. The Mission Control panel's "Ev bölgesi: İçeride/Dışarıda" line was
+   removed from `Renderer3D.cpp` - per the brief's own UI guidance,
+   showing a distance fact that no longer affects any behavior would only
+   be clutter, not a decision aid.
+
+`ReturnHomeReason`/`RobotStateMachine` transition semantics, `HomeNavigator`,
+`ReactiveObstacleAvoidance`, `TableEdgeSafetyController`,
+`VirtualObstacleSensorArray`, `ExplorationMap`/`ExplorationMapper`/
+`CoverageTrail`/`ExplorationMapStorage`, `DriveAuthority` priority, and
+`RobotRuntime::step()`'s single-call-per-frame contract are all completely
+unmodified - this was audited as a pure removal of one event source's
+production wiring, never touching anything downstream of "does a
+`ReturnHomeRequested` Event exist to consume."
+
+### Test regression strategy
+
+The former `MissionControlIntegrationTests.cpp` tests
+`HomeZoneClosedLoopIntegrationTest` and
+`ObstacleDuringAutomaticHomeZoneReturnIntegrationTest` asserted the OLD
+product requirement directly (that leaving the zone WOULD trigger an
+automatic return) - they were removed, not merely edited, since their
+entire premise no longer holds. In their place:
+`MissionControlIntegrationTests.cpp` gained seven new tests
+(`StartExploreDoesNotAutoReturnWhenFarFromBase`,
+`CrossingFormerHomeZoneRadiusDoesNotEmitReturnHomeRequested`,
+`RobotCanContinueExploringBeyondFormerExitRadius`,
+`UserReturnHomeStillWorks`, `BatteryCriticalReturnHomeStillWorks`,
+`StopTaskStillWorks`, `TableEdgeSafetyStillWorks`) and
+`ExplorationIntegrationTests.cpp` gained two more
+(`MappingContinuesIncreasingAfterFormerHomeZoneBoundary` and the full
+closed-loop `ExploringBeyondFormerHomeZoneContinuesMappingUntilUserRequestsReturnHome`).
+`HomeZoneMonitor::kHomeZoneExitRadius` is reused throughout these new
+tests purely as a *named reference distance* ("the boundary that used to
+trigger auto-return") - never by constructing a `HomeZoneMonitor`
+instance in either harness again.
+
+Two implementation lessons surfaced while writing the new tests
+(documented here since they were non-obvious and cost real debugging
+time): first, asserting a robot's distance-from-base is still large
+*after a long, unconstrained multi-frame drive* is fragile, since
+`TableEdgeSafetyController` recovery turning near a table boundary has no
+path memory and can legitimately carry the robot back closer to base over
+enough simulated time - the correct assertion is "distance exceeded the
+former radius at some point during the drive" (tracked live, frame by
+frame), not "distance is still large at an arbitrary later frame."
+Second, `BatteryCriticalReturnHomeStillWorks` needed to prove Navigation
+authority *genuinely* engages (not just that the FSM transitions
+correctly) - `VirtualRobotHardware` has no battery-drain simulation to
+trigger `BatteryCritical` naturally (a pre-existing, out-of-scope V1
+limitation - see `VirtualRobotHardwareTests.cpp`'s own
+`LowBatteryReturnHomeStillEndsInAbortedThroughRealEventChain`, which
+works around the same gap for a narrower FSM-only test), so this test
+adds a small, inert-unless-armed `BatteryCriticalEventSourceStub`
+(`IPollingEventSource`) into `MissionControlHarness`'s composite chain -
+test-only, never present in `main3d.cpp` - specifically so the injected
+`BatteryCritical` flows through the real `RobotRuntime::step()` ->
+`RobotController::applyState()` path (a direct
+`stateMachine.processEvent()` call, as the FSM-only precedent uses, does
+not synchronize the controller, so `HomeNavigator`'s `enabled` condition
+- gated on `hardware.currentCommand()` - would never actually become
+true).
+
+### Future direction
+
+A future phase wanting an explicit "mapping complete, come home" signal
+should introduce it as its own clearly-named `EventType`/event source
+(e.g. driven by `ExplorationMap::exploredPercentage()` crossing an
+operator-configured threshold) rather than reviving distance-from-base as
+an implicit proxy for completion - the two are not the same fact, and
+conflating them again would reintroduce this exact defect under a new
+name.
+
+## Phase 13V human-validation fix: Return Home obstacle-avoidance oscillation
+
+Human GUI validation of Return Home found a delivery-blocking defect:
+pressing `2`/`R` with an obstacle sitting near the direct line back to
+base made the robot get stuck oscillating in place near the obstacle -
+turning one way, then the other, indefinitely, with the base visible
+beyond the obstacle but never actually approached. This is exactly the
+resonance flagged as a then-unfixed V1 limitation earlier in this document
+("A real V1 limitation, discovered while testing this phase", Phase 13R
+section) - it had gone unexercised by every existing automated test
+because the Phase 13T/13U precedent
+(`ObstacleDuringReturnHomeInterruptsThenResumesNavigation`) clears its
+obstacle via a direct `world.setObstacleEnabled(0, false)` mutation
+(identical to the `O` key) rather than ever proving the robot steers
+itself around a real, permanently-enabled obstacle.
+
+### Root cause, confirmed (not assumed)
+
+Two independent facts combine to produce the oscillation:
+
+1. **`ReactiveObstacleAvoidance` (Phase 13R) released the instant the
+   forward body corridor read clear, at the robot's CURRENT heading** -
+   `forwardCorridorClear` is a fact about rotation (does a straight line
+   from here, at this heading, currently clear the obstacle's expanded
+   AABB), not about whether the robot has physically moved far enough to
+   no longer be sitting right next to the obstacle's footprint.
+2. **`HomeNavigator` recomputes its target heading fresh every single
+   frame from the robot's current pose** (by design - see its own Phase
+   13T docs above; this is what allows a Manual/Safety interruption to be
+   resumed correctly from a new pose with zero extra bookkeeping) - it has
+   no memory of the avoidance turn that just happened, and no obstacle
+   awareness of its own.
+
+Because avoidance's `TurnAway` phase is pure in-place rotation
+(`v = (vRight + vLeft) / 2 = (-k + k) / 2 = 0` exactly, per
+`DifferentialDrive`'s own equations - see the Phase 13P section above),
+the robot's POSITION never changes while turning. The instant the
+corridor happens to read clear at the new heading, avoidance released,
+and `HomeNavigator` - driven every frame - immediately recomputed a target
+heading back toward base's raw direction from that same, unmoved,
+position: for an obstacle sitting close to the direct line, this new
+target very plausibly re-enters the obstacle's detection range almost
+immediately, re-triggering avoidance. Confirmed empirically, not just by
+code audit: a temporary build with the OLD two-phase latch logic
+(identical new 5-argument `update()`/`wheelSpeeds()` signatures, so no
+other file needed to change) was substituted in behind the new regression
+test below, and the test failed exactly as predicted -
+`ASSERT_TRUE(everAdvanceClear)` failed because the old design has no
+concept of a physical-bypass phase at all, so the tracking variable was
+never set true across the full test run.
+
+### The fix: `ReactiveObstacleAvoidance` becomes a three-phase incident lifecycle
+
+`ReactiveObstacleAvoidance` (`include/robot/visual/ReactiveObstacleAvoidance.hpp`,
+`src/visual/ReactiveObstacleAvoidance.cpp`) is upgraded from a two-state
+latch (`Inactive` / `active`-with-one-fixed-turn-direction) to a three-
+state `AvoidanceState` incident lifecycle: `Inactive -> TurnAway ->
+AdvanceClear -> Inactive`. `HomeNavigator`, `ForwardClearanceProbe`,
+`RobotCollision`, `RobotStateMachine`, `ReturnHomeReason`,
+`MissionControlEventSource`, `HomeArrivalEventSource`, exploration
+mapping, map persistence, `DriveAuthority` priority ordering, and
+`RobotRuntime::step()`'s single-call-per-frame contract are all completely
+unmodified - the fix is entirely local to this one class plus its call
+sites (which only needed new arguments/a renamed method, never new
+decision logic of their own).
+
+- **`TurnAway`**: identical to the old latch's rotation behavior
+  (`{-kTurnWheelSpeed, +kTurnWheelSpeed}` scaled by a per-incident sign -
+  see below), except it no longer releases directly to `Inactive`.
+- **`AdvanceClear`**: entered the instant `forwardCorridorClear` becomes
+  true while `TurnAway`. Commands simple, deterministic straight-ahead
+  motion (`{kAdvanceWheelSpeed, kAdvanceWheelSpeed}`, `kAdvanceWheelSpeed
+  = 0.8F`) - a plain forward drive was chosen over a latched arc for
+  simplicity and testability, since the brief allowed either. Tracks real
+  displacement from the pose where `AdvanceClear` began
+  (`advanceStartPosition_`) and only releases to `Inactive` once BOTH the
+  corridor is still clear AND the robot has translated at least
+  `kMinimumBypassDistanceWorldUnits` - the direct fix for "corridor clear"
+  not implying "physically bypassed."
+- **`kMinimumBypassDistanceWorldUnits`**: derived, not hardcoded - `2.0F *
+  RobotCollision::kRobotCollisionRadius` (the robot's full collision
+  diameter, the same collision-footprint source of truth
+  `ForwardClearanceProbe`'s own safety margin already uses), which is
+  `1.0F` at this project's actual `RobotDimensions` - at the top of the
+  0.6F-1.0F range suggested as reasonable. Defined out-of-line in the
+  `.cpp` (not an in-class initializer) since `kRobotCollisionRadius` is
+  itself a cross-header `inline const float`, mirroring the exact
+  precedent `VirtualRobotHardware.cpp`'s own `kBodyCorridorHazardLookahead`
+  already established for the same reason.
+- **Turn-direction selection and latching**: a new `ObstacleHazardSample`
+  (per-ray left/center/right distances, a small plain struct - deliberately
+  not a dependency on `VirtualObstacleSensorArray.hpp`, preserving this
+  class' documented "no knowledge of sensor/world types" principle) is
+  read ONCE, at the exact `Inactive -> TurnAway` transition, to choose a
+  turn sign: closer obstacle on the left turns right, closer on the right
+  turns left, symmetric/no-information falls back to the original Phase
+  13R default direction (so the common single-obstacle-dead-ahead case
+  behaves identically to before). That sign is latched
+  (`latchedTurnSign_`) for the entire incident - including across a
+  `AdvanceClear -> TurnAway` re-block within the same incident - and is
+  only ever recomputed when a brand new incident begins from `Inactive`.
+  This is the direct fix for the frame-to-frame direction-flip failure
+  mode: real sensor readings fluctuate near an obstacle's edge, and the
+  old design had no direction memory at all to fluctuate against (it only
+  ever used one fixed direction), but a naive per-frame recomputation
+  would have reintroduced oscillation in exactly the same shape as the
+  bug this phase fixes.
+- **Re-block during `AdvanceClear`**: if `forwardCorridorClear` goes false
+  again mid-advance (a second, closer obstacle edge encountered),
+  `AdvanceClear -> TurnAway`, preserving (never recomputing) the latched
+  direction for that same incident.
+- **Safety/Manual interaction**: unchanged in every respect other than the
+  call-site argument list - `DriveAuthority` priority remains exactly
+  `Safety > Manual > AutonomousAvoidance > Navigation > Fsm`, arbitrated
+  centrally in `VirtualRobotHardware::applyEffectiveWheelSpeeds()`, which
+  this fix never touches. `main3d.cpp`/every test harness keeps calling
+  `avoidance.update()` every frame regardless of who currently holds
+  physical authority (the same always-latched-underneath pattern Phase
+  13R established), so Safety can still preempt an incident at any phase
+  (`TurnAway` or `AdvanceClear`) and Manual still physically wins while the
+  incident stays logically active underneath, resuming from whatever phase
+  it was in - now including a resumed `AdvanceClear` continuing to track
+  displacement from its original start position, since `advanceStartPosition_`
+  is untouched by a Manual/Safety interruption.
+- **Roam (normal exploration) regression**: `ReactiveObstacleAvoidance` is
+  one shared component - every existing Phase 13Q/13R/13S closed-loop
+  Roam-obstacle test (`ClearanceAwareAvoidanceClosedLoopThroughRealEventChain`,
+  `FullClosedLoopOffsetObstacleAvoidanceThroughRealEventChain`,
+  `AvoidanceEdgeSafetyOverridesAutonomousAndAutonomousResumesIfStillActive`)
+  still passes unmodified in behavior (only call-site argument/rename
+  updates were needed), proving Moving -> obstacle -> avoidance -> bypass
+  -> FSM-resumed-movement still works exactly as before for the non-
+  Return-Home case.
+- **Mapping regression**: `ExplorationMap`/`ExplorationMapper`/
+  `CoverageTrail`/`ExplorationMapStorage` are completely untouched:
+  `ExplorationIntegrationTests.cpp`'s existing 5 tests all still pass
+  unmodified, and the travelled bypass path naturally appears in
+  `CoverageTrail` for free, because the robot now genuinely, physically
+  moves during `AdvanceClear` - no special-cased mapping logic was needed
+  or added.
+
+### New deterministic regression test
+
+`VirtualRobotHardwareTests.cpp` gains
+`ReturnHomeBypassesObstacleOnDirectPathWithoutOscillating`: the real
+production stack end to end (`VirtualWorld`, `VirtualRobotHardware`,
+`HardwareEventSource`, `[DemoCommandSource + ReturnHomeRequestSource]` /
+`[HardwareEventSource + HomeArrivalEventSource]` nested via
+`CompositePollingEventSource` exactly like `main3d.cpp`, `RobotRuntime`,
+`RobotStateMachine`, `RobotController`, `ReactiveObstacleAvoidance`,
+`ForwardClearanceProbe`, `VirtualObstacleSensorArray`, `HomeNavigator`,
+`TableEdgeSafetyController`/`VirtualCliffSensor`), robot starting well
+away from base with an obstacle placed squarely on the direct line to
+base - **the obstacle stays enabled for the entire test**, deliberately
+never toggled off, unlike the older Phase 13T/13U precedent. Asserts, over
+the whole run: avoidance genuinely activates and enters `TurnAway`
+(proven through real `DriveAuthority` arbitration, not just
+`avoidance.active()`); the latched turn direction never flips within a
+continuous incident; `AdvanceClear` is entered and the robot travels at
+least `kMinimumBypassDistanceWorldUnits` while in it; avoidance eventually
+releases and Navigation authority resumes afterward, still within the
+same Return Home mission; distance to base is strictly lower after the
+bypass than when the mission started; the robot is never stuck within a
+0.05F position radius for 100+ consecutive frames (the direct anti-
+oscillation guarantee); no collision penetration occurs; and the mission
+eventually reaches `Ready` via the real `HomeArrivalEventSource` edge.
+
+### Ayrıntılı HUD telemetry
+
+`Renderer3D`'s Ayrıntılı (detailed) panel gains one line, "Kaçınma
+durumu: Kapalı / Engelden Dönüyor / Engeli Geçiyor" (`ReactiveObstacleAvoidance::state()`,
+translated via a new `turkishText(AvoidanceState)` overload in
+`TurkishText.hpp`, following that header's own established `main3d.cpp`-
+only enum-to-Turkish-text boundary rule). Sade (simple) mode is
+deliberately unchanged - this is diagnostic detail, not part of the small
+high-value operational summary that mode is scoped to.
+
+### Known limitation after this fix
+
+This remains V1 reactive local-obstacle bypass, not path planning - a
+single obstacle (or several, provided each individually resolves before
+the next is encountered) is handled, but a genuine cul-de-sac (two or
+more obstacles arranged so that every bypass direction re-encounters
+another obstacle before `AdvanceClear` can complete) is not guaranteed to
+resolve, and full maze-solving was explicitly out of scope for this fix.
+This is not a new limitation introduced here - it was already implied by
+"V1 reactive navigation only... NOT global path planning" - only now
+precisely characterized now that the single-obstacle case this fix
+targets is confirmed to actually converge.

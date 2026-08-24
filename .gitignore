@@ -6,6 +6,14 @@ out/
 logs/
 reports/
 
+# Phase 13V: RobotSimulator3D's persisted exploration map/trail
+# (runtime/maps/exploration_map.json, resolved next to the executable at
+# runtime - see ExecutableDirectory.hpp) - generated data, not source.
+# Already covered by build/ above for the normal build/Debug/runtime/...
+# location; listed explicitly too in case the executable is ever run from
+# elsewhere inside the repo.
+runtime/
+
 # CMake
 CMakeFiles/
 CMakeCache.txt

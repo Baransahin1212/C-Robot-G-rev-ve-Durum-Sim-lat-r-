@@ -147,6 +147,30 @@ Vec3 VirtualObstacleSensorArray::rayOrigin(ObstacleRayPosition position) const
     return Vec3{center.x + (right.x * sign * lateralOffset), center.y, center.z + (right.z * sign * lateralOffset)};
 }
 
+std::array<RangeObservation, 3> VirtualObstacleSensorArray::observations() const
+{
+    const Vec3 direction = rayDirection();
+    constexpr ObstacleRayPosition kPositions[3] = {ObstacleRayPosition::FrontLeft, ObstacleRayPosition::FrontCenter,
+                                                     ObstacleRayPosition::FrontRight};
+
+    std::array<RangeObservation, 3> result{};
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+        const Vec3 origin = rayOrigin(kPositions[i]);
+        // Reuses the exact same free function readings() itself calls -
+        // never a second copy of the ray/AABB slab test.
+        const std::optional<float> hitDistance = distanceToNearestObstacleAlongRay(origin, direction, world_);
+
+        RangeObservation& observation = result[i];
+        observation.origin = origin;
+        observation.direction = direction;
+        observation.maxRange = VirtualDistanceSensor::kMaximumRange;
+        observation.hit = hitDistance.has_value();
+        observation.distance = hitDistance.value_or(VirtualDistanceSensor::kMaximumRange);
+    }
+    return result;
+}
+
 ObstacleSensorArrayReadings VirtualObstacleSensorArray::readings() const
 {
     const Vec3 direction = rayDirection();

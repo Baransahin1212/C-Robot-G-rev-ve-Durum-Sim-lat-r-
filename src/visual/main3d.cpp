@@ -1,4 +1,7 @@
+#include <array>
 #include <cmath>
+#include <string>
+#include <vector>
 
 #include "raylib.h"
 
@@ -8,13 +11,18 @@
 #include "robot/RobotRuntime.hpp"
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/visual/CoverageTrail.hpp"
+#include "robot/visual/ExecutableDirectory.hpp"
+#include "robot/visual/ExplorationMap.hpp"
+#include "robot/visual/ExplorationMapStorage.hpp"
+#include "robot/visual/ExplorationMapper.hpp"
 #include "robot/visual/ForwardClearanceProbe.hpp"
 #include "robot/visual/HomeArrivalEventSource.hpp"
 #include "robot/visual/HomeNavigator.hpp"
-#include "robot/visual/HomeZoneMonitor.hpp"
 #include "robot/visual/ManualDriveInput.hpp"
 #include "robot/visual/MissionControlEventSource.hpp"
 #include "robot/visual/MissionTask.hpp"
+#include "robot/visual/RangeObservation.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
@@ -37,6 +45,25 @@ constexpr int kTargetFps = 60;
 // deterministic UP/DOWN/LEFT/RIGHT behavior table in
 // docs/technical-decisions.md (Phase 13P) exactly.
 constexpr float kManualWheelSpeed = 1.0F;
+
+// Phase 13V: how often the exploration map/trail are saved to disk while
+// dirty - a periodic timer, not once per frame (this phase's own brief,
+// "keep filesystem writes low"). A final unconditional save also runs on
+// clean shutdown (see the end of main() below), so this interval only
+// bounds how much of an in-progress session could be lost to a non-clean
+// exit (window-manager kill, crash, power loss) - 5 seconds is a
+// reasonable bound for a desktop simulator without being a noticeable
+// per-write cost.
+constexpr float kMapSaveIntervalSeconds = 5.0F;
+
+// Phase 13V: where the persisted exploration map/trail live, relative to
+// RobotSimulator3D.exe's own directory (see ExecutableDirectory.hpp) -
+// never the source tree, so a checkout built on another machine still
+// finds/creates its own map correctly. "runtime/" (not "assets/", which
+// is read-only shipped content) signals this is generated data - see
+// .gitignore.
+constexpr const char* kMapStorageRelativePath = "\\runtime\\maps\\exploration_map.json";
+
 } // namespace
 
 // Thin application-lifecycle composition root for the 3D visual simulator:
@@ -80,19 +107,27 @@ constexpr float kManualWheelSpeed = 1.0F;
 // Home implementations (`2` and `R` are literally the same call). Task
 // status (`MissionTask` - None/Roam/ReturnHome) is derived fresh every
 // frame from RobotStateMachine's own public state
-// (MissionTask.hpp::deriveMissionTask()) - it is presentation/Home-Zone-
-// activation context only, never a second authority over the robot.
-// HomeZoneMonitor is an automatic convenience trigger: while the task is
-// Roam, it watches distance from base with hysteresis (exit/rearm radii)
-// and emits its own ReturnHomeRequested the instant the robot wanders too
-// far, through the exact same IPollingEventSource/FSM path as every
-// manual request - see docs/technical-decisions.md (Phase 13U) for the
-// full audit, the nested event-source priority
-// (MissionControl > HardwareEventSource > HomeArrivalEventSource >
-// HomeZoneMonitor), and a real V1 limitation this phase's own testing
-// discovered (reactive avoidance can resonate against HomeNavigator's
-// continuous re-aiming for a centered obstacle sitting exactly on the
-// return path).
+// (MissionTask.hpp::deriveMissionTask()) - it is presentation context
+// only, never a second authority over the robot.
+//
+// Phase 13V human-validation fix: `HomeZoneMonitor` is deliberately NOT
+// wired into this executable's event-source chain (it was, in Phase
+// 13U). Human validation of Phase 13V's exploration map found that
+// automatic Home-Zone-triggered Return Home was cutting normal
+// exploration off at roughly 20-30% mapped - the user clarified that
+// distance-from-base alone is not a meaningful reason to abandon an
+// in-progress exploration/mapping session (unlike `BatteryCritical`, an
+// explicit `2`/`R` request, or a future explicit mapping-complete
+// signal). `HomeZoneMonitor` itself is unmodified and still compiled/
+// tested (`HomeZoneMonitorTests.cpp`) as a small, self-contained,
+// correctly-behaving geometry component - only its production wiring
+// here was removed, since emitting `ReturnHomeRequested` was its one and
+// only responsibility (see docs/technical-decisions.md, "Phase 13V
+// human-validation fix," for the full audit and rationale). The event-
+// source chain below is correspondingly one level flatter than Phase
+// 13U's own nested nested (MissionControl, (Hardware, HomeArrival),
+// HomeZone) - this is a wiring simplification, not a redesign of
+// `CompositePollingEventSource` itself, which is unmodified.
 int main()
 {
     InitWindow(kWindowWidth, kWindowHeight, "Robot Simulator 3D");
@@ -129,29 +164,20 @@ int main()
     robot::visual::HomeNavigator homeNavigator;
     robot::visual::HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
 
-    // HomeZoneMonitor (Phase 13U) - the automatic "come home" trigger for
-    // Roam: watches distance from world.basePlatform() with hysteresis
-    // while the current task is Roam, and produces its own
-    // ReturnHomeRequested the instant the robot wanders outside the exit
-    // radius - through this same IPollingEventSource path, never a direct
-    // Navigation call or FSM mutation (see HomeZoneMonitor.hpp).
-    robot::visual::HomeZoneMonitor homeZone;
-
     // CompositePollingEventSource only combines two sources at a time
-    // (Phase 13J, unmodified), so the four effective sources this phase
-    // needs are composed via NESTING rather than rewriting that class.
-    // Priority (Phase 13U, highest first): explicit Mission Control
-    // commands > hardware obstacle/sensor events > HomeReached arrival >
-    // automatic Home Zone return request. Rationale: explicit user
-    // commands must never be starved by an automatic trigger; safety-
-    // relevant hardware perception must never be lost underneath a
-    // same-frame HomeReached/Home-Zone readiness; HomeReached completes an
-    // already-active Return Home, which outranks a brand new automatic
-    // request from the same or a different mission. See
-    // docs/technical-decisions.md (Phase 13U) for the full audit.
+    // (Phase 13J, unmodified), so the three effective sources this phase
+    // needs are still composed via nesting - one level flatter than
+    // Phase 13U's own three-level nest, though, since HomeZoneMonitor is
+    // no longer part of this chain at all (Phase 13V human-validation
+    // fix - see this file's own docs above and
+    // docs/technical-decisions.md for the full removal rationale).
+    // Priority (highest first): explicit Mission Control commands >
+    // hardware obstacle/sensor events > HomeReached arrival. Rationale:
+    // explicit user commands must never be starved by an automatic
+    // event; safety-relevant hardware perception must never be lost
+    // underneath a same-frame HomeReached readiness.
     robot::CompositePollingEventSource innerHardwareGroup(hardwareEventSource, homeArrivalEventSource);
-    robot::CompositePollingEventSource innerAutoGroup(innerHardwareGroup, homeZone);
-    robot::CompositePollingEventSource compositeSource(missionControl, innerAutoGroup);
+    robot::CompositePollingEventSource compositeSource(missionControl, innerHardwareGroup);
     robot::RobotStateMachine stateMachine;
     robot::RobotController controller(hardware);
     robot::RobotRuntime runtime(compositeSource, stateMachine, controller);
@@ -204,6 +230,45 @@ int main()
     // behavior on its own - it only feeds Renderer3D's VisualTelemetry,
     // exactly like `sensor` above.
     robot::visual::VirtualObstacleSensorArray obstacleSensorArray(world);
+
+    // Phase 13V: progressive robot-vacuum-style exploration map. Grid
+    // covers world.tableSurface() exactly (ExplorationMap's own
+    // constructor derives width/height/resolution from it - never
+    // hardcoded here). ExplorationMapper is the ONLY thing allowed to
+    // mutate explorationMap's cells, and it is only ever fed real sensor
+    // observations (obstacleSensorArray.observations() below) - never
+    // world.obstacles() directly; see ExplorationMapper.hpp's own docs.
+    // CoverageTrail independently records the actual travelled path,
+    // regardless of which task/authority is currently driving the
+    // wheels.
+    robot::visual::ExplorationMap explorationMap(world.tableSurface());
+    robot::visual::ExplorationMapper explorationMapper(explorationMap);
+    robot::visual::CoverageTrail coverageTrail;
+
+    // Runtime-relative persistence path (never a source-tree path - see
+    // ExecutableDirectory.hpp/kMapStorageRelativePath's own docs above).
+    // An empty executableDirectory() (the OS call failed for some reason)
+    // degrades to "no persistence this session" rather than writing to a
+    // malformed relative-looking-but-actually-drive-root path - the map
+    // still works in memory for the session, it just is not saved/loaded.
+    const std::string exeDirectory = robot::visual::executableDirectory();
+    const bool mapPersistenceAvailable = !exeDirectory.empty();
+    const std::string mapStoragePath = exeDirectory + kMapStorageRelativePath;
+
+    // First run (no compatible file yet) vs. subsequent run (a
+    // compatible map was found) - captured once at startup, drives the
+    // map panel's "Oluşturuluyor"/"Yüklendi" status line for the whole
+    // session (Phase 13V brief). The map is never read-only after
+    // loading: explorationMapper keeps updating explorationMap normally
+    // regardless of how this came out.
+    bool mapWasLoadedAtStartup = false;
+    if (mapPersistenceAvailable)
+    {
+        const robot::visual::MapLoadResult loadResult =
+            robot::visual::ExplorationMapStorage::load(mapStoragePath, explorationMap, &coverageTrail);
+        mapWasLoadedAtStartup = (loadResult == robot::visual::MapLoadResult::Loaded);
+    }
+    float mapSaveTimer = 0.0F;
 
     // Camera mouse capture starts enabled, so the mouse immediately
     // drives the camera without an extra keypress; DisableCursor() also
@@ -378,26 +443,42 @@ int main()
         // and the HUD telemetry always agree on the exact same value.
         const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
 
-        // Advance the avoidance latch (Phase 13R) - runs every frame,
-        // regardless of manual drive mode, so it stays in sync with the
-        // real FSM/sensor/clearance state and is correctly restored the
-        // instant manual mode ends (see docs/technical-decisions.md,
-        // Phase 13R, "manual priority while latched"). The trigger
-        // condition is unchanged from Phase 13Q (section 7): avoidance
-        // enabled, the FSM is actually WaitingForObstacleClear, and the
-        // forward sensor still reports the obstacle. This never calls
-        // stateMachine.processEvent()/handleEvent() or injects
-        // ObstacleDetected/ObstacleCleared itself - HardwareEventSource
-        // observes the sensor's real true -> false edge naturally, once
-        // the turn below has rotated the sensor ray far enough away from
-        // the obstacle. What changed from Phase 13Q: the FSM's real
-        // return to Moving on that edge no longer by itself releases the
-        // override - the latch stays active until forwardCorridorClear is
-        // also true.
+        // Phase 13V human-validation fix: read the three-ray obstacle
+        // perception array once, here, BEFORE avoidance.update() below -
+        // it now needs per-side hazard distances (to choose a stable turn
+        // direction), not just the aggregate obstacleDetected() bool.
+        // Reused verbatim for the HUD ray telemetry further below (never
+        // recomputed a second time this frame), matching this loop's own
+        // established "compute once, reuse" convention (e.g. cliffReadings).
+        const robot::visual::ObstacleSensorArrayReadings obstacleRays = obstacleSensorArray.readings();
+
+        // Advance the avoidance state machine (Phase 13R latch; Phase 13V
+        // human-validation fix upgraded it to a three-phase
+        // TurnAway/AdvanceClear/Inactive incident lifecycle - see
+        // ReactiveObstacleAvoidance's own class docs for the full "why").
+        // Runs every frame, regardless of manual drive mode, so it stays
+        // in sync with the real FSM/sensor/clearance state and is
+        // correctly restored the instant manual mode ends (see
+        // docs/technical-decisions.md, Phase 13R, "manual priority while
+        // latched"). The trigger condition is unchanged from Phase 13Q
+        // (section 7): avoidance enabled, the FSM is actually
+        // WaitingForObstacleClear, and the forward sensor still reports
+        // the obstacle - this only ever starts a NEW incident from
+        // Inactive; once TurnAway/AdvanceClear are in progress, the
+        // incident's own forwardCorridorClear/displacement bookkeeping
+        // drives every further transition (see update()'s own docs).
+        // This never calls stateMachine.processEvent()/handleEvent() or
+        // injects ObstacleDetected/ObstacleCleared itself -
+        // HardwareEventSource observes the sensor's real true -> false
+        // edge naturally, once TurnAway has rotated the sensor ray far
+        // enough away from the obstacle.
         const bool triggerAvoidance = avoidanceEnabled &&
                                        stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
                                        hardware.obstacleDetected();
-        avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear);
+        const robot::visual::ObstacleHazardSample avoidanceHazard{
+            obstacleRays.frontLeftDistance, obstacleRays.frontCenterDistance, obstacleRays.frontRightDistance};
+        avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear, world.robotPose(),
+                          avoidanceHazard);
 
         // Compute this frame's cliff-sensor readings and advance the
         // table-edge safety recovery latch (Phase 13S) - runs
@@ -434,22 +515,14 @@ int main()
 
         // Phase 13U: this frame's user-facing task status - derived
         // fresh from RobotStateMachine's own public state, never a second
-        // authority over the robot (see MissionTask.hpp). Drives both the
-        // Mission Control HUD panel and HomeZoneMonitor's activation
-        // condition below.
+        // authority over the robot (see MissionTask.hpp). Drives the
+        // Mission Control HUD panel below. Phase 13V human-validation
+        // fix: no longer also drives a HomeZoneMonitor activation
+        // condition - that automatic distance-based trigger was removed
+        // from this executable entirely (see this file's own docs
+        // above).
         const robot::visual::MissionTask missionTask =
             robot::visual::deriveMissionTask(stateMachine.currentState(), stateMachine.returnHomeReason());
-
-        // Advance HomeZoneMonitor (Phase 13U) - runs every frame,
-        // unconditionally, exactly like HomeNavigator's own update()
-        // above; only actually evaluates distance while missionTask is
-        // Roam (see HomeZoneMonitor::update()'s own docs for why it must
-        // freeze - not merely suppress its trigger - the rest of the
-        // time). Its own pollEvent() (polled by runtime.step() next
-        // frame, via the composite chain) is the ONLY way a Home-Zone
-        // excursion ever reaches the FSM - never a direct Navigation call
-        // or RobotState mutation.
-        homeZone.update(world.robotPose(), world.basePlatform(), missionTask == robot::visual::MissionTask::Roam);
 
         // Apply drive authority (Safety > Manual > AutonomousAvoidance >
         // Navigation > Fsm - see VirtualRobotHardware::driveAuthority()).
@@ -479,7 +552,7 @@ int main()
         // without needing to be re-triggered.
         if (avoidance.active())
         {
-            const robot::visual::WheelSpeeds turnSpeeds = avoidance.avoidanceWheelSpeeds();
+            const robot::visual::WheelSpeeds turnSpeeds = avoidance.wheelSpeeds();
             hardware.setAutonomousWheelSpeeds(turnSpeeds.left, turnSpeeds.right);
         }
         else if (hardware.autonomousOverrideActive())
@@ -541,6 +614,50 @@ int main()
             hardware.update(GetFrameTime());
         }
 
+        // Phase 13V: the robot's physical pose and this frame's real
+        // sensor observations are both final for this frame now (after
+        // hardware.update() above, before rendering below) - exactly
+        // where the phase brief says to update the map. Reuses
+        // VirtualObstacleSensorArray's own existing ray/AABB math
+        // (obstacleSensorArray.observations(), Phase 13V) - never a
+        // second, duplicated implementation inside ExplorationMapper.
+        // Runs unconditionally every frame (even while worldPaused, or
+        // regardless of which task/authority currently drives the
+        // wheels) - both explorationMapper.update() and
+        // coverageTrail.update() are idempotent/distance-sampled
+        // respectively, so re-observing an unchanged pose is harmless,
+        // and this is the one call site that keeps the map/trail
+        // genuinely representing "everywhere the robot has physically
+        // been," matching the Explore/Return Home/Safety-recovery/
+        // Avoidance/manual-drive trail-lifecycle requirement (Phase 13V
+        // brief) with no per-task branching needed.
+        {
+            const std::array<robot::visual::RangeObservation, 3> rayObservations = obstacleSensorArray.observations();
+            const std::vector<robot::visual::RangeObservation> observationList(rayObservations.begin(),
+                                                                                 rayObservations.end());
+            explorationMapper.update(world.robotPose(), observationList);
+        }
+        coverageTrail.update(world.robotPose());
+
+        // Periodic save-when-dirty (Phase 13V brief, "do NOT write every
+        // frame") - both consumeDirty() calls always run (never short-
+        // circuited), so a dirty trail is never missed merely because
+        // the map happened to be clean this interval, or vice versa.
+        if (mapPersistenceAvailable)
+        {
+            mapSaveTimer += GetFrameTime();
+            if (mapSaveTimer >= kMapSaveIntervalSeconds)
+            {
+                mapSaveTimer = 0.0F;
+                const bool mapDirty = explorationMap.consumeDirty();
+                const bool trailDirty = coverageTrail.consumeDirty();
+                if (mapDirty || trailDirty)
+                {
+                    robot::visual::ExplorationMapStorage::save(mapStoragePath, explorationMap, &coverageTrail);
+                }
+            }
+        }
+
         robot::visual::VisualTelemetry telemetry{};
         // Final UI/HUD polish: these six fields are now populated through
         // TurkishText.hpp's turkishText() overloads instead of each type's
@@ -567,8 +684,10 @@ int main()
         telemetry.driveAuthorityText = robot::visual::turkishText(hardware.driveAuthority());
         telemetry.collidedLastUpdate = hardware.collidedLastUpdate();
         telemetry.batteryPercent = hardware.batteryLevelPercent();
+        telemetry.mapWasLoaded = mapWasLoadedAtStartup;
         telemetry.avoidanceEnabled = avoidanceEnabled;
         telemetry.avoidanceActive = avoidance.active();
+        telemetry.avoidanceStateText = robot::visual::turkishText(avoidance.state());
         telemetry.forwardClearanceClear = forwardCorridorClear;
         telemetry.clearanceLookahead = robot::visual::ForwardClearanceProbe::kLookaheadDistance;
         telemetry.cliffFrontLeft = cliffReadings.frontLeft;
@@ -586,7 +705,9 @@ int main()
         // never recomputed twice). bodyCorridorObstacleHazard mirrors the
         // exact same hazard signal hardware.obstacleDetected() itself ORs
         // in - see VirtualRobotHardware::bodyCorridorObstacleHazard().
-        const robot::visual::ObstacleSensorArrayReadings obstacleRays = obstacleSensorArray.readings();
+        // obstacleRays itself was already computed once, earlier this
+        // frame, before avoidance.update() (Phase 13V human-validation
+        // fix) - reused here, never recomputed twice.
         telemetry.obstacleRayLeftOrigin =
             obstacleSensorArray.rayOrigin(robot::visual::ObstacleRayPosition::FrontLeft);
         telemetry.obstacleRayRightOrigin =
@@ -610,12 +731,17 @@ int main()
 
         // Phase 13U: Mission Control panel telemetry - main3d computes
         // task status and base distance directly (the same simple
-        // dx/dz-from-pose formula HomeNavigator/HomeZoneMonitor each
-        // independently use internally for their own decisions); this is
-        // a third, presentation-only computation purely for display,
-        // exactly like "Position: X/Z" above already reads
-        // world.robotPose() directly rather than through another
-        // component.
+        // dx/dz-from-pose formula HomeNavigator itself independently uses
+        // internally for its own decisions); this is a second,
+        // presentation-only computation purely for display, exactly like
+        // "Position: X/Z" above already reads world.robotPose() directly
+        // rather than through another component. Phase 13V human-
+        // validation fix: no longer also computes a Home-Zone inside/
+        // outside boolean - that telemetry field and its Mission Control
+        // panel line were removed along with HomeZoneMonitor's production
+        // wiring, since a distance-only fact that no longer affects
+        // behavior would only be presentation clutter (see this file's
+        // own docs above).
         telemetry.missionTaskText = robot::visual::turkishText(missionTask);
         telemetry.returningHomeTask = missionTask == robot::visual::MissionTask::ReturnHome;
         {
@@ -625,14 +751,23 @@ int main()
             const float dz = basePosition.z - robotPosition.z;
             telemetry.baseDistance = std::sqrt((dx * dx) + (dz * dz));
         }
-        telemetry.homeZoneInside = telemetry.baseDistance <= robot::visual::HomeZoneMonitor::kHomeZoneExitRadius;
 
         // Camera updates (mouse-look and CAMERA_FREE's own arrow-key
         // pitch/yaw) are suppressed while manual drive mode is active -
         // see the manualDriveMode comment above. cameraCaptured still
         // governs cursor capture/release via TAB independently of this.
         const bool updateCamera = cameraCaptured && !manualDriveMode;
-        renderer.renderFrame(world, updateCamera, telemetry);
+        renderer.renderFrame(world, updateCamera, telemetry, explorationMap, coverageTrail);
+    }
+
+    // Phase 13V: one final unconditional save on clean shutdown (this
+    // phase's own brief, "save... on clean application shutdown") -
+    // regardless of the periodic dirty-check timer above, so a session
+    // that ends less than kMapSaveIntervalSeconds after its last change
+    // is never silently lost.
+    if (mapPersistenceAvailable)
+    {
+        robot::visual::ExplorationMapStorage::save(mapStoragePath, explorationMap, &coverageTrail);
     }
 
     CloseWindow();

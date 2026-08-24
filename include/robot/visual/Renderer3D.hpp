@@ -5,6 +5,8 @@
 
 #include "raylib.h"
 
+#include "robot/visual/CoverageTrail.hpp"
+#include "robot/visual/ExplorationMap.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
 namespace robot::visual
@@ -114,6 +116,15 @@ struct VisualTelemetry
     // returned to Moving - directly visible in the HUD.
     bool avoidanceActive = false;
 
+    // Phase 13V human-validation fix: already-formatted, Turkish
+    // presentation text for ReactiveObstacleAvoidance::state() - "Kapalı"/
+    // "Engelden Dönüyor"/"Engeli Geçiyor" (Inactive/TurnAway/AdvanceClear),
+    // mirroring edgeRecoveryStateText's own already-translated-string
+    // pattern below. Ayrıntılı (detailed) HUD only, matching every other
+    // diagnostic-only field on this struct; Renderer3D never has any
+    // notion of the avoidance state machine itself.
+    std::string_view avoidanceStateText;
+
     // Phase 13R: this frame's ForwardClearanceProbe::isForwardCorridorClear()
     // reading - true when the robot's physical body has a safe forward
     // corridor along its current heading, independent of (and generally
@@ -220,13 +231,16 @@ struct VisualTelemetry
 
     // Phase 13U: Mission Control panel telemetry - already-formatted
     // MissionTask text ("NONE"/"ROAM"/"RETURN HOME", see
-    // MissionTask.hpp::toString()), whether the robot is currently within
-    // HomeZoneMonitor's own exit radius, and the live distance to base.
-    // Renderer3D never derives task status or Home Zone membership
-    // itself - both are computed once in main3d.cpp and displayed
-    // verbatim, exactly like every other VisualTelemetry field.
+    // MissionTask.hpp::toString()) and the live distance to base.
+    // Renderer3D never derives task status itself - it is computed once
+    // in main3d.cpp and displayed verbatim, exactly like every other
+    // VisualTelemetry field. Phase 13V human-validation fix: this struct
+    // no longer carries a Home-Zone inside/outside boolean -
+    // HomeZoneMonitor's production wiring (and its Mission Control panel
+    // line) were removed entirely, since distance-from-base no longer
+    // affects any behavior a user would need this fact to anticipate
+    // (see main3d.cpp's own docs and docs/technical-decisions.md).
     std::string_view missionTaskText;
-    bool homeZoneInside = true;
     float baseDistance = 0.0F;
 
     // Final UI/HUD polish: true exactly when missionTaskText corresponds
@@ -246,6 +260,16 @@ struct VisualTelemetry
     // simulator), wired through now so the simple/Sade HUD's "Batarya"
     // line reflects the real getter rather than a hardcoded display value.
     int batteryPercent = 100;
+
+    // Phase 13V: true for the whole session if a compatible persisted map
+    // was found and loaded at startup (main3d.cpp's one
+    // ExplorationMapStorage::load() call) - false if this session started
+    // a fresh, all-Unknown map. Drives the map panel's "Oluşturuluyor"
+    // (fresh)/"Yüklendi" (loaded) status line; never re-derived from
+    // exploredPercentage() or any other runtime state, matching this
+    // phase's own brief ("Durum" reflects how the SESSION started, not
+    // whether the map is read-only afterward - it never is).
+    bool mapWasLoaded = false;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,
@@ -291,11 +315,30 @@ public:
     // class never needs to know any of those types. Call exactly once per
     // iteration of the main render loop, between InitWindow() and
     // CloseWindow().
-    void renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry);
+    // `map`/`trail` (Phase 13V) are passed the same way `world` already
+    // is - a whole plain-data object by const reference, never flattened
+    // into VisualTelemetry (see ExplorationMap.hpp/CoverageTrail.hpp's
+    // own docs and this class's docs above for why that is
+    // architecturally fine for read-only data containers like these,
+    // exactly like VirtualWorld itself).
+    void renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry,
+                      const ExplorationMap& map, const CoverageTrail& trail);
 
 private:
     void drawScene(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
     void drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
+
+    // Phase 13V: the bottom-right inset 2D exploration-map panel - top-
+    // down, fixed orientation (never rotates with the robot), drawn from
+    // `map`'s own cell states only. Deliberately never reads
+    // `world.obstacles()` - the whole point of progressive exploration is
+    // that this panel can only ever show what `map` itself already
+    // knows; see ExplorationMapper.hpp for the one legitimate way `map`
+    // learns anything. `world` is read only for robotPose()/
+    // basePlatform() - the robot/base markers' own live positions, never
+    // obstacle ground truth.
+    void drawExplorationMapPanel(const VirtualWorld& world, const ExplorationMap& map, const CoverageTrail& trail,
+                                  const VisualTelemetry& telemetry) const;
 
     // Phase 13U: the compact Mission Control panel (task status, 1/2/3/R
     // key hints, Home Zone status) - deliberately separate from drawHud()'s
@@ -321,7 +364,7 @@ private:
     // Final Turkish-font polish: the Turkish-capable Unicode font loaded
     // in the constructor (assets/fonts/anonymous_pro_bold.ttf, resolved at
     // runtime relative to this executable's own directory - see the
-    // constructor's exeDirectory() helper, CMakeLists.txt's POST_BUILD
+    // constructor's executableDirectory() call, CMakeLists.txt's POST_BUILD
     // copy step, and assets/fonts/LICENSE-AnonymousPro.txt) - replaces
     // raylib's built-in
     // default font (Unicode U+0000-U+00FF only) for every string this

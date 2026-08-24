@@ -1,9 +1,12 @@
 #include <cmath>
+#include <optional>
 
 #include <gtest/gtest.h>
 
 #include "robot/CompositePollingEventSource.hpp"
+#include "robot/Event.hpp"
 #include "robot/HardwareEventSource.hpp"
+#include "robot/IPollingEventSource.hpp"
 #include "robot/RobotController.hpp"
 #include "robot/RobotRuntime.hpp"
 #include "robot/RobotState.hpp"
@@ -17,6 +20,7 @@
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/VirtualCliffSensor.hpp"
+#include "robot/visual/VirtualObstacleSensorArray.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
@@ -24,7 +28,10 @@ namespace
 {
 
 using robot::CompositePollingEventSource;
+using robot::Event;
+using robot::EventType;
 using robot::HardwareEventSource;
+using robot::IPollingEventSource;
 using robot::ReturnHomeReason;
 using robot::RobotController;
 using robot::RobotRuntime;
@@ -43,14 +50,50 @@ using robot::visual::HomeNavigator;
 using robot::visual::HomeZoneMonitor;
 using robot::visual::MissionControlEventSource;
 using robot::visual::MissionTask;
+using robot::visual::ObstacleHazardSample;
 using robot::visual::ReactiveObstacleAvoidance;
 using robot::visual::TableEdgeSafetyController;
 using robot::visual::Vec3;
 using robot::visual::VirtualCliffSensor;
 using robot::visual::VirtualDriveCommand;
+using robot::visual::VirtualObstacleSensorArray;
 using robot::visual::VirtualRobotHardware;
 using robot::visual::VirtualWorld;
 using robot::visual::WheelSpeeds;
+
+// Test-only IPollingEventSource fake (same shape/precedent as
+// QueuePollingEventSource in CompositePollingEventSourceTests.cpp) - lets
+// BatteryCriticalReturnHomeStillWorksIntegrationTest inject one genuine
+// BatteryCritical Event through the REAL composite/RobotRuntime/
+// RobotController chain, since VirtualRobotHardware itself has no
+// battery-drain simulation to trigger this naturally (a pre-existing,
+// out-of-scope V1 limitation - see VirtualRobotHardwareTests.cpp's own
+// LowBatteryReturnHomeStillEndsInAbortedThroughRealEventChain, which uses
+// the same reasoning for a more isolated FSM-only test). Inert (always
+// returns nullopt) unless arm() is called - every other test in this file
+// never arms it, so its mere presence in the harness changes nothing
+// about their behavior.
+class BatteryCriticalEventSourceStub : public IPollingEventSource
+{
+public:
+    void arm()
+    {
+        armed_ = true;
+    }
+
+    std::optional<Event> pollEvent() override
+    {
+        if (!armed_)
+        {
+            return std::nullopt;
+        }
+        armed_ = false;
+        return Event{EventType::BatteryCritical, 0, std::nullopt};
+    }
+
+private:
+    bool armed_ = false;
+};
 
 // Disables every default demo obstacle - same convention
 // VirtualRobotHardwareTests.cpp already uses.
@@ -62,13 +105,19 @@ void disableAllObstacles(VirtualWorld& world)
     }
 }
 
-// Drives the ENTIRE real Phase 13U production stack one frame at a time,
-// in exactly main3d.cpp's own order: runtime.step() -> avoidance ->
-// table-edge safety -> HomeNavigator -> HomeZoneMonitor -> sync overrides
-// (Safety, Autonomous, Navigation) -> hardware.update(dt). Exists purely
-// to avoid repeating this ~30-line block identically in every test below
-// - it performs no decisions of its own beyond what main3d.cpp itself
-// already does.
+// Drives the ENTIRE real production stack one frame at a time, in
+// exactly main3d.cpp's own order: runtime.step() -> avoidance -> table-
+// edge safety -> HomeNavigator -> sync overrides (Safety, Autonomous,
+// Navigation) -> hardware.update(dt). Exists purely to avoid repeating
+// this ~30-line block identically in every test below - it performs no
+// decisions of its own beyond what main3d.cpp itself already does. Phase
+// 13V human-validation fix: no longer includes HomeZoneMonitor at all
+// (matching main3d.cpp's own removal - see that file's docs and
+// docs/technical-decisions.md); `batteryStub` is the one addition beyond
+// main3d.cpp's real wiring, and is TEST-ONLY - inert unless a test
+// explicitly arms it (see BatteryCriticalEventSourceStub's own docs
+// above), needed only because VirtualRobotHardware has no battery-drain
+// simulation to trigger BatteryCritical naturally.
 struct MissionControlHarness
 {
     explicit MissionControlHarness(VirtualWorld& world)
@@ -77,15 +126,16 @@ struct MissionControlHarness
         , missionControl()
         , homeNavigator()
         , homeArrivalEventSource(homeNavigator)
-        , homeZone()
+        , batteryStub()
         , innerHardwareGroup(hardwareEventSource, homeArrivalEventSource)
-        , innerAutoGroup(innerHardwareGroup, homeZone)
+        , innerAutoGroup(innerHardwareGroup, batteryStub)
         , compositeSource(missionControl, innerAutoGroup)
         , stateMachine()
         , controller(hardware)
         , runtime(compositeSource, stateMachine, controller)
         , avoidance()
         , clearanceProbe(world)
+        , obstacleSensorArray(world)
         , cliffSensor(world)
         , tableEdgeSafety()
         , avoidanceEnabled(true)
@@ -98,7 +148,7 @@ struct MissionControlHarness
     MissionControlEventSource missionControl;
     HomeNavigator homeNavigator;
     HomeArrivalEventSource homeArrivalEventSource;
-    HomeZoneMonitor homeZone;
+    BatteryCriticalEventSourceStub batteryStub;
     CompositePollingEventSource innerHardwareGroup;
     CompositePollingEventSource innerAutoGroup;
     CompositePollingEventSource compositeSource;
@@ -107,6 +157,7 @@ struct MissionControlHarness
     RobotRuntime runtime;
     ReactiveObstacleAvoidance avoidance;
     ForwardClearanceProbe clearanceProbe;
+    VirtualObstacleSensorArray obstacleSensorArray;
     VirtualCliffSensor cliffSensor;
     TableEdgeSafetyController tableEdgeSafety;
     bool avoidanceEnabled;
@@ -130,19 +181,20 @@ struct MissionControlHarness
         runtime.step();
 
         const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
+        const auto obstacleRays = obstacleSensorArray.readings();
         const bool triggerAvoidance = avoidanceEnabled &&
                                        stateMachine.currentState() == RobotState::WaitingForObstacleClear &&
                                        hardware.obstacleDetected();
-        avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear);
+        const ObstacleHazardSample avoidanceHazard{obstacleRays.frontLeftDistance, obstacleRays.frontCenterDistance,
+                                                     obstacleRays.frontRightDistance};
+        avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear, world_.robotPose(),
+                          avoidanceHazard);
 
         const CliffSensorReadings cliffReadings = cliffSensor.readings();
         tableEdgeSafety.update(cliffReadings, world_.robotPose(), world_.tableSurface());
 
         const bool navigationEnabled = hardware.currentCommand() == VirtualDriveCommand::ReturnToBase;
         const HomeNavigationOutput nav = homeNavigator.update(world_.robotPose(), world_.basePlatform(), navigationEnabled);
-
-        const bool roamActive = currentTask() == MissionTask::Roam;
-        homeZone.update(world_.robotPose(), world_.basePlatform(), roamActive);
 
         if (tableEdgeSafety.active())
         {
@@ -156,7 +208,7 @@ struct MissionControlHarness
 
         if (avoidance.active())
         {
-            const WheelSpeeds turn = avoidance.avoidanceWheelSpeeds();
+            const WheelSpeeds turn = avoidance.wheelSpeeds();
             hardware.setAutonomousWheelSpeeds(turn.left, turn.right);
         }
         else if (hardware.autonomousOverrideActive())
@@ -419,42 +471,216 @@ TEST(MissionControlIntegrationTest, StopDuringAvoidanceIntegrationTest)
     EXPECT_FALSE(h.hardware.collidedLastUpdate());
 }
 
-// --- Home-Zone closed-loop integration test ---
-TEST(MissionControlIntegrationTest, HomeZoneClosedLoopIntegrationTest)
+// ============================================================
+// Phase 13V human-validation fix: Home-Zone auto-return removal
+// regression coverage
+// ============================================================
+//
+// Replaces the former Phase 13U "HomeZoneClosedLoopIntegrationTest"/
+// "ObstacleDuringAutomaticHomeZoneReturnIntegrationTest" - those tests
+// asserted the OLD product requirement (automatic Return Home once the
+// robot left a radius around base), which human validation of Phase 13V's
+// exploration map found interrupted normal exploration prematurely (map
+// only ~20-30% built before an automatic return). The product requirement
+// changed: distance-from-base alone must never trigger Return Home.
+// HomeZoneMonitor.hpp/.cpp and HomeZoneMonitorTests.cpp are entirely
+// unmodified (the class itself still correctly implements the geometry
+// it always did) - only main3d.cpp's/this harness's PRODUCTION WIRING of
+// it was removed. `HomeZoneMonitor::kHomeZoneExitRadius`/
+// `kHomeZoneRearmRadius` are reused below purely as named reference
+// distances ("the boundary that used to trigger auto-return"), never by
+// constructing a HomeZoneMonitor instance.
+
+// 1: StartExploreDoesNotAutoReturnWhenFarFromBase
+TEST(MissionControlIntegrationTest, StartExploreDoesNotAutoReturnWhenFarFromBase)
 {
-    // Arrange: positioned on the same X as the base, 5 units away (well
-    // inside the 9.0F exit radius) and facing further away, so a plain
-    // Roam forward travel deterministically crosses the exit radius
-    // within a bounded number of frames.
+    // Arrange: same departure geometry the old Home-Zone test used -
+    // deterministically crosses the former exit radius within a bounded
+    // number of frames if it were still active.
     VirtualWorld world;
     disableAllObstacles(world);
     world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
     world.setRobotHeading(180.0F);
     MissionControlHarness h(world);
 
-    // 1-2: Start Roam through Mission Control.
     h.missionControl.requestStartRoam(h.stateMachine.currentState());
     ASSERT_EQ(h.runtime.step(), RuntimeStepResult::TransitionAccepted);
     ASSERT_EQ(h.runtime.step(), RuntimeStepResult::TransitionAccepted);
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
 
-    // 3-6: drive away until the zone naturally triggers an automatic
-    // Return Home - exactly one ReturnHomeRequested, through
-    // HomeZoneMonitor's own pollEvent(), never injected directly.
-    for (int frame = 0; frame < 3000 && h.stateMachine.currentState() == RobotState::Moving; ++frame)
+    // Act: drive far enough to genuinely cross the former exit radius -
+    // tracked live during the drive (not just checked at the end), since
+    // over a long enough unconstrained Roam, table-edge recovery turning
+    // near a boundary can legitimately carry the robot back closer to
+    // base later with no path memory - the requirement under test is
+    // "never auto-returns merely for having left," not "must still be
+    // far away at an arbitrary later frame."
+    bool everCrossedFormerRadius = false;
+    for (int frame = 0; frame < 3000; ++frame)
+    {
+        h.driveFrame();
+        ASSERT_FALSE(h.hardware.collidedLastUpdate());
+        if (h.distanceToBase() > HomeZoneMonitor::kHomeZoneExitRadius)
+        {
+            everCrossedFormerRadius = true;
+        }
+    }
+
+    // Assert: still Moving (Roam) throughout, never auto-returned, even
+    // though the robot genuinely left the former Home Zone at some point.
+    ASSERT_TRUE(everCrossedFormerRadius);
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::None);
+}
+
+// 2: CrossingFormerHomeZoneRadiusDoesNotEmitReturnHomeRequested
+TEST(MissionControlIntegrationTest, CrossingFormerHomeZoneRadiusDoesNotEmitReturnHomeRequested)
+{
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
+    world.setRobotHeading(180.0F);
+    MissionControlHarness h(world);
+
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    // Drive exactly until distance-from-base first exceeds the former
+    // exit radius, then continue driving several more frames - the FSM
+    // must remain Moving throughout, since nothing in the current event-
+    // source chain (missionControl, hardwareEventSource,
+    // homeArrivalEventSource) can ever produce a distance-triggered
+    // ReturnHomeRequested any more.
+    bool everCrossedFormerRadius = false;
+    for (int frame = 0; frame < 3000; ++frame)
+    {
+        h.driveFrame();
+        ASSERT_FALSE(h.hardware.collidedLastUpdate());
+        if (h.distanceToBase() > HomeZoneMonitor::kHomeZoneExitRadius)
+        {
+            everCrossedFormerRadius = true;
+        }
+        // Never transitions away from Moving purely from crossing the
+        // boundary, for as long as the loop runs.
+        ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+    }
+    ASSERT_TRUE(everCrossedFormerRadius);
+    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::None);
+}
+
+// 3: RobotCanContinueExploringBeyondFormerExitRadius
+TEST(MissionControlIntegrationTest, RobotCanContinueExploringBeyondFormerExitRadius)
+{
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
+    world.setRobotHeading(180.0F);
+    MissionControlHarness h(world);
+
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+
+    // Drive only until the moment the robot FIRST crosses the former
+    // exit radius (a short, deterministic loop with an early-exit
+    // condition), then confirm the robot is STILL physically making
+    // forward progress from there (not merely "not returned" - genuinely
+    // still exploring, position still changing) over a further, bounded
+    // number of frames - deliberately not a long unconstrained drive,
+    // since over enough simulated time table-edge recovery turning could
+    // legitimately carry the robot back closer to base again with no
+    // path memory, which is irrelevant to what this test checks.
+    for (int frame = 0; frame < 2500 && h.distanceToBase() <= HomeZoneMonitor::kHomeZoneExitRadius; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_GT(h.distanceToBase(), HomeZoneMonitor::kHomeZoneExitRadius);
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    const Vec3 positionBeyondBoundary = world.robotPose().position;
+    for (int frame = 0; frame < 200; ++frame)
+    {
+        h.driveFrame();
+    }
+    const Vec3 positionLater = world.robotPose().position;
+
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+    EXPECT_TRUE(positionBeyondBoundary.x != positionLater.x || positionBeyondBoundary.z != positionLater.z);
+}
+
+// 5: UserReturnHomeStillWorks
+TEST(MissionControlIntegrationTest, UserReturnHomeStillWorks)
+{
+    VirtualWorld world;
+    disableAllObstacles(world);
+    MissionControlHarness h(world);
+
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    // `2`/`R` (requestReturnHome()) must still work identically to before
+    // this fix - never affected by HomeZoneMonitor's removal.
+    h.missionControl.requestReturnHome();
+    ASSERT_EQ(h.runtime.step(), RuntimeStepResult::TransitionAccepted);
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
+    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::UserRequest);
+
+    for (int frame = 0; frame < 3000 && h.stateMachine.currentState() == RobotState::ReturningHome; ++frame)
     {
         h.driveFrame();
         ASSERT_FALSE(h.hardware.collidedLastUpdate());
     }
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_LE(h.distanceToBase(), HomeNavigator::kHomeArrivalRadius);
+}
+
+// 6: BatteryCriticalReturnHomeStillWorks (also satisfies the brief's
+// separate "BATTERY INTEGRATION REGRESSION" section in full: Start
+// Explore, BatteryCritical through the real event/runtime/controller
+// chain via BatteryCriticalEventSourceStub - never a direct
+// stateMachine.processEvent() call bypassing RobotRuntime/RobotController
+// the way VirtualRobotHardwareTests.cpp's own FSM-only precedent does -
+// ReturningHome[MissionAbort], real Navigation authority/physical
+// movement toward base, and HomeReached -> Aborted reached through the
+// genuine HardwareEventSource/HomeArrivalEventSource/RobotRuntime chain,
+// never faked directly.)
+TEST(MissionControlIntegrationTest, BatteryCriticalReturnHomeStillWorks)
+{
+    VirtualWorld world;
+    disableAllObstacles(world);
+    MissionControlHarness h(world);
+
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+    const float zAfterStart = world.robotPose().position.z;
+    for (int i = 0; i < 10; ++i)
+    {
+        h.driveFrame();
+    }
+    ASSERT_GT(world.robotPose().position.z, zAfterStart);
+
+    // Act: BatteryCritical, injected through the real composite event
+    // chain (never stateMachine.processEvent() directly), so
+    // RobotController::applyState() genuinely runs and Navigation
+    // authority genuinely engages below.
+    h.batteryStub.arm();
+    ASSERT_EQ(h.runtime.step(), RuntimeStepResult::TransitionAccepted);
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
-    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::UserRequest);
-    EXPECT_FALSE(h.homeZone.armed());
+    ASSERT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::MissionAbort);
 
-    // 7: Navigation authority becomes active.
-    h.driveFrame();
+    // Assert: Navigation authority/physical movement toward base remains
+    // fully intact - unaffected by which event triggered ReturningHome.
+    for (int i = 0; i < 5; ++i)
+    {
+        h.driveFrame();
+    }
     EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::Navigation);
-
-    // 8-9: robot turns toward base, distance eventually decreases.
     float previousDistance = h.distanceToBase();
     bool everDecreased = false;
     for (int frame = 0; frame < 3000 && h.stateMachine.currentState() == RobotState::ReturningHome; ++frame)
@@ -470,83 +696,46 @@ TEST(MissionControlIntegrationTest, HomeZoneClosedLoopIntegrationTest)
     }
     EXPECT_TRUE(everDecreased);
 
-    // 10-12: arrival radius reached, HomeReached emitted naturally,
-    // FSM -> Ready.
-    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
-    EXPECT_LE(h.distanceToBase(), HomeNavigator::kHomeArrivalRadius);
-
-    // 13-14: Navigation clears, robot stops.
-    h.driveFrame();
-    EXPECT_FALSE(h.hardware.navigationOverrideActive());
-    const WheelSpeeds stopped = h.hardware.wheelSpeeds();
-    EXPECT_FLOAT_EQ(stopped.left, 0.0F);
-    EXPECT_FLOAT_EQ(stopped.right, 0.0F);
-
-    // 15: the monitor re-arms - but only once evaluated while Roam is
-    // active again (HomeZoneMonitor freezes entirely, including the
-    // armed/disarmed latch, while the task is not Roam - see
-    // DisabledWhenTaskIsNotRoam - so the monitor is still legitimately
-    // Disarmed here, throughout the just-finished Return Home trip, and
-    // only re-arms once a fresh Roam evaluates it again below).
-    EXPECT_FALSE(h.homeZone.armed());
-
-    // 16-17: Start Roam again - repositioned to the same kind of open
-    // path away from base used at the top of this test (representing a
-    // fresh Roam session, not a mid-mission event), so a second
-    // excursion is exercised deterministically. A second automatic
-    // Return Home can trigger.
-    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
-    world.setRobotHeading(180.0F);
-    h.missionControl.requestStartRoam(h.stateMachine.currentState());
-    ASSERT_EQ(h.runtime.step(), RuntimeStepResult::TransitionAccepted); // StartMission only (Ready)
-    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
-
-    // The very first Roam frame already re-arms the monitor - the robot
-    // is still well within the 6.0F rearm radius at (4, -1), distance 5.
-    h.driveFrame();
-    EXPECT_TRUE(h.homeZone.armed());
-
-    for (int frame = 0; frame < 3000 && h.stateMachine.currentState() == RobotState::Moving; ++frame)
-    {
-        h.driveFrame();
-        ASSERT_FALSE(h.hardware.collidedLastUpdate());
-    }
-    EXPECT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
-    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::UserRequest);
+    // Assert: HomeReached, reached naturally through
+    // HomeArrivalEventSource observing HomeNavigator's own Arrived edge
+    // (never faked), leads to Aborted - the pre-existing, unmodified
+    // MissionAbort lifecycle.
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Aborted);
+    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::None);
 }
 
-// --- Obstacle during automatic Home-Zone return ---
-//
-// The obstacle is cleared via a direct world mutation once
-// WaitingForObstacleClear is reached (identical to RobotSimulator3D's own
-// `O` key) rather than by driving a real ReactiveObstacleAvoidance turn to
-// convergence - this is exactly the same technique Phase 13T's own
-// ObstacleDuringReturnHomeInterruptsThenResumesNavigation test already
-// uses (VirtualRobotHardwareTests.cpp), reused rather than duplicated
-// with new architecture. Direct experimentation while writing this test
-// found that genuine avoidance turning CAN resonate indefinitely against
-// HomeNavigator's continuous re-aiming in this V1 design, when the two
-// repeatedly disagree about the same heading band (WaitingForObstacleClear
-// <-> ReturningHome forever, zero net progress) - a real, previously-
-// undiscovered V1 limitation, not something either this test or Phase
-// 13T's own precedent actually exercises; see docs/technical-decisions.md
-// (Phase 13U) for the full writeup. This test still proves everything the
-// brief requires: an obstacle genuinely interrupts an AUTOMATICALLY-
-// triggered Return Home, and Navigation genuinely resumes and completes
-// afterward, through the exact same ReturningHome + ObstacleDetected ->
-// WaitingForObstacleClear -> ObstacleCleared -> ReturningHome transitions
-// as every other test - never a direct state mutation.
-TEST(MissionControlIntegrationTest, ObstacleDuringAutomaticHomeZoneReturnIntegrationTest)
+// 7: StopTaskStillWorks
+TEST(MissionControlIntegrationTest, StopTaskStillWorks)
 {
-    // Arrange: same departure setup as HomeZoneClosedLoopIntegrationTest -
-    // already known to safely cross the exit radius and return without
-    // touching table-edge recovery.
     VirtualWorld world;
     disableAllObstacles(world);
-    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
-    world.setRobotHeading(180.0F);
-    world.setObstaclePosition(0, Vec3{4.0F, 0.4F, 2.0F});
-    world.setObstacleEnabled(0, true);
+    MissionControlHarness h(world);
+
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+    for (int i = 0; i < 10; ++i)
+    {
+        h.driveFrame();
+    }
+
+    h.missionControl.requestStopTask();
+    ASSERT_EQ(h.runtime.step(), RuntimeStepResult::TransitionAccepted);
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_EQ(h.hardware.currentCommand(), VirtualDriveCommand::Stopped);
+}
+
+// 8: TableEdgeSafetyStillWorks
+TEST(MissionControlIntegrationTest, TableEdgeSafetyStillWorks)
+{
+    // Same positioning strategy as the existing StopDuringSafetyIntegrationTest
+    // above - front corner approaches the table edge while Roaming
+    // straight ahead.
+    VirtualWorld world;
+    disableAllObstacles(world);
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.6F});
+    world.setRobotHeading(0.0F);
     MissionControlHarness h(world);
 
     h.missionControl.requestStartRoam(h.stateMachine.currentState());
@@ -554,44 +743,18 @@ TEST(MissionControlIntegrationTest, ObstacleDuringAutomaticHomeZoneReturnIntegra
     h.runtime.step();
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
 
-    // Roam away until the zone triggers automatically.
-    for (int frame = 0; frame < 3000 && h.stateMachine.currentState() == RobotState::Moving; ++frame)
+    bool everSafety = false;
+    for (int frame = 0; frame < 500 && !everSafety; ++frame)
     {
         h.driveFrame();
-        ASSERT_FALSE(h.hardware.collidedLastUpdate());
+        if (h.hardware.driveAuthority() == DriveAuthority::Safety)
+        {
+            everSafety = true;
+        }
     }
-    ASSERT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
-    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::UserRequest);
 
-    // Continue toward base until the obstacle interrupts navigation -
-    // reusing the exact Phase 13T ReturningHome + ObstacleDetected ->
-    // WaitingForObstacleClear behavior, never a separate mechanism.
-    for (int frame = 0; frame < 3000 && h.stateMachine.currentState() == RobotState::ReturningHome; ++frame)
-    {
-        h.driveFrame();
-        ASSERT_FALSE(h.hardware.collidedLastUpdate());
-    }
-    ASSERT_EQ(h.stateMachine.currentState(), RobotState::WaitingForObstacleClear);
-    EXPECT_EQ(h.stateMachine.returnHomeReason(), ReturnHomeReason::UserRequest);
-    EXPECT_EQ(h.homeNavigator.state(), HomeNavigationState::Inactive);
-
-    // Act: clear the obstacle - identical world-only mutation to
-    // RobotSimulator3D's "O" key; never a manual Event injection.
-    world.setObstacleEnabled(0, false);
-
-    // Assert: HardwareEventSource observes the edge and emits
-    // ObstacleCleared; RobotStateMachine resumes ReturningHome (the
-    // remembered resumeState_) - never plain Moving.
-    ASSERT_EQ(h.runtime.step(), RuntimeStepResult::TransitionAccepted);
-    ASSERT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
-
-    // Continue until the robot genuinely reaches home - HomeNavigator
-    // recomputes a fresh target from wherever the robot ended up.
-    for (int frame = 0; frame < 3000 && h.stateMachine.currentState() == RobotState::ReturningHome; ++frame)
-    {
-        h.driveFrame();
-        ASSERT_FALSE(h.hardware.collidedLastUpdate());
-    }
-    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
-    EXPECT_LE(h.distanceToBase(), HomeNavigator::kHomeArrivalRadius);
+    // Table-edge Safety is completely independent of HomeZoneMonitor's
+    // removal - it remains fully active, unweakened.
+    EXPECT_TRUE(everSafety);
+    EXPECT_TRUE(h.tableEdgeSafety.active());
 }

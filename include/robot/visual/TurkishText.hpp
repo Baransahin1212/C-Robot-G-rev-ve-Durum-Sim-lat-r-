@@ -6,6 +6,7 @@
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/HomeNavigator.hpp"
 #include "robot/visual/MissionTask.hpp"
+#include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
 
@@ -130,6 +131,17 @@ constexpr std::string_view turkishText(TableEdgeSafetyController::RecoveryState 
         case TableEdgeSafetyController::RecoveryState::MovingForwardFromRearEdge: return "İleri Çıkıyor";
         case TableEdgeSafetyController::RecoveryState::Turning: return "İçeri Dönüyor";
         case TableEdgeSafetyController::RecoveryState::AdvancingInward: return "Güvenli Alana Giriyor";
+    }
+    return "Bilinmiyor";
+}
+
+constexpr std::string_view turkishText(AvoidanceState value) noexcept
+{
+    switch (value)
+    {
+        case AvoidanceState::Inactive: return "Kapalı";
+        case AvoidanceState::TurnAway: return "Engelden Dönüyor";
+        case AvoidanceState::AdvanceClear: return "Engeli Geçiyor";
     }
     return "Bilinmiyor";
 }
