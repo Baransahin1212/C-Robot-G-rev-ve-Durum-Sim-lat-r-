@@ -4120,3 +4120,454 @@ This is not a new limitation introduced here - it was already implied by
 "V1 reactive navigation only... NOT global path planning" - only now
 precisely characterized now that the single-obstacle case this fix
 targets is confirmed to actually converge.
+
+## Phase 13W: Desktop Workspace Environment + Charging Dock Visual Foundation
+
+Transforms the abstract tabletop demo into a believable miniature
+desktop-robot workspace: six recognizable desk objects (monitor,
+keyboard, mouse, mug, notebook, lamp base) replace generic orange box
+obstacles, and the flat blue base platform becomes a recognizable
+charging dock. Explicitly scoped as **world model + collision geometry +
+3D presentation only** - no charging simulation, no approach-point
+docking controller, no charging state/animation, no docking-specific
+obstacle-ignore behavior, no global planning/SLAM/frontier exploration.
+Those remain deferred to a future phase.
+
+### Repository audit (before any change)
+
+1. **Obstacle representation**: `BoxObstacle` (`VirtualWorld.hpp`) -
+   `position`/`size`/`enabled`, nothing else. `VirtualWorld` owns exactly
+   one `std::vector<BoxObstacle> obstacles_`.
+2. **Sensor access**: `VirtualDistanceSensor`, `VirtualObstacleSensorArray`,
+   `ForwardClearanceProbe` all read `world.obstacles()` directly (a plain
+   const-reference iteration) - none has ever known any richer type.
+3. **Collision access**: `RobotCollision::robotPositionCollidesWithObstacles()`
+   takes `const std::vector<BoxObstacle>&` directly - same story.
+4. **Mapper access**: `ExplorationMapper::update()` takes only
+   `RobotPose` + `std::vector<RangeObservation>` - it has never had, and
+   still does not have, any `VirtualWorld`/obstacle-list parameter at all
+   (verified again this phase - see
+   `ExplorationMapperTests.cpp::MapperDoesNotRequireVirtualWorldReference`,
+   unmodified and still passing).
+5. **`BasePlatform`**: `position` + `size` only, no heading, no
+   approach/dock-point fields, never registered as a `BoxObstacle` (zero
+   collision/sensing presence before this phase).
+6. **Base position/size**: `(4.0, 0.025, 4.0)`, `1.5 × 0.05 × 1.5` -
+   unchanged by this phase (see "BasePlatform compatibility" below for
+   why).
+7. **Original obstacle positions**: four `BoxObstacle`s, index 3
+   (`VirtualWorld::kBlockingObstacleIndex`) deliberately directly ahead of
+   the robot's start pose - and, critically, several existing tests
+   (`VirtualRobotHardwareTests.cpp`'s `ObstacleDetectedTrueWhenWithinThreshold`
+   and neighbors) assert *exact* sensor distances (`EXPECT_NEAR(...,
+   0.5F, 0.01F)`) that depend on that obstacle's precise default
+   position/size - this is why they were left completely untouched (see
+   below).
+8. **Must `BoxObstacle` remain?** Yes, unconditionally - it is the one
+   type every sensor/collision component already depends on; replacing it
+   would mean rewriting four independent, already-tested geometry
+   components for a purely presentational goal.
+
+### DeskObject model
+
+```cpp
+enum class DeskObjectType { Monitor, Keyboard, Mouse, Mug, Notebook, LampBase };
+
+struct DeskObject
+{
+    DeskObjectType type = DeskObjectType::Monitor;
+    Vec3 position;
+    Vec3 size;
+    bool enabled = true;
+};
+```
+
+Added directly to `VirtualWorld.hpp` (no new header/library target) -
+it is exactly the same kind of small, plain world-model struct
+`BoxObstacle`/`BasePlatform`/`TableSurface` already are, living in the
+one file that already hosts all of them; a dedicated `DeskObject.hpp`
+would have added CMakeLists.txt churn for zero architectural benefit
+("do NOT create six unrelated world-model classes unless genuinely
+necessary" - this phase's own brief).
+
+**Separation of concerns**, exactly as required:
+
+- **Semantic desktop object** = `DeskObject` (`type`/`position`/`size`/
+  `enabled`) - read only by `Renderer3D`.
+- **Physical collision geometry** = a plain `BoxObstacle`, registered
+  alongside every `DeskObject` with IDENTICAL `position`/`size`
+  (`VirtualWorld::addDeskObject()`, the one place both are ever created,
+  so they can never drift apart) - read only by
+  `VirtualDistanceSensor`/`VirtualObstacleSensorArray`/
+  `ForwardClearanceProbe`/`RobotCollision`, exactly as before this phase.
+- **Rendering** = `Renderer3D::drawDeskObject()` dispatches on `type` to
+  `drawMonitor()`/`drawKeyboard()`/`drawMouse()`/`drawMug()`/
+  `drawNotebook()`/`drawLampBase()` - the only place `DeskObjectType` is
+  ever switched on.
+
+No sensor, collision, or mapping code anywhere in this codebase includes
+`VirtualWorld.hpp`'s `DeskObject`/`DeskObjectType` symbols for anything
+beyond compiling the header (`VirtualObstacleSensorArray`/
+`ForwardClearanceProbe`/`RobotCollision` never reference them at all);
+`ExplorationMapper` still cannot even see `VirtualWorld` to begin with.
+
+### Why simple AABB proxies are used
+
+Every `DeskObject`'s registered `BoxObstacle` is a small, deliberately
+FOOTPRINT-only box - never the object's full visual volume. This matters
+most for the **monitor**: its registered obstacle is sized to the small
+STAND base (`size.x * size.z < 0.5` sq. units, see
+`RobotCollisionTests.cpp::MonitorFootprintIsStandSizedNotFullScreenVolume`),
+not the taller screen+neck assembly `drawMonitor()` draws above it.
+This falls out for free from an existing invariant, not a special case
+added for monitors: every collision/sensor AABB test in this codebase
+(`RobotCollision.cpp`, `VirtualDistanceSensor.cpp`,
+`VirtualObstacleSensorArray.cpp`, `ForwardClearanceProbe.cpp`) has
+**always** operated purely on X/Z - `size.y`/`position.y` have never
+participated in any collision or ray-intersection decision anywhere in
+this project. A monitor's screen therefore could never physically block
+the robot regardless of how tall it were registered; keeping the
+registered footprint small anyway is about visual/physical *honesty*
+(the collision box should look like it belongs to the stand, not imply
+the whole screen is a solid wall) rather than a new technical necessity.
+No triangle-mesh collision was introduced anywhere - every desk object
+reduces to exactly one AABB, per the brief's own explicit constraint.
+
+### Why the mapper never sees DeskObjectType
+
+Unchanged architecture, re-verified rather than re-designed:
+`ExplorationMapper::update(const RobotPose&, const
+std::vector<RangeObservation>&)` is the entire public surface - there is
+no overload, no optional parameter, no back-channel through which a
+`DeskObjectType` could reach it even if a future change wanted to. The
+only way a desk object's geometry becomes map data is the same path
+every obstacle already used: `VirtualObstacleSensorArray` casts a real
+ray against the plain `BoxObstacle` registered for it, produces a
+`RangeObservation` (distance + hit, no type information), and
+`ExplorationMapper` traces that observation into `Free`/`Occupied` cells.
+`ExplorationIntegrationTests.cpp::DeskObjectSemanticsNeverReachExplorationMap`
+proves this end to end: a desk object the robot has actually sensed
+becomes `Occupied`, a different, unobserved desk object in the same
+cluster stays `Unknown`, and nothing in the map ever distinguishes which
+object type produced an occupied cell.
+
+### Deterministic layout
+
+One fixed desk-object cluster (never randomized), placed in table space
+untouched by the four original obstacles, the robot's start pose, and
+the base/dock:
+
+| Object    | Position (x, y, z)      | Footprint (w × h × d)     |
+|-----------|--------------------------|----------------------------|
+| Monitor   | (-2.6, 0.15, -5.6)       | 0.5 × 0.3 × 0.3            |
+| Keyboard  | (-2.6, 0.05, -4.5)       | 1.0 × 0.1 × 0.35           |
+| Mouse     | (-1.5, 0.04, -4.5)       | 0.25 × 0.08 × 0.3          |
+| Mug       | (-3.7, 0.175, -4.6)      | 0.3 × 0.35 × 0.3           |
+| Notebook  | (-2.7, 0.03, -3.5)       | 0.5 × 0.06 × 0.4           |
+| LampBase  | (-4.2, 0.125, -5.7)      | 0.35 × 0.25 × 0.35         |
+
+All within the ±6 table half-extent with margin; the whole cluster's
+bounding region leaves a full robot-diameter of clear space to at least
+one table edge on both axes (`VirtualWorldTest::DemoLayoutLeavesNavigableClearanceForRobot`)
+- proof a route around the cluster always exists. Individual item-to-item
+gaps within the cluster are intentionally desk-realistic (as close as
+~0.45 world units in places) rather than each independently robot-
+passable: real desk items sit close together, and the robot is expected
+to route around the cluster as a whole, not thread between a keyboard
+and a mouse - exactly like it already routes around the four original
+obstacles' own loose groupings.
+
+Registered via `VirtualWorld::addDeskObject(type, position, size)`,
+called once per object in the constructor, immediately after the four
+original (untouched) obstacles and immediately before the dock's rear-
+housing obstacle - so `obstacles()` is deterministically `[4 original]
+[6 desk objects][1 dock housing]` (11 total), and
+`VirtualWorld::kOriginalObstacleCount`/`kDockHousingIndex` name that
+layout explicitly rather than leaving it an implicit ordering
+assumption.
+
+### Charging-dock V1 compatibility decision
+
+**`BasePlatform` remains the one semantic "home" representation** -
+`HomeNavigator`, `HomeArrivalEventSource`, and the exploration map's own
+home marker all still read `basePlatform().position` directly, exactly
+as before. A dedicated `ChargingDock` world-model struct (position,
+heading, size, approachPoint, dockPoint) was **considered and rejected**:
+this phase's own brief explicitly permits skipping it ("the minimum
+subset required for this phase... do not over-engineer unused fields"),
+and since docking behavior itself is deferred, nothing in this codebase
+would ever consume `approachPoint`/`dockPoint`/a stored heading this
+phase - `BasePlatform` already has everything the visual needs
+(`position`, `size`); the dock's single fixed orientation (rear housing
+toward the far/outer table corner) is a `Renderer3D.cpp`-local rendering
+constant, not world-model state, since there is exactly one dock in the
+whole demo and it never rotates. This is the smaller architectural
+change the brief asks to prefer.
+
+`Renderer3D::drawChargingDock()` draws the platform slab, rear housing,
+two guide arms, and two contact pads entirely from `basePlatform()` plus
+the one dock-housing `BoxObstacle` - no new type, no new `VirtualWorld`
+field beyond the housing obstacle itself and its named index.
+
+### Dock collision/sensor compatibility
+
+**Only the rear housing is physically collidable** - option A from the
+brief ("central parking area is sensor-clear, only rear housing is
+collidable"), combined with option B for the rest ("guide arms do not
+participate in obstacle sensing"): the guide arms and contact pads are
+drawn purely visually, never registered as obstacles, so the parking
+slot between the arms is always physically open regardless of approach
+angle.
+
+The housing itself is placed at `(basePlatform().position.x + 0.9,
+basePlatform().position.z + 0.9)`, size `0.4 × 0.3 × 0.3` - beyond the
+platform's own far corner, on the side opposite every realistic approach
+(every existing obstacle and the robot's default start pose sit at
+negative X/Z relative to the dock; the housing sits at positive X/Z
+beyond it). Verified analytically before writing any test: the
+worst-case point on `HomeNavigator::kHomeArrivalRadius`'s own arrival
+circle (0.40F) closest to the housing keeps a closest-point distance of
+≈0.59 world units to the housing's AABB - comfortably outside
+`kRobotCollisionRadius` (0.5F) - so the robot can physically settle
+anywhere within the arrival disk, from any approach angle, without
+`RobotCollision` ever rejecting the pose. Proven empirically (not just
+analytically) by
+`VirtualRobotHardwareTests.cpp::ReturnHomeReachesChargingDockWithoutOscillating`,
+which drives the real production stack against the fully default demo
+scene (dock housing enabled, untouched) to `HomeReached` with zero
+collision rejections and no stuck-in-place window anywhere in the run.
+`ReturnHomeBypassesDeskObjectOnDirectPathToDock` separately proves the
+unmodified Phase 13V avoidance mechanism bypasses an arbitrary desk
+object placed directly on the path to base exactly like any other
+obstacle - it has no notion of "desk object" to special-case.
+
+Obstacle sensing itself was never globally disabled for Return Home at
+any point - both new tests run the real, always-on
+`VirtualObstacleSensorArray`/`ForwardClearanceProbe`/`RobotCollision`
+chain throughout.
+
+### Home marker on the map
+
+Unchanged - the exploration map panel's home/base marker
+(`kExplorationBaseColor`, `Renderer3D.cpp`) already draws from
+`world.basePlatform().position` directly, independent of sensor
+discovery (see the Phase 13V section above); this phase did not touch
+that panel. A richer dock-shaped map icon was considered but skipped as
+unnecessary polish beyond this phase's scope - the brief's own "keep it
+simple" guidance.
+
+### Colors/theme
+
+The table's existing color (`Color{180, 140, 90, 255}`, wood-toned) was
+already desk-appropriate from Phase 13S and needed no change. The four
+original obstacles were recolored from bright `ORANGE` to a neutral
+"generic clutter" tone (`Color{150, 140, 122, 255}`) so they read as
+background rather than competing with the six desk objects. Desk
+objects/dock use a coherent dark-neutral palette (electronics: grays
+near-black; dock: dark housing with a small brass/gold contact-pad
+accent) with exactly one accent color each for the mug (warm red) and
+notebook (muted teal) - never every object sharing one bright color.
+
+### Known limitations after this phase
+
+Everything already documented under "Reactive navigation only - not
+global path planning" (README's Known Limitations, and the Phase 13V
+sections above) applies unchanged: a genuine cul-de-sac of 2+ obstacles
+is still not guaranteed to resolve, whether those obstacles are plain
+boxes or desk objects - the avoidance mechanism itself is identical
+either way. No new limitation is introduced by this phase; the two new
+Return-Home tests above are the strongest available proof the desktop
+workspace's specific geometry does not regress that existing, already-
+documented boundary. Charging/docking behavior (approach-point
+controller, charging state, docking-specific sensor handling) remains
+entirely deferred, as scoped.
+
+## Phase 13W final workspace redesign: miniature robot + clean desk +
+## monitor-side dock
+
+Continues directly from the section above. Two rounds of human visual
+validation on the six-desk-object, ~8x4-desk pass (the "Phase 13W v2"
+material earlier in this file) both failed, for different reasons, and
+this pass fixes both:
+
+- **First validation failure** ("the table looked square and huge, legacy
+  generic cubes remained, monitor/keyboard/mouse were too small and
+  clustered, the dock looked like a giant black floor plate, camera
+  framing was too distant, map looked square rather than desk-shaped") -
+  already addressed by the v2 rectangular-desk pass documented above.
+- **Second validation failure** (this phase): even after the rectangular
+  desk, the robot still read as oversized next to the monitor/keyboard/
+  dock, some visually-open passages were physically impossible for the
+  robot's own collision footprint, and the dock sat near the front edge
+  rather than beside the monitor as the product actually wanted.
+
+### Why the robot was rescaled
+
+Human validation was explicit: "the robot must now read as MINIATURE."
+Rather than fix the *symptom* (impossible-looking passages) by loosening
+`ReactiveObstacleAvoidance`'s own geometry assumptions - explicitly
+out of scope, this phase's own brief - the fix goes to the *cause*:
+`RobotDimensions::kBodyWidth`/`kBodyLength` (`VisualRobot.hpp`) shrink
+from 0.60x0.80 to 0.40x0.50 (a uniform ~2/3 scale factor applied to every
+other dimension too - wheel radius, wheel thickness, body height), giving
+an ~8x10cm miniature body at this project's own ~20cm-per-world-unit
+design scale. Every dependent system - `VirtualObstacleSensorArray`'s ray
+origins, `VirtualCliffSensor`'s corner positions, `VirtualDistanceSensor`'s
+front-sensor offset, `DifferentialDrive::kDefaultWheelTrack`,
+`ExplorationMapper`'s footprint-marking rectangle - already derived
+these from `RobotDimensions` rather than hand-duplicating them (Phase
+13O/13P/13S/13V precedent), so the rescale propagated automatically; the
+one dependent value that needed an explicit code change was
+`RobotCollision::kRobotCollisionRadius` itself (see below).
+
+### Collision-radius derivation
+
+Previously `kRobotCollisionRadius` was exactly the rectangle's own
+enclosing-circle half-diagonal (`sqrt((w/2)^2 + (l/2)^2)`), no added
+margin. This phase's brief asked for "half-diagonal plus a small named
+safety margin," so a new `kCollisionSafetyMargin = 0.03F` constant was
+introduced and added on top: `0.3202F` (half-diagonal for 0.40x0.50) +
+`0.03F` = `~0.3502F`, landing inside the brief's own suggested
+0.32-0.35 range. `ReactiveObstacleAvoidance::kMinimumBypassDistanceWorldUnits`
+(already `2.0F * kRobotCollisionRadius`, unchanged formula) updates to
+`~0.70F` automatically.
+
+### Minimal workspace: Monitor/Keyboard/Mouse only
+
+Explicit product requirement: "the production desk must contain ONLY
+Monitor, Keyboard, Mouse, Robot, Charging dock." `VirtualWorld`'s
+constructor no longer calls `addDeskObject()` for Mug/Notebook/LampBase -
+they disappear both visually (nothing left in `deskObjects()` for
+`Renderer3D` to dispatch on) and physically (no matching `BoxObstacle`
+registered either). `DeskObjectType`'s three now-unused enumerators and
+`Renderer3D`'s `drawMug()`/`drawNotebook()`/`drawLampBase()` helpers are
+left in place - deliberately not deleted, to avoid unnecessary code
+churn for values a future scene could still legitimately want - but nothing
+in the default constructor instantiates one, and
+`tests/visual/VirtualWorldTests.cpp`'s `WorkspaceDoesNotContainMug`/
+`WorkspaceDoesNotContainNotebook`/`WorkspaceDoesNotContainLampBase` (plus
+`NoLegacyGenericObstacleExists`/
+`EveryPhysicalObstacleCorrespondsToVisibleWorkspaceObject`) pin that
+down as a regression, not just a one-time constructor edit.
+
+### Dock moved beside the monitor
+
+Also an explicit product requirement ("the charging dock must be
+IMMEDIATELY BESIDE THE MONITOR... dock to the RIGHT of the monitor"),
+replacing the earlier pass's front-table-edge placement. The dock
+(`BasePlatform`, via `kBaseX`/`kBaseZ` in `VirtualWorld.cpp`) now sits
+near the desk's own rear (-Z) edge, in the same row as the monitor, just
+to its right. This inverts which side of the platform the rear housing
+sits on: the housing (the one physically collidable dock piece) now
+faces the rear (-Z) table edge, and the parking slot's open entrance
+faces the desk interior (+Z) - the direction the robot actually parks
+from/departs to - the opposite orientation from the earlier front-edge
+placement, where the housing faced the front edge instead. The robot's
+own default start heading was re-derived for the new dock bearing (see
+"Return Home regression" below) - the underlying antipodal-turn class of
+bug from the v2 pass (documented above) is heading-relative, not tied to
+any specific dock position, so the same "start a quarter-turn from home,
+never exactly antipodal" fix generalizes directly.
+
+### Navigable-corridor rule
+
+Every intentional passage in the layout (dock exit corridor, the gap
+between the monitor's stand and the dock, the lane past the keyboard/
+mouse cluster) is sized against one explicit rule: available gap must
+exceed `2 * kRobotCollisionRadius + kNavigationSafetyMargin` (a modest
+named margin, `0.10F`, introduced in `tests/visual/VirtualWorldTests.cpp`
+alongside the corridor tests themselves - `DockExitCorridorIsNavigable`,
+`MonitorDockGeometryDoesNotTrapRobot`, `KeyboardDoesNotBlockDockExit`,
+`MonitorBypassRouteExists`). This is a *layout* rule, checked by tests
+against `VirtualWorld`'s own static geometry - it says nothing about, and
+never touches, how `ReactiveObstacleAvoidance` itself decides to move.
+
+### `kDockHousingIndex` bug found and fixed
+
+While adding the corridor/layout tests above, `VirtualWorld::kDockHousingIndex`
+was found still hardcoded to `6` - a leftover from the six-desk-object
+v2 layout. With only three desk objects now, the real housing index is
+`3`; the stale `6` was silently reading one-past-the-end of `obstacles()`
+whenever `EveryPhysicalObstacleCorrespondsToVisibleWorkspaceObject`
+touched it directly, and `Renderer3D::drawChargingDock()` (which
+indexes `obstacles()[VirtualWorld::kDockHousingIndex]` every frame in
+production) was equally exposed - out-of-bounds `std::vector::operator[]`
+is undefined behavior, observed here as an MSVC debug-iterator assertion
+crash. Fixed by updating the constant to `3` with a comment explaining
+why a hardcoded literal (not a runtime-derived value) is acceptable here:
+it encodes a real positional invariant ("always the last entry pushed"),
+same as before, just kept in sync with the current desk-object count.
+
+### Return Home regression (again) - a second, distinct geometric trap
+
+`ReturnHomeReachesChargingDockWithoutOscillating` broke again after the
+dock moved, for a genuinely different reason than the v2-pass fix
+documented above (both are real, both independently necessary):
+
+1. **Antipodal start heading, again.** The default start heading stayed
+   90 degrees from the v2 fix, but the dock's new bearing from the
+   robot's start point is 180 degrees (not 0), so 90 is still the
+   correct "quarter-turn from home, never antipodal" choice - no change
+   needed here, confirming the earlier fix's reasoning was properly
+   heading-relative rather than tied to the old dock's specific position.
+2. **A genuinely new failure**, found by driving the real production
+   stack frame-by-frame with temporary stderr tracing (removed before
+   this phase's diff; the technique - not the printouts - is worth
+   recording): `ReactiveObstacleAvoidance`'s per-incident bypass distance
+   (`kMinimumBypassDistanceWorldUnits`, ~0.70F) is far shorter than the
+   keyboard's own width (2.3F). Combined with `HomeNavigator` recomputing
+   its target heading fresh every frame (by design, no path memory - see
+   the Phase 13T section), a robot needing to route around the whole
+   monitor/keyboard cluster can legitimately take many short bypass
+   increments, re-aiming at home and re-triggering avoidance after each
+   one, walking along the cluster's silhouette rather than a single clean
+   swerve. With the cluster positioned close to the desk's rear-left
+   corner, that walk had enough room to reach the table's own -Z/-X
+   corner and trip `VirtualRobotHardware`'s table-support fail-safe
+   (`completelyOffTable`, Phase 13S) - which this test's own harness
+   deliberately never wires a recovery controller for (it isolates
+   obstacle-avoidance-only behavior) - leaving the robot permanently
+   stuck with every proposed step silently rejected. Fixed by shifting
+   the monitor/keyboard/mouse cluster further from the desk's rear-left
+   corner (`Vec3{-1.2F, ..., -1.2F}`/`{-1.2F, ..., -0.4F}`/
+   `{0.6F, ..., -0.4F}`, up from `-1.5F`/`-1.5F`/`-0.6F`/`-0.6F`) - a
+   *layout* fix (more corner clearance), never a change to
+   `ReactiveObstacleAvoidance`'s own bypass-increment or re-aiming logic.
+   `docs`/this file records the specific numbers so a future geometry
+   change can re-derive the same clearance reasoning rather than
+   rediscovering it by trial and error.
+
+### Long-Gezinme regression: a related, deliberately out-of-scope edge case
+
+Added `ExplorationIntegrationTests.cpp`'s
+`LongGezinmeMakesSustainedProgressWithoutGettingStuck` - a sustained,
+undirected Roam over the real production desk, proving translational
+progress, mapping growth, and trail growth hold up over many multiples of
+a single avoidance/safety incident. Its frame budget is deliberately a
+few hundred frames, not several thousand: `ReactiveObstacleAvoidance`'s
+`TurnAway` release condition is heading-only, with no notion of "I am
+already within my own clearance radius of this obstacle - no rotation
+will ever read clear." That is a pre-existing property of local reactive
+avoidance (the same `[kRobotCollisionRadius, kRobotCollisionRadius +
+ForwardClearanceProbe::kSafetyMargin]` gap existed at the old 0.5F/0.58F
+scale too, just less likely to be grazed on the old, larger, more open
+12x12 table), and fixing it would mean redesigning
+`ReactiveObstacleAvoidance` itself - explicitly out of scope per this
+phase's own brief. Sustained, *undirected* Roam (unlike Return Home,
+which always has a target pulling the robot back toward one place) can
+random-walk into that narrow band near a small obstacle's corner purely
+by chance given long enough a run; empirically, the default desk's first
+such incident lands around frame ~440. The regression test's own duration
+(350 frames) stays safely inside that window - long enough to be a
+meaningful sustained-operation proof, short enough not to gamble on an
+unrelated, already-documented algorithmic edge case.
+
+### What did not change
+
+`RobotStateMachine`, `ReturnHomeReason`, `MissionControlEventSource`,
+`HomeNavigator`, `ReactiveObstacleAvoidance`'s TurnAway/AdvanceClear
+state machine, `DriveAuthority` priority, Home Zone removal,
+`ExplorationMapper`'s sensor-observation architecture, `CoverageTrail`'s
+lifecycle, and `RobotRuntime::step()` ordering are all untouched - this
+phase is world geometry, derived robot dimensions, and tests only, as
+scoped.

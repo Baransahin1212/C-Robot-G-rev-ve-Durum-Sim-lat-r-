@@ -116,6 +116,30 @@ bool isPointSafelyInsideTable(const Vec3& point, const TableSurface& table, floa
 // #2) for the full three-concept split.
 bool areAllCornersSafelyInsideTable(const RobotPose& pose, const TableSurface& table, float margin) noexcept;
 
+// RECOVERY-ONLY geometry (table-edge recovery bugfix #3, Phase 13W
+// safety-recovery-geometry-mismatch fix): a single continuous "how far
+// off the table is the whole footprint, aggregated" scalar - 0.0F when
+// every corner is on the table (isPointOnTable() true for all four),
+// growing the further any corner(s) sit outside it. Unlike
+// CliffSensorReadings (a per-corner boolean) or
+// areAllCornersSafelyInsideTable() (a single pass/fail against a margin),
+// this is a genuinely continuous metric, specifically so
+// TableEdgeSafetyController can compare "does one small step in this
+// direction make the overall situation better or worse" - the "proposed-
+// pose safety check" this bugfix introduces for BackingAway/
+// MovingForwardFromRearEdge/AdvancingInward alike (see
+// TableEdgeSafetyController.cpp's own update() docs for why: those
+// states' recovery direction is derived from the robot's CURRENT
+// heading, which - for an edge encountered at a shallow/lateral angle -
+// is not guaranteed to be the direction that actually reduces the
+// specific overhang that triggered recovery, and blindly continuing to
+// translate in a heading-derived direction that is NOT reducing overhang
+// can drive the robot toward/off a DIFFERENT edge entirely). Computed as
+// the sum, over all four footprint corners, of how far outside `table`'s
+// bounds that corner's X and Z coordinates individually are (0 for a
+// coordinate already inside the corresponding range).
+float aggregateTableOverhang(const RobotPose& pose, const TableSurface& table) noexcept;
+
 // Raylib-free, read-only virtual cliff/table-edge sensor (Phase 13S):
 // four downward-looking corner sensors modeling the presence/absence of
 // supporting tabletop beneath the robot's footprint. This is NOT a

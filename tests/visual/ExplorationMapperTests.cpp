@@ -7,6 +7,7 @@
 #include "robot/visual/ExplorationMapper.hpp"
 #include "robot/visual/RangeObservation.hpp"
 #include "robot/visual/VirtualWorld.hpp"
+#include "robot/visual/VisualRobot.hpp"
 
 namespace
 {
@@ -213,6 +214,34 @@ TEST(ExplorationMapperTest, RobotFootprintMarkedFree)
     int farRow = -1;
     ASSERT_TRUE(map.worldToCell(Vec3{3.0F, 0.0F, 3.0F}, farCol, farRow));
     EXPECT_EQ(map.cellAt(farCol, farRow), MapCell::Unknown);
+}
+
+// Phase 13W final workspace redesign: MapperFootprintMatchesRobotDimensions
+//
+// The footprint's own forward extent must track RobotDimensions::
+// kBodyLength directly (not a fixed/independently-guessed radius) - a
+// point just inside half the body length ahead of center is marked Free;
+// a point clearly beyond it is not, proving the rectangle genuinely
+// scales with the robot's real dimensions rather than a hardcoded
+// constant left over from an earlier body size.
+TEST(ExplorationMapperTest, MapperFootprintMatchesRobotDimensions)
+{
+    ExplorationMap map(demoTable());
+    ExplorationMapper mapper(map);
+
+    mapper.update(RobotPose{Vec3{0.0F, 0.0F, 0.0F}, 0.0F}, std::vector<RangeObservation>{});
+
+    const float halfLength = robot::visual::RobotDimensions::kBodyLength / 2.0F;
+
+    int insideCol = -1;
+    int insideRow = -1;
+    ASSERT_TRUE(map.worldToCell(Vec3{0.0F, 0.0F, halfLength * 0.5F}, insideCol, insideRow));
+    EXPECT_EQ(map.cellAt(insideCol, insideRow), MapCell::Free);
+
+    int outsideCol = -1;
+    int outsideRow = -1;
+    ASSERT_TRUE(map.worldToCell(Vec3{0.0F, 0.0F, halfLength + 1.0F}, outsideCol, outsideRow));
+    EXPECT_EQ(map.cellAt(outsideCol, outsideRow), MapCell::Unknown);
 }
 
 // 10: RepeatedObservationIsIdempotent

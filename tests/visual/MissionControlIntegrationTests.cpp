@@ -256,13 +256,18 @@ TEST(MissionControlIntegrationTest, FullClosedLoopStartRoamIntegrationTest)
     EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::Fsm);
 
     // Assert: the robot physically moves - real DifferentialDrive
-    // kinematics, never a teleport.
-    const float zBefore = world.robotPose().position.z;
+    // kinematics, never a teleport. Checked via Euclidean displacement
+    // (not a specific axis) since Phase 13W v2's default start heading
+    // (90 - see VirtualWorld.cpp) moves the robot along X, not Z.
+    const Vec3 positionBefore = world.robotPose().position;
     for (int i = 0; i < 10; ++i)
     {
         h.driveFrame();
     }
-    EXPECT_NE(world.robotPose().position.z, zBefore);
+    const Vec3 positionAfter = world.robotPose().position;
+    const float dx = positionAfter.x - positionBefore.x;
+    const float dz = positionAfter.z - positionBefore.z;
+    EXPECT_GT(std::sqrt((dx * dx) + (dz * dz)), 0.0F);
 }
 
 // --- Stop / restart integration test ---
@@ -278,12 +283,18 @@ TEST(MissionControlIntegrationTest, StopRestartIntegrationTest)
     h.runtime.step();
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
 
-    const float zAfterStart = world.robotPose().position.z;
+    // Displacement checked via Euclidean distance (not a specific axis)
+    // since Phase 13W v2's default start heading (90 - see
+    // VirtualWorld.cpp) moves the robot along X, not Z.
+    const Vec3 positionAfterStart = world.robotPose().position;
     for (int i = 0; i < 10; ++i)
     {
         h.driveFrame();
     }
-    ASSERT_GT(world.robotPose().position.z, zAfterStart);
+    const Vec3 positionAfterDriving = world.robotPose().position;
+    const float dxDriving = positionAfterDriving.x - positionAfterStart.x;
+    const float dzDriving = positionAfterDriving.z - positionAfterStart.z;
+    ASSERT_GT(std::sqrt((dxDriving * dxDriving) + (dzDriving * dzDriving)), 0.0F);
 
     // Act: request Stop Task.
     h.missionControl.requestStopTask();
@@ -294,9 +305,10 @@ TEST(MissionControlIntegrationTest, StopRestartIntegrationTest)
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
     EXPECT_EQ(h.hardware.currentCommand(), VirtualDriveCommand::Stopped);
 
-    const float zAfterStop = world.robotPose().position.z;
+    const Vec3 positionAfterStop = world.robotPose().position;
     h.driveFrame();
-    EXPECT_FLOAT_EQ(world.robotPose().position.z, zAfterStop);
+    EXPECT_FLOAT_EQ(world.robotPose().position.x, positionAfterStop.x);
+    EXPECT_FLOAT_EQ(world.robotPose().position.z, positionAfterStop.z);
 
     // Act: request Start Roam again (from Ready this time).
     h.missionControl.requestStartRoam(h.stateMachine.currentState());
@@ -305,12 +317,15 @@ TEST(MissionControlIntegrationTest, StopRestartIntegrationTest)
     // Assert: StartMission accepted, FSM -> Moving, robot travels again.
     EXPECT_EQ(restartResult, RuntimeStepResult::TransitionAccepted);
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
-    const float zAfterRestart = world.robotPose().position.z;
+    const Vec3 positionAfterRestart = world.robotPose().position;
     for (int i = 0; i < 10; ++i)
     {
         h.driveFrame();
     }
-    EXPECT_GT(world.robotPose().position.z, zAfterRestart);
+    const Vec3 positionAfterRestartDriving = world.robotPose().position;
+    const float dxRestart = positionAfterRestartDriving.x - positionAfterRestart.x;
+    const float dzRestart = positionAfterRestartDriving.z - positionAfterRestart.z;
+    EXPECT_GT(std::sqrt((dxRestart * dxRestart) + (dzRestart * dzRestart)), 0.0F);
 }
 
 // --- Stop-Return-Home integration test ---
@@ -367,10 +382,12 @@ TEST(MissionControlIntegrationTest, StopDuringSafetyIntegrationTest)
 {
     // Arrange: front corner will approach the table edge while Roaming
     // straight ahead - same positioning strategy as the Phase 13S edge-
-    // safety integration tests.
+    // safety integration tests. Phase 13W v2: same 0.4F margin pattern as
+    // VirtualRobotHardwareTests.cpp's own table-edge tests, against the
+    // table's new Z half-extent (2.0F, was 6.0F).
     VirtualWorld world;
     disableAllObstacles(world);
-    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.6F});
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 1.6F});
     world.setRobotHeading(0.0F);
     MissionControlHarness h(world);
 
@@ -486,10 +503,21 @@ TEST(MissionControlIntegrationTest, StopDuringAvoidanceIntegrationTest)
 // HomeZoneMonitor.hpp/.cpp and HomeZoneMonitorTests.cpp are entirely
 // unmodified (the class itself still correctly implements the geometry
 // it always did) - only main3d.cpp's/this harness's PRODUCTION WIRING of
-// it was removed. `HomeZoneMonitor::kHomeZoneExitRadius`/
-// `kHomeZoneRearmRadius` are reused below purely as named reference
-// distances ("the boundary that used to trigger auto-return"), never by
-// constructing a HomeZoneMonitor instance.
+// it was removed.
+//
+// Phase 13W v2: the demo desk shrank from a ~12x12 square to a ~8x4
+// rectangle, so HomeZoneMonitor::kHomeZoneExitRadius (9.0F - calibrated
+// to the OLD table, where the robot's farthest reachable corner was
+// genuinely beyond it) is no longer reachable anywhere on the new,
+// smaller tabletop without driving off the desk entirely. The three
+// tests below still need SOME "clearly far from base" reference distance
+// to exercise the same regression (crossing a large distance never
+// resurrects the removed auto-return), so they use this smaller,
+// reachable-on-the-new-desk stand-in instead of the legacy constant -
+// comfortably past HomeNavigator::kHomeArrivalRadius/any "still near
+// base" reading, well short of the new table's own far corners even
+// after table-edge-safety margins are accounted for.
+constexpr float kFarDistanceThreshold = 3.0F;
 
 // 1: StartExploreDoesNotAutoReturnWhenFarFromBase
 TEST(MissionControlIntegrationTest, StartExploreDoesNotAutoReturnWhenFarFromBase)
@@ -499,7 +527,7 @@ TEST(MissionControlIntegrationTest, StartExploreDoesNotAutoReturnWhenFarFromBase
     // number of frames if it were still active.
     VirtualWorld world;
     disableAllObstacles(world);
-    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
+    world.setRobotPosition(Vec3{3.5F, 0.125F, -1.0F});
     world.setRobotHeading(180.0F);
     MissionControlHarness h(world);
 
@@ -520,7 +548,7 @@ TEST(MissionControlIntegrationTest, StartExploreDoesNotAutoReturnWhenFarFromBase
     {
         h.driveFrame();
         ASSERT_FALSE(h.hardware.collidedLastUpdate());
-        if (h.distanceToBase() > HomeZoneMonitor::kHomeZoneExitRadius)
+        if (h.distanceToBase() > kFarDistanceThreshold)
         {
             everCrossedFormerRadius = true;
         }
@@ -538,7 +566,7 @@ TEST(MissionControlIntegrationTest, CrossingFormerHomeZoneRadiusDoesNotEmitRetur
 {
     VirtualWorld world;
     disableAllObstacles(world);
-    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
+    world.setRobotPosition(Vec3{3.5F, 0.125F, -1.0F});
     world.setRobotHeading(180.0F);
     MissionControlHarness h(world);
 
@@ -558,7 +586,7 @@ TEST(MissionControlIntegrationTest, CrossingFormerHomeZoneRadiusDoesNotEmitRetur
     {
         h.driveFrame();
         ASSERT_FALSE(h.hardware.collidedLastUpdate());
-        if (h.distanceToBase() > HomeZoneMonitor::kHomeZoneExitRadius)
+        if (h.distanceToBase() > kFarDistanceThreshold)
         {
             everCrossedFormerRadius = true;
         }
@@ -575,7 +603,7 @@ TEST(MissionControlIntegrationTest, RobotCanContinueExploringBeyondFormerExitRad
 {
     VirtualWorld world;
     disableAllObstacles(world);
-    world.setRobotPosition(Vec3{4.0F, 0.125F, -1.0F});
+    world.setRobotPosition(Vec3{3.5F, 0.125F, -1.0F});
     world.setRobotHeading(180.0F);
     MissionControlHarness h(world);
 
@@ -592,11 +620,11 @@ TEST(MissionControlIntegrationTest, RobotCanContinueExploringBeyondFormerExitRad
     // since over enough simulated time table-edge recovery turning could
     // legitimately carry the robot back closer to base again with no
     // path memory, which is irrelevant to what this test checks.
-    for (int frame = 0; frame < 2500 && h.distanceToBase() <= HomeZoneMonitor::kHomeZoneExitRadius; ++frame)
+    for (int frame = 0; frame < 2500 && h.distanceToBase() <= kFarDistanceThreshold; ++frame)
     {
         h.driveFrame();
     }
-    ASSERT_GT(h.distanceToBase(), HomeZoneMonitor::kHomeZoneExitRadius);
+    ASSERT_GT(h.distanceToBase(), kFarDistanceThreshold);
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
 
     const Vec3 positionBeyondBoundary = world.robotPose().position;
@@ -658,12 +686,18 @@ TEST(MissionControlIntegrationTest, BatteryCriticalReturnHomeStillWorks)
     h.runtime.step();
     h.runtime.step();
     ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
-    const float zAfterStart = world.robotPose().position.z;
+    // Displacement checked via Euclidean distance (not a specific axis)
+    // since Phase 13W v2's default start heading (90 - see
+    // VirtualWorld.cpp) moves the robot along X, not Z.
+    const Vec3 positionAfterStart = world.robotPose().position;
     for (int i = 0; i < 10; ++i)
     {
         h.driveFrame();
     }
-    ASSERT_GT(world.robotPose().position.z, zAfterStart);
+    const Vec3 positionAfterDriving = world.robotPose().position;
+    const float dxDriving = positionAfterDriving.x - positionAfterStart.x;
+    const float dzDriving = positionAfterDriving.z - positionAfterStart.z;
+    ASSERT_GT(std::sqrt((dxDriving * dxDriving) + (dzDriving * dzDriving)), 0.0F);
 
     // Act: BatteryCritical, injected through the real composite event
     // chain (never stateMachine.processEvent() directly), so

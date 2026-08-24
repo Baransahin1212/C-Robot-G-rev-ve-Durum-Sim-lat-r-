@@ -380,11 +380,22 @@ built-in default font if the file cannot be read.
 
 It opens a real 1280x720 window titled **"Robot Simulator 3D"** (starting
 in borderless fullscreen - press `F11` to toggle windowed) showing a small
-hard-coded demo world: a ground plane and grid, a two-wheel robot model
-(body, two wheels, a red front heading marker), four box obstacles, and a
-base/docking platform, viewed through a perspective camera you can orbit
-with the mouse (`TAB` toggles mouse capture, drag to rotate, scroll to
-zoom - raylib's built-in `CAMERA_FREE` mode).
+hard-coded demo world dressed as a clean, miniature desktop workspace
+(Phase 13W final workspace redesign): a wood-toned rectangular desk
+(~160x80cm, ~8x4 world units, 2:1 aspect ratio), a small two-wheel robot
+model (body, two wheels, a red front heading marker) scaled to read as a
+genuinely miniature ~8x10cm desktop companion, exactly three recognizable
+desk objects - a monitor, keyboard, and mouse, deterministically laid out
+near the desk's rear - and a compact charging-dock platform (rear
+housing, guide arms, parking slot, contact pads) immediately beside the
+monitor as the robot's home/base, viewed through an elevated three-
+quarter perspective camera you can further orbit with the mouse (`TAB`
+toggles mouse capture, drag to rotate, scroll to zoom - raylib's built-in
+`CAMERA_FREE` mode). No mug, notebook, lamp, or generic "clutter" boxes
+remain - every physical obstacle on the desk corresponds to one of these
+three visible objects or the dock's own housing. See "Desktop Workspace"
+below for how the desk objects/dock relate to obstacle sensing,
+collision, and the exploration map.
 
 **As of Phase 13U, the robot does NOT move on its own.** It starts `Idle`,
 with the on-screen **Mission Control** panel (top-right) reading
@@ -1046,7 +1057,7 @@ already doing their job on top of a plain forward FSM command.
 position is clamped to a generic ~10x10 simulation-coordinate bound (a
 purely defensive numeric safety net, never expected to be reached in
 practice now that the table-edge safety system keeps the robot on the
-much smaller ~12x12 table well before that) so it cannot drift away
+much smaller ~8x4 desk well before that) so it cannot drift away
 indefinitely (`DifferentialDrive` itself is world-bounds- and
 obstacle-agnostic - both clamping and collision-checking stay in
 `VirtualRobotHardware`); and wheel speeds change instantly with no
@@ -1151,6 +1162,78 @@ incompatible file prints one warning and also starts a fresh map -
 loading never crashes and never silently reinterprets an incompatible
 grid. `runtime/` is gitignored - a generated map is never source-
 controlled content.
+
+### Desktop Workspace (Phase 13W final workspace redesign)
+
+The demo scene is dressed as a **clean, miniature desktop-robot
+workspace** - purely a world-model/presentation change, not a new
+behavior: the robot is meant to read as "a small autonomous robot living
+on a computer desk," not "a robot driving around generic cubes," and the
+desk itself holds only what an actual computer desk needs.
+
+**Exactly three recognizable desk objects**, one deterministic cluster
+near the desk's rear (never random): a monitor (screen slab + neck +
+stand), a keyboard (low body + a few raised key-row strips, never
+hundreds of individual keys), and a mouse (low box + rounded cap). The
+earlier redesign pass's mug/notebook/lamp-base desk-clutter items are
+gone entirely - both visually and physically - an explicit product
+requirement for a clean desk; `DeskObjectType`/`Renderer3D`'s own
+`drawMug()`/`drawNotebook()`/`drawLampBase()` helpers remain defined
+(avoiding unnecessary churn to remove a still-harmless, unused code path)
+but nothing in `VirtualWorld`'s constructor ever instantiates one. Each
+object is a `DeskObject` (`VirtualWorld.hpp`) - a semantic
+`type`/`position`/`size`/`enabled` record - kept strictly separate from
+its **physical collision geometry**: every `DeskObject` is registered
+together with a plain `BoxObstacle` of identical position/footprint
+(`VirtualWorld::addDeskObject()`), so `VirtualDistanceSensor`/
+`VirtualObstacleSensorArray`/`ForwardClearanceProbe`/`RobotCollision`
+never know `DeskObject`/`DeskObjectType` exist at all - they still only
+ever see the same plain obstacle list they always did. A monitor's
+registered footprint is its small STAND base, not its full visual
+screen+neck volume, so it can never physically block the robot at
+"screen height" (collision here is always a pure X/Z footprint test -
+height never participates). The entire front half of the desk is
+deliberately left open for the robot to explore.
+
+**The robot itself is miniature.** `RobotDimensions` (`VisualRobot.hpp`)
+is ~0.40x0.50 world units (~8x10cm at this project's ~20cm-per-world-unit
+design scale) - the monitor's screen reads ~7-8 robot widths across, the
+keyboard ~5-6. `RobotCollision::kRobotCollisionRadius` is derived
+directly from those dimensions (half-diagonal plus a small named safety
+margin, `kCollisionSafetyMargin`) rather than an independently-chosen
+number, so every dependent system - `VirtualObstacleSensorArray`'s ray
+origins, `VirtualCliffSensor`'s corner positions, `DifferentialDrive`'s
+default wheel track, `ExplorationMapper`'s footprint-marking rectangle,
+`ReactiveObstacleAvoidance`'s minimum bypass distance - stays coherent
+automatically if the robot is ever rescaled again.
+
+**The exploration map stays honest.** `ExplorationMapper` was not
+touched by this phase at all - it still only ever takes a `RobotPose`
+plus real `RangeObservation`s, still has no `VirtualWorld` reference of
+any kind. A desk object only becomes `Occupied` map geometry once the
+robot's real sensor has actually observed it; an unseen desk object
+elsewhere in the cluster stays `Unknown` exactly like any other
+undiscovered obstacle. Nothing about *which* desk object produced an
+occupied cell is ever recoverable from the map - it only ever learns
+geometry, never a semantic label.
+
+**The charging dock sits immediately beside the monitor**, near the
+desk's rear edge - an explicit product requirement, replacing an earlier
+pass's front-edge placement. `BasePlatform` (`VirtualWorld.hpp`) remains
+the one semantic "home" record `HomeNavigator`/`HomeArrivalEventSource`/
+the exploration map's home marker all target - no new navigation/docking
+world-model type was introduced. `Renderer3D::drawChargingDock()` draws a
+small station silhouette (rear housing, two guide arms, an open parking
+slot, two contact pads) straight from `BasePlatform`'s own existing
+position/size, plus one dedicated rear-housing `BoxObstacle`
+(`VirtualWorld::kDockHousingIndex`) - the ONE physically collidable dock
+piece, facing the desk's own rear (-Z) table edge, opposite the parking
+slot's open entrance (which faces the desk interior, where the robot
+actually parks from/departs to). The guide arms/contact pads are visual
+only. **This phase does not implement docking behavior** - no charging
+simulation, no approach-point controller, no docking-specific sensor
+handling: Return Home still simply drives to `BasePlatform.position`
+exactly as before, now visualized as a dock instead of a flat platform.
 
 ## The six final scenarios
 

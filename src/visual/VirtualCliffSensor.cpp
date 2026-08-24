@@ -75,6 +75,41 @@ bool areAllCornersSafelyInsideTable(const RobotPose& pose, const TableSurface& t
            isPointSafelyInsideTable(cliffSensorWorldPosition(pose, CliffSensorPosition::RearRight), table, margin);
 }
 
+namespace
+{
+
+float pointOverhang(const Vec3& point, const TableSurface& table) noexcept
+{
+    float overhang = 0.0F;
+    if (point.x < table.minX)
+    {
+        overhang += table.minX - point.x;
+    }
+    else if (point.x > table.maxX)
+    {
+        overhang += point.x - table.maxX;
+    }
+    if (point.z < table.minZ)
+    {
+        overhang += table.minZ - point.z;
+    }
+    else if (point.z > table.maxZ)
+    {
+        overhang += point.z - table.maxZ;
+    }
+    return overhang;
+}
+
+} // namespace
+
+float aggregateTableOverhang(const RobotPose& pose, const TableSurface& table) noexcept
+{
+    return pointOverhang(cliffSensorWorldPosition(pose, CliffSensorPosition::FrontLeft), table) +
+           pointOverhang(cliffSensorWorldPosition(pose, CliffSensorPosition::FrontRight), table) +
+           pointOverhang(cliffSensorWorldPosition(pose, CliffSensorPosition::RearLeft), table) +
+           pointOverhang(cliffSensorWorldPosition(pose, CliffSensorPosition::RearRight), table);
+}
+
 VirtualCliffSensor::VirtualCliffSensor(const VirtualWorld& world)
     : world_(world)
 {

@@ -328,6 +328,39 @@ private:
     void drawScene(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
     void drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
 
+    // Phase 13W: dispatches on `object.type` to the matching drawX()
+    // helper below - the one place DeskObjectType is ever switched on for
+    // presentation. Each helper draws a self-contained, recognizable
+    // desktop-object silhouette using simple raylib primitives anchored at
+    // `object.position`, with its own small set of fixed internal
+    // proportions (screen height, stem height, ...) - never derived from
+    // `object.size` alone, since that field is the small collision
+    // FOOTPRINT (see DeskObject's own docs in VirtualWorld.hpp), not a
+    // full visual bounding box. Collision/sensing never call any of these
+    // - they only ever see the plain BoxObstacle registered alongside
+    // each DeskObject.
+    void drawDeskObject(const DeskObject& object) const;
+    void drawMonitor(const Vec3& position, const Vec3& footprint) const;
+    void drawKeyboard(const Vec3& position, const Vec3& footprint) const;
+    void drawMouse(const Vec3& position, const Vec3& footprint) const;
+    void drawMug(const Vec3& position, const Vec3& footprint) const;
+    void drawNotebook(const Vec3& position, const Vec3& footprint) const;
+    void drawLampBase(const Vec3& position, const Vec3& footprint) const;
+
+    // Phase 13W: replaces the old flat single-cube base-platform draw with
+    // a recognizable small charging-dock silhouette (rear housing + two
+    // visual-only guide arms + open parking slot + two contact pads) -
+    // drawn from `world.basePlatform()`'s existing position/size (the
+    // platform/slot) plus `world.obstacles()[VirtualWorld::kDockHousingIndex]`
+    // (the one physically collidable piece - see that constant's own
+    // docs). No new world-model type was introduced for this (see
+    // docs/technical-decisions.md, Phase 13W, "charging-dock V1
+    // compatibility decision"). Purely presentation: HomeNavigator/
+    // HomeArrivalEventSource/the exploration map's home marker all still
+    // target `basePlatform().position` directly, unaffected by how it is
+    // drawn.
+    void drawChargingDock(const VirtualWorld& world) const;
+
     // Phase 13V: the bottom-right inset 2D exploration-map panel - top-
     // down, fixed orientation (never rotates with the robot), drawn from
     // `map`'s own cell states only. Deliberately never reads

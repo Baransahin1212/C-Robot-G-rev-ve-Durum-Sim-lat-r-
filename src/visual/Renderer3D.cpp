@@ -21,15 +21,51 @@ Vector3 toRaylibVector3(const Vec3& v)
     return Vector3{v.x, v.y, v.z};
 }
 
-constexpr float kGroundHalfExtent = 10.0F; // matches the grid below (20 slices * 1.0 spacing)
-constexpr int kGridSlices = 20;
+// Phase 13W human-visual-redesign v2: shrunk from the old 10.0F/20 (sized
+// for the old 12x12 square table) so the outside floor/grid no longer
+// dwarfs the new, smaller 8x4 desk - still a bit larger than the desk
+// itself (context, not a hard wall), but no longer the dominant feature
+// of the frame.
+constexpr float kGroundHalfExtent = 6.0F; // matches the grid below (12 slices * 1.0 spacing)
+constexpr int kGridSlices = 12;
 constexpr float kGridSpacing = 1.0F;
 
-constexpr Color kGroundColor = Color{60, 90, 60, 255};
-constexpr Color kObstacleColor = ORANGE;
-constexpr Color kObstacleOutlineColor = MAROON;
-constexpr Color kBaseColor = Color{80, 140, 220, 255};
-constexpr Color kBaseOutlineColor = DARKBLUE;
+// Phase 13W human-visual-redesign v2: darker, lower-contrast than the
+// original bright green - human validation flagged the outside
+// ground/grid as visually competing with the desk itself. Still present
+// (never fully removed - the brief's own "reduce dominance... not
+// necessarily remove it completely"), just deliberately recessive now.
+constexpr Color kGroundColor = Color{35, 45, 38, 255};
+
+// Phase 13W: desktop-workspace palette - coherent, neutral desk colors
+// rather than every object sharing one bright color. Kept dark/neutral
+// for the electronics (monitor/keyboard/mouse/lamp/dock), with the mug
+// and notebook each carrying one small accent color, matching the
+// brief's own "table: wood, monitor: dark gray/black, ... one accent
+// color" guidance.
+constexpr Color kDeskObjectOutlineColor = Color{20, 20, 22, 255};
+constexpr Color kMonitorBodyColor = Color{48, 48, 52, 255};
+constexpr Color kMonitorScreenColor = Color{18, 22, 30, 255};
+constexpr Color kKeyboardColor = Color{58, 58, 62, 255};
+constexpr Color kKeyRowColor = Color{40, 40, 44, 255};
+constexpr Color kMouseColor = Color{52, 52, 58, 255};
+constexpr Color kMugBodyColor = Color{188, 72, 58, 255};
+constexpr Color kMugHandleColor = Color{164, 60, 48, 255};
+constexpr Color kNotebookCoverColor = Color{62, 104, 128, 255};
+constexpr Color kNotebookPageColor = Color{222, 216, 196, 255};
+constexpr Color kLampBaseColor = Color{42, 42, 46, 255};
+constexpr Color kLampStemColor = Color{64, 64, 68, 255};
+constexpr Color kLampHeadColor = Color{214, 200, 158, 255};
+
+// Charging dock palette (Phase 13W) - dark/neutral housing, matching the
+// brief's "dock: dark/black" guidance, with a small brass/gold accent on
+// the contact pads so they read as functional detail, not just more dark
+// plastic.
+constexpr Color kDockPlatformColor = Color{58, 58, 64, 255};
+constexpr Color kDockPlatformOutlineColor = Color{30, 30, 34, 255};
+constexpr Color kDockHousingColor = Color{34, 34, 38, 255};
+constexpr Color kDockGuideArmColor = Color{50, 50, 55, 255};
+constexpr Color kDockContactPadColor = Color{196, 168, 64, 255};
 
 // Table surface visualization (Phase 13S): a simple raised rectangular
 // platform, never a vertical wall - the whole point is that the ground
@@ -40,7 +76,11 @@ constexpr Color kBaseOutlineColor = DARKBLUE;
 constexpr Color kTableColor = Color{180, 140, 90, 255};
 constexpr Color kTableOutlineColor = Color{110, 80, 40, 255};
 constexpr float kTableTopY = 0.02F;
-constexpr float kTableThickness = 0.06F;
+// Phase 13W human-visual-redesign v2: thickened from 0.06F so the desk
+// reads as a solid slab with visible edge thickness from the new elevated
+// three-quarter camera angle (brief: "clean rectangular slab, visible
+// thickness"), not a paper-thin plane.
+constexpr float kTableThickness = 0.15F;
 
 // Sensor ray colors (Phase 13O): red once the reading is within
 // VirtualDistanceSensor::kDetectionDistance (obstacleDetected() true), amber
@@ -87,7 +127,15 @@ constexpr Color kMissionControlTaskColor = Color{255, 220, 100, 255};
 // fixed orientation - never rotated by robot heading (Phase 13V brief).
 constexpr int kExplorationPanelMarginRight = 20;
 constexpr int kExplorationPanelMarginBottom = 20;
-constexpr int kExplorationGridPixelSize = 220;
+
+// Phase 13W human-visual-redesign v2: the map viewport now preserves the
+// desk's own physical aspect ratio (~2:1, width:depth) instead of forcing
+// the rectangular 67x33-ish grid into a square drawing area (human
+// validation: "the map is visually square instead of matching the desk").
+// A fixed WIDTH with height derived from the actual TableSurface aspect
+// ratio (never a hardcoded height) keeps this correct if the table's own
+// dimensions ever change again.
+constexpr int kExplorationGridPixelWidth = 300;
 constexpr Color kExplorationUnknownColor = kHudPanelBackground; // "not yet observed" reads as the panel's own background
 constexpr Color kExplorationFreeColor = Color{70, 90, 70, 255};
 constexpr Color kExplorationOccupiedColor = Color{200, 70, 60, 255};
@@ -95,7 +143,7 @@ constexpr Color kExplorationTrailColor = Color{80, 220, 220, 255}; // matches kH
 constexpr Color kExplorationBoundaryColor = LIGHTGRAY;
 constexpr Color kExplorationRobotColor = Color{255, 220, 100, 255}; // matches kMissionControlTaskColor
 constexpr Color kExplorationHeadingColor = RED;
-constexpr Color kExplorationBaseColor = Color{80, 140, 220, 255}; // matches kBaseColor
+constexpr Color kExplorationBaseColor = Color{80, 140, 220, 255}; // the map panel's own home/base marker color
 
 struct HudLine
 {
@@ -151,8 +199,33 @@ Renderer3D::Renderer3D()
     : camera_{}
     , font_{}
 {
-    camera_.position = Vector3{8.0F, 8.0F, 8.0F};
-    camera_.target = Vector3{0.0F, 0.0F, 0.0F};
+    // Phase 13W human-visual-redesign v2: elevated three-quarter
+    // workstation view, replacing the old distant near-isometric (8,8,8)
+    // camera human validation flagged as "too distant... looks like a
+    // robotics debug environment, not a computer desk." Derived from
+    // VirtualWorld's own table extents (kDeskHalfWidth/kDeskHalfDepth
+    // below mirror VirtualWorld.cpp's kTableHalfWidth/kTableHalfDepth -
+    // the table is deliberately fixed/deterministic, never runtime-
+    // configurable, so this is a documented FORMULA against the current
+    // desk size, not a number re-tuned by hand for the old square table)
+    // via simple spherical coordinates around the table center: a ~40
+    // degree yaw and ~32 degree elevation angle, at a distance
+    // proportional to the desk's longer axis - close enough that the
+    // rectangular desk fills most of the viewport while the whole
+    // tabletop, monitor, keyboard, and dock all stay in frame.
+    constexpr float kDeskHalfWidth = 4.0F;
+    constexpr float kDeskHalfDepth = 2.0F;
+    constexpr float kCameraDistance = std::max(kDeskHalfWidth, kDeskHalfDepth) * 2.0F * 0.85F;
+    constexpr float kPi = 3.14159265358979323846F;
+    constexpr float kYawDegrees = 40.0F;
+    constexpr float kElevationDegrees = 32.0F;
+    const float yawRadians = kYawDegrees * (kPi / 180.0F);
+    const float elevationRadians = kElevationDegrees * (kPi / 180.0F);
+    const float horizontalRadius = kCameraDistance * std::cos(elevationRadians);
+
+    camera_.position = Vector3{horizontalRadius * std::sin(yawRadians), kCameraDistance * std::sin(elevationRadians),
+                                horizontalRadius * std::cos(yawRadians)};
+    camera_.target = Vector3{0.0F, 0.1F, 0.0F};
     camera_.up = Vector3{0.0F, 1.0F, 0.0F};
     camera_.fovy = 45.0F;
     camera_.projection = CAMERA_PERSPECTIVE;
@@ -253,21 +326,21 @@ void Renderer3D::drawScene(const VirtualWorld& world, const VisualTelemetry& tel
     DrawCube(tableCenter, tableWidth, kTableThickness, tableDepth, kTableColor);
     DrawCubeWires(tableCenter, tableWidth, kTableThickness, tableDepth, kTableOutlineColor);
 
-    for (const BoxObstacle& obstacle : world.obstacles())
+    // Phase 13W human-visual-redesign v2: the old generic-cube demo
+    // obstacles are gone entirely - the default workspace's only physical
+    // obstacles are the six desk objects (drawn below via
+    // drawDeskObject()) and the dock's rear housing (drawChargingDock()).
+    // Nothing here draws a plain, undecorated box anymore.
+    for (const DeskObject& object : world.deskObjects())
     {
-        if (!obstacle.enabled)
+        if (!object.enabled)
         {
             continue;
         }
-        const Vector3 position = toRaylibVector3(obstacle.position);
-        DrawCube(position, obstacle.size.x, obstacle.size.y, obstacle.size.z, kObstacleColor);
-        DrawCubeWires(position, obstacle.size.x, obstacle.size.y, obstacle.size.z, kObstacleOutlineColor);
+        drawDeskObject(object);
     }
 
-    const BasePlatform& base = world.basePlatform();
-    const Vector3 basePosition = toRaylibVector3(base.position);
-    DrawCube(basePosition, base.size.x, base.size.y, base.size.z, kBaseColor);
-    DrawCubeWires(basePosition, base.size.x, base.size.y, base.size.z, kBaseOutlineColor);
+    drawChargingDock(world);
 
     drawVisualRobot(world.robotPose());
 
@@ -306,6 +379,201 @@ void Renderer3D::drawScene(const VirtualWorld& world, const VisualTelemetry& tel
         guideEnd.y = world.robotPose().position.y;
         DrawLine3D(toRaylibVector3(world.robotPose().position), guideEnd, kHomeGuideColor);
     }
+}
+
+void Renderer3D::drawDeskObject(const DeskObject& object) const
+{
+    switch (object.type)
+    {
+        case DeskObjectType::Monitor: drawMonitor(object.position, object.size); break;
+        case DeskObjectType::Keyboard: drawKeyboard(object.position, object.size); break;
+        case DeskObjectType::Mouse: drawMouse(object.position, object.size); break;
+        case DeskObjectType::Mug: drawMug(object.position, object.size); break;
+        case DeskObjectType::Notebook: drawNotebook(object.position, object.size); break;
+        case DeskObjectType::LampBase: drawLampBase(object.position, object.size); break;
+    }
+}
+
+// Every drawX() below anchors at `position` (the object's registered
+// collision-footprint center - see DeskObject's own docs) and
+// `footprint.y`, which is treated as the small slab the object visually
+// "sits in" on the desk - anything taller (a monitor's neck/screen, a
+// lamp's stem/head) uses its own small set of FIXED internal proportions,
+// entirely independent of `footprint`, exactly because the collision
+// footprint is deliberately not the full visual volume (see
+// RobotCollisionTests.cpp's MonitorFootprintIsStandSizedNotFullScreenVolume).
+
+void Renderer3D::drawMonitor(const Vec3& position, const Vec3& footprint) const
+{
+    // Phase 13W human-visual-redesign v2: the screen is deliberately the
+    // visually DOMINANT desk object (brief: "screen width should be
+    // approximately 4.5-5.5x robot width") - scaled up substantially from
+    // the v1 redesign's own too-small screen (human validation flagged
+    // "the monitor is far too small"). Still entirely independent of
+    // `footprint` (the small stand collision box) - see this class' own
+    // drawDeskObject() docs for why.
+    constexpr float kNeckHeight = 0.22F;
+    constexpr float kNeckWidth = 0.08F;
+    constexpr float kScreenWidth = 3.0F;
+    constexpr float kScreenHeight = 1.65F;
+    constexpr float kScreenThickness = 0.15F;
+    constexpr float kBezelInset = 0.08F;
+
+    const float baseTopY = position.y + (footprint.y / 2.0F);
+    const Vector3 standCenter = toRaylibVector3(position);
+    DrawCube(standCenter, footprint.x, footprint.y, footprint.z, kMonitorBodyColor);
+    DrawCubeWires(standCenter, footprint.x, footprint.y, footprint.z, kDeskObjectOutlineColor);
+
+    const Vector3 neckCenter{position.x, baseTopY + (kNeckHeight / 2.0F), position.z};
+    DrawCube(neckCenter, kNeckWidth, kNeckHeight, kNeckWidth, kMonitorBodyColor);
+
+    const float screenCenterY = baseTopY + kNeckHeight + (kScreenHeight / 2.0F);
+    const Vector3 screenCenter{position.x, screenCenterY, position.z};
+    DrawCube(screenCenter, kScreenWidth, kScreenHeight, kScreenThickness, kMonitorBodyColor);
+    DrawCubeWires(screenCenter, kScreenWidth, kScreenHeight, kScreenThickness, kDeskObjectOutlineColor);
+
+    // Phase 13W human-visual-redesign v2: the screen face points toward
+    // +Z (the desk interior/robot workspace, where the keyboard and robot
+    // sit - see VirtualWorld.cpp's layout, monitor at the -Z/"rear" edge
+    // facing forward) - "the screen should face the desk front/robot
+    // workspace... not sideways or away from the default camera."
+    const Vector3 faceCenter{position.x, screenCenterY, position.z + (kScreenThickness / 2.0F)};
+    DrawCube(faceCenter, kScreenWidth - kBezelInset, kScreenHeight - kBezelInset, 0.01F, kMonitorScreenColor);
+}
+
+void Renderer3D::drawKeyboard(const Vec3& position, const Vec3& footprint) const
+{
+    const Vector3 bodyCenter = toRaylibVector3(position);
+    DrawCube(bodyCenter, footprint.x, footprint.y, footprint.z, kKeyboardColor);
+    DrawCubeWires(bodyCenter, footprint.x, footprint.y, footprint.z, kDeskObjectOutlineColor);
+
+    // A recognizable silhouette only needs a handful of raised key-row
+    // strips, never hundreds of individual keys (this phase's own brief:
+    // "do NOT render hundreds of individual keys").
+    constexpr int kRowCount = 3;
+    constexpr float kRowHeight = 0.015F;
+    constexpr float kRowDepth = 0.05F;
+    const float rowWidth = footprint.x * 0.85F;
+    const float topY = position.y + (footprint.y / 2.0F) + (kRowHeight / 2.0F);
+    for (int row = 0; row < kRowCount; ++row)
+    {
+        const float t = (static_cast<float>(row) + 0.5F) / static_cast<float>(kRowCount);
+        const float rowZ = position.z - (footprint.z / 2.0F) + (t * footprint.z);
+        DrawCube(Vector3{position.x, topY, rowZ}, rowWidth, kRowHeight, kRowDepth, kKeyRowColor);
+    }
+}
+
+void Renderer3D::drawMouse(const Vec3& position, const Vec3& footprint) const
+{
+    const Vector3 bodyCenter = toRaylibVector3(position);
+    DrawCube(bodyCenter, footprint.x, footprint.y, footprint.z, kMouseColor);
+    DrawCubeWires(bodyCenter, footprint.x, footprint.y, footprint.z, kDeskObjectOutlineColor);
+
+    // A low sphere cap on top approximates a rounded mouse shell - simple
+    // primitives only, per this phase's own brief.
+    const float capRadius = std::min(footprint.x, footprint.z) * 0.45F;
+    const Vector3 capCenter{position.x, position.y + (footprint.y / 2.0F), position.z};
+    DrawSphere(capCenter, capRadius, kMouseColor);
+}
+
+void Renderer3D::drawMug(const Vec3& position, const Vec3& footprint) const
+{
+    constexpr int kCylinderSlices = 16;
+    const float radius = std::min(footprint.x, footprint.z) / 2.0F;
+    const float bodyHeight = footprint.y;
+    const Vector3 bottomCenter{position.x, position.y - (bodyHeight / 2.0F), position.z};
+    const Vector3 topCenter{position.x, position.y + (bodyHeight / 2.0F), position.z};
+    DrawCylinderEx(bottomCenter, topCenter, radius, radius, kCylinderSlices, kMugBodyColor);
+
+    // Simple handle approximation - a single thin box off to one side, per
+    // this phase's own brief ("do not make handle collision unnecessarily
+    // complex" - this is visual only, no collision of its own).
+    const float handleWidth = radius * 0.35F;
+    const Vector3 handleCenter{position.x + radius + (handleWidth / 2.0F), position.y, position.z};
+    DrawCube(handleCenter, handleWidth, bodyHeight * 0.5F, handleWidth, kMugHandleColor);
+}
+
+void Renderer3D::drawNotebook(const Vec3& position, const Vec3& footprint) const
+{
+    const Vector3 coverCenter = toRaylibVector3(position);
+    DrawCube(coverCenter, footprint.x, footprint.y, footprint.z, kNotebookCoverColor);
+    DrawCubeWires(coverCenter, footprint.x, footprint.y, footprint.z, kDeskObjectOutlineColor);
+
+    constexpr float kPageInset = 0.04F;
+    constexpr float kPageHeightFactor = 0.6F;
+    const Vector3 pageCenter{position.x, position.y + (footprint.y / 2.0F) * 0.5F, position.z};
+    DrawCube(pageCenter, footprint.x - kPageInset, footprint.y * kPageHeightFactor, footprint.z - kPageInset,
+              kNotebookPageColor);
+}
+
+void Renderer3D::drawLampBase(const Vec3& position, const Vec3& footprint) const
+{
+    // Phase 13W human-visual-redesign v2: scaled up alongside the larger
+    // (0.8 diameter) base - "stem: visually tall, lamp head: clearly
+    // recognizable."
+    constexpr int kCylinderSlices = 16;
+    constexpr float kStemHeight = 0.7F;
+    constexpr float kStemRadius = 0.035F;
+    constexpr float kHeadRadius = 0.2F;
+
+    const float baseRadius = std::min(footprint.x, footprint.z) / 2.0F;
+    const Vector3 baseBottom{position.x, position.y - (footprint.y / 2.0F), position.z};
+    const Vector3 baseTop{position.x, position.y + (footprint.y / 2.0F), position.z};
+    DrawCylinderEx(baseBottom, baseTop, baseRadius, baseRadius, kCylinderSlices, kLampBaseColor);
+
+    const Vector3 stemBottom = baseTop;
+    const Vector3 stemTop{position.x, baseTop.y + kStemHeight, position.z};
+    DrawCylinderEx(stemBottom, stemTop, kStemRadius, kStemRadius, 10, kLampStemColor);
+
+    DrawSphere(stemTop, kHeadRadius, kLampHeadColor);
+}
+
+void Renderer3D::drawChargingDock(const VirtualWorld& world) const
+{
+    const BasePlatform& base = world.basePlatform();
+    const Vector3 platformCenter = toRaylibVector3(base.position);
+    DrawCube(platformCenter, base.size.x, base.size.y, base.size.z, kDockPlatformColor);
+    DrawCubeWires(platformCenter, base.size.x, base.size.y, base.size.z, kDockPlatformOutlineColor);
+
+    // Rear housing - the one physically collidable dock piece (see
+    // VirtualWorld::kDockHousingIndex's own docs); drawn at its exact
+    // registered collision position, never a separately-eyeballed visual
+    // position.
+    const BoxObstacle& housing = world.obstacles()[VirtualWorld::kDockHousingIndex];
+    const Vector3 housingCenter = toRaylibVector3(housing.position);
+    DrawCube(housingCenter, housing.size.x, housing.size.y, housing.size.z, kDockHousingColor);
+    DrawCubeWires(housingCenter, housing.size.x, housing.size.y, housing.size.z, kDeskObjectOutlineColor);
+
+    // Two SHORT guide arms flanking the entrance (the platform's +Z/open-
+    // desk-interior side, opposite the rear housing at -Z - see
+    // VirtualWorld.cpp's kDockHousingZ; Phase 13W final redesign flipped
+    // the dock to sit near the desk's REAR edge, so the housing/entrance
+    // sides swapped from the earlier v2 pass), and two contact pads on the
+    // platform floor near the housing - VISUAL ONLY (this phase's brief,
+    // "guide arms may be visual-only" - option B): neither participates in
+    // obstacle sensing/collision, so the open parking slot between them
+    // always stays physically reachable regardless of approach angle.
+    // Rescaled alongside the dock's own smaller footprint (brief's own
+    // "guide arms: SHORT... do NOT make a giant floor platform").
+    constexpr float kArmWidth = 0.07F;
+    constexpr float kArmHeight = 0.08F;
+    constexpr float kArmDepth = 0.11F;
+    const float armInsetX = (base.size.x / 2.0F) - (kArmWidth / 2.0F);
+    const float armCenterZ = base.position.z + (base.size.z / 2.0F) - (kArmDepth / 2.0F);
+    const float armCenterY = base.position.y + (base.size.y / 2.0F) + (kArmHeight / 2.0F);
+    DrawCube(Vector3{base.position.x - armInsetX, armCenterY, armCenterZ}, kArmWidth, kArmHeight, kArmDepth,
+              kDockGuideArmColor);
+    DrawCube(Vector3{base.position.x + armInsetX, armCenterY, armCenterZ}, kArmWidth, kArmHeight, kArmDepth,
+              kDockGuideArmColor);
+
+    constexpr float kPadSize = 0.07F;
+    constexpr float kPadHeight = 0.01F;
+    const float padCenterZ = base.position.z - (base.size.z / 2.0F) * 0.3F;
+    const float padCenterY = base.position.y + (base.size.y / 2.0F) + (kPadHeight / 2.0F);
+    DrawCube(Vector3{base.position.x - (base.size.x * 0.2F), padCenterY, padCenterZ}, kPadSize, kPadHeight, kPadSize,
+              kDockContactPadColor);
+    DrawCube(Vector3{base.position.x + (base.size.x * 0.2F), padCenterY, padCenterZ}, kPadSize, kPadHeight, kPadSize,
+              kDockContactPadColor);
 }
 
 void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const
@@ -680,7 +948,21 @@ void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const Explor
     };
     constexpr std::size_t headerLineCount = sizeof(headerLines) / sizeof(headerLines[0]);
 
-    int panelWidth = kExplorationGridPixelSize;
+    // Phase 13W human-visual-redesign v2: the grid viewport's height is
+    // derived from the map's own real TableSurface aspect ratio (never a
+    // second, hardcoded height) - a wide, short viewport for the current
+    // ~2:1 desk, but this keeps matching whatever the table's actual
+    // proportions are if they ever change again.
+    const TableSurface& gridBounds = map.bounds();
+    const float gridWorldWidth = gridBounds.maxX - gridBounds.minX;
+    const float gridWorldHeight = gridBounds.maxZ - gridBounds.minZ;
+    const int gridPixelWidth = kExplorationGridPixelWidth;
+    const int gridPixelHeight = (gridWorldWidth > 0.0F)
+                                     ? std::max(1, static_cast<int>(static_cast<float>(gridPixelWidth) *
+                                                                     (gridWorldHeight / gridWorldWidth)))
+                                     : gridPixelWidth;
+
+    int panelWidth = gridPixelWidth;
     int headerHeight = 0;
     for (std::size_t i = 0; i < headerLineCount; ++i)
     {
@@ -688,7 +970,7 @@ void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const Explor
         headerHeight += headerLines[i].fontSize + kHudLineSpacing;
     }
     panelWidth += 2 * kHudPadding;
-    const int panelHeight = headerHeight + kExplorationGridPixelSize + (3 * kHudPadding);
+    const int panelHeight = headerHeight + gridPixelHeight + (3 * kHudPadding);
 
     const int panelX = GetScreenWidth() - kExplorationPanelMarginRight - panelWidth;
     const int panelY = GetScreenHeight() - kExplorationPanelMarginBottom - panelHeight;
@@ -714,17 +996,15 @@ void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const Explor
     // every frame for a freshly-started map.
     const int gridX = textX;
     const int gridY = textY + kHudPadding;
-    const TableSurface& bounds = map.bounds();
-    const float worldWidth = bounds.maxX - bounds.minX;
-    const float worldHeight = bounds.maxZ - bounds.minZ;
-    const float pixelsPerCellX = static_cast<float>(kExplorationGridPixelSize) / static_cast<float>(map.width());
-    const float pixelsPerCellZ = static_cast<float>(kExplorationGridPixelSize) / static_cast<float>(map.height());
+    const TableSurface& bounds = gridBounds;
+    const float pixelsPerCellX = static_cast<float>(gridPixelWidth) / static_cast<float>(map.width());
+    const float pixelsPerCellZ = static_cast<float>(gridPixelHeight) / static_cast<float>(map.height());
 
     const auto worldToPanel = [&](float worldX, float worldZ) {
-        const float normX = (worldX - bounds.minX) / worldWidth;
-        const float normZ = (worldZ - bounds.minZ) / worldHeight;
-        return Vector2{static_cast<float>(gridX) + (normX * static_cast<float>(kExplorationGridPixelSize)),
-                        static_cast<float>(gridY) + (normZ * static_cast<float>(kExplorationGridPixelSize))};
+        const float normX = (worldX - bounds.minX) / gridWorldWidth;
+        const float normZ = (worldZ - bounds.minZ) / gridWorldHeight;
+        return Vector2{static_cast<float>(gridX) + (normX * static_cast<float>(gridPixelWidth)),
+                        static_cast<float>(gridY) + (normZ * static_cast<float>(gridPixelHeight))};
     };
 
     const std::vector<MapCell>& cells = map.cells();
@@ -764,20 +1044,25 @@ void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const Explor
 
     // --- Base marker: BasePlatform's own live position - never a
     // duplicated coordinate (Phase 13V brief, "do not duplicate its
-    // coordinates").
+    // coordinates"). Phase 13W human-visual-redesign v2: kept compact
+    // (6x6, down from 8x8) now that the panel itself is shorter (150px
+    // vs the old 220px square) - "home/dock marker should also be
+    // compact."
     const Vector2 basePanel = worldToPanel(world.basePlatform().position.x, world.basePlatform().position.z);
-    DrawRectangle(static_cast<int>(basePanel.x) - 4, static_cast<int>(basePanel.y) - 4, 8, 8, kExplorationBaseColor);
+    DrawRectangle(static_cast<int>(basePanel.x) - 3, static_cast<int>(basePanel.y) - 3, 6, 6, kExplorationBaseColor);
 
     // --- Robot marker: small filled circle at the current position plus
     // a short heading-direction line, using this project's one heading
     // convention (0 = +Z, +90 = +X - VisualMath.hpp's forwardDirection(),
     // matching the grid's own row/column axes exactly, so the marker
     // never visually disagrees with which way the grid itself is
-    // oriented).
+    // oriented). Phase 13W human-visual-redesign v2: radius kept small
+    // (3px) relative to the new, shorter panel - never a significant
+    // fraction of the 67x33-ish grid.
     const RobotPose& pose = world.robotPose();
     const Vector2 robotPanel = worldToPanel(pose.position.x, pose.position.z);
-    DrawCircleV(robotPanel, 4.0F, kExplorationRobotColor);
-    constexpr float kHeadingMarkerLengthPixels = 10.0F;
+    DrawCircleV(robotPanel, 3.0F, kExplorationRobotColor);
+    constexpr float kHeadingMarkerLengthPixels = 8.0F;
     constexpr float kPi = 3.14159265358979323846F;
     const float headingRadians = pose.headingDegrees * (kPi / 180.0F);
     const Vector2 headingEnd{robotPanel.x + (std::sin(headingRadians) * kHeadingMarkerLengthPixels),
@@ -786,7 +1071,7 @@ void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const Explor
 
     // --- Table boundary outline, drawn last so it stays visible over any
     // cell/trail/marker drawing near the grid's own edge.
-    DrawRectangleLines(gridX, gridY, kExplorationGridPixelSize, kExplorationGridPixelSize, kExplorationBoundaryColor);
+    DrawRectangleLines(gridX, gridY, gridPixelWidth, gridPixelHeight, kExplorationBoundaryColor);
 }
 
 } // namespace robot::visual

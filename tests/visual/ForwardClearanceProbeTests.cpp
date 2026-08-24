@@ -51,6 +51,7 @@ TEST(ForwardClearanceProbeTest, StraightObstacleBlocksCorridor)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
@@ -65,6 +66,7 @@ TEST(ForwardClearanceProbeTest, DisabledObstacleIsIgnored)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     // Deliberately left disabled (disableAllObstacles() above).
     ForwardClearanceProbe probe(world);
 
@@ -79,6 +81,7 @@ TEST(ForwardClearanceProbeTest, ObstacleBehindRobotDoesNotBlock)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, -2.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
@@ -95,6 +98,7 @@ TEST(ForwardClearanceProbeTest, ObstacleBeyondLookaheadDoesNotBlock)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 3.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
@@ -105,20 +109,22 @@ TEST(ForwardClearanceProbeTest, ObstacleBeyondLookaheadDoesNotBlock)
 // 6: ObstacleBesideNarrowPointRayButInsideBodyWidthBlocks
 TEST(ForwardClearanceProbeTest, ObstacleBesideNarrowPointRayButInsideBodyWidthBlocks)
 {
-    // Obstacle's raw X footprint (0.5 to 1.3) does NOT contain the
+    // Obstacle's raw X footprint (0.3 to 1.1) does NOT contain the
     // centerline X (0.0) - a narrow point ray straight down X 0.0 would
     // miss it entirely - but the clearance-radius-expanded footprint
-    // (-0.08 to 1.88) does, since it must account for the robot's full
-    // body width, not just its centerline.
+    // (~-0.13 to ~1.53, expanded by kRobotCollisionRadius + kSafetyMargin
+    // =~ 0.43F for this project's rescaled robot) does, since it must
+    // account for the robot's full body width, not just its centerline.
     VirtualWorld world;
     disableAllObstacles(world);
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
-    world.setObstaclePosition(0, Vec3{0.9F, 0.4F, 1.0F});
+    world.setObstaclePosition(0, Vec3{0.7F, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
-    ASSERT_GT(0.9F - 0.4F, 0.0F); // raw footprint excludes X 0.0
+    ASSERT_GT(0.7F - 0.4F, 0.0F); // raw footprint excludes X 0.0
     EXPECT_FALSE(probe.isForwardCorridorClear());
 }
 
@@ -132,6 +138,7 @@ TEST(ForwardClearanceProbeTest, ObstacleOutsideBodyClearanceDoesNotBlock)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{2.0F, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
@@ -147,6 +154,7 @@ TEST(ForwardClearanceProbeTest, HeadingZeroUsesPositiveZ)
     worldAhead.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldAhead.setRobotHeading(0.0F);
     worldAhead.setObstaclePosition(0, Vec3{0.0F, 0.4F, 1.0F});
+    worldAhead.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldAhead.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeAhead(worldAhead);
     EXPECT_FALSE(probeAhead.isForwardCorridorClear());
@@ -156,6 +164,7 @@ TEST(ForwardClearanceProbeTest, HeadingZeroUsesPositiveZ)
     worldBehind.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldBehind.setRobotHeading(0.0F);
     worldBehind.setObstaclePosition(0, Vec3{0.0F, 0.4F, -1.0F});
+    worldBehind.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldBehind.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeBehind(worldBehind);
     EXPECT_TRUE(probeBehind.isForwardCorridorClear());
@@ -169,6 +178,7 @@ TEST(ForwardClearanceProbeTest, HeadingNinetyUsesPositiveX)
     worldAhead.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldAhead.setRobotHeading(90.0F);
     worldAhead.setObstaclePosition(0, Vec3{1.0F, 0.4F, 0.0F});
+    worldAhead.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldAhead.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeAhead(worldAhead);
     EXPECT_FALSE(probeAhead.isForwardCorridorClear());
@@ -178,6 +188,7 @@ TEST(ForwardClearanceProbeTest, HeadingNinetyUsesPositiveX)
     worldBehind.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldBehind.setRobotHeading(90.0F);
     worldBehind.setObstaclePosition(0, Vec3{-1.0F, 0.4F, 0.0F});
+    worldBehind.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldBehind.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeBehind(worldBehind);
     EXPECT_TRUE(probeBehind.isForwardCorridorClear());
@@ -191,6 +202,7 @@ TEST(ForwardClearanceProbeTest, HeadingMinusNinetyUsesNegativeX)
     worldAhead.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldAhead.setRobotHeading(-90.0F);
     worldAhead.setObstaclePosition(0, Vec3{-1.0F, 0.4F, 0.0F});
+    worldAhead.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldAhead.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeAhead(worldAhead);
     EXPECT_FALSE(probeAhead.isForwardCorridorClear());
@@ -200,6 +212,7 @@ TEST(ForwardClearanceProbeTest, HeadingMinusNinetyUsesNegativeX)
     worldBehind.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldBehind.setRobotHeading(-90.0F);
     worldBehind.setObstaclePosition(0, Vec3{1.0F, 0.4F, 0.0F});
+    worldBehind.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldBehind.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeBehind(worldBehind);
     EXPECT_TRUE(probeBehind.isForwardCorridorClear());
@@ -213,6 +226,7 @@ TEST(ForwardClearanceProbeTest, HeadingOneEightyUsesNegativeZ)
     worldAhead.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldAhead.setRobotHeading(180.0F);
     worldAhead.setObstaclePosition(0, Vec3{0.0F, 0.4F, -1.0F});
+    worldAhead.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldAhead.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeAhead(worldAhead);
     EXPECT_FALSE(probeAhead.isForwardCorridorClear());
@@ -222,6 +236,7 @@ TEST(ForwardClearanceProbeTest, HeadingOneEightyUsesNegativeZ)
     worldBehind.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     worldBehind.setRobotHeading(180.0F);
     worldBehind.setObstaclePosition(0, Vec3{0.0F, 0.4F, 1.0F});
+    worldBehind.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     worldBehind.setObstacleEnabled(0, true);
     ForwardClearanceProbe probeBehind(worldBehind);
     EXPECT_TRUE(probeBehind.isForwardCorridorClear());
@@ -239,6 +254,7 @@ TEST(ForwardClearanceProbeTest, ParallelSegmentHandledWithoutDivisionByZero)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{5.0F, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
@@ -260,6 +276,7 @@ TEST(ForwardClearanceProbeTest, BoundaryContactHandledDeterministically)
     world.setRobotHeading(0.0F);
     const float boundaryZ = ForwardClearanceProbe::kLookaheadDistance + 0.4F + kClearanceRadius;
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, boundaryZ});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
@@ -278,9 +295,11 @@ TEST(ForwardClearanceProbeTest, NearestOfMultipleObstaclesBlocks)
     disableAllObstacles(world);
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
-    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 10.0F}); // far - beyond lookahead
+    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 10.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F}); // far - beyond lookahead
     world.setObstacleEnabled(0, true);
-    world.setObstaclePosition(1, Vec3{0.0F, 0.4F, 1.0F}); // near - blocks
+    world.setObstaclePosition(1, Vec3{0.0F, 0.4F, 1.0F});
+    world.setObstacleSize(1, Vec3{0.8F, 0.8F, 0.8F}); // near - blocks
     world.setObstacleEnabled(1, true);
     ForwardClearanceProbe probe(world);
 
@@ -303,6 +322,7 @@ TEST(ForwardClearanceProbeTest, FacingAwayFromNearbyObstacleCanBeClear)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, -1.5F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 
@@ -325,6 +345,7 @@ TEST(ForwardClearanceProbeTest, SafetyMarginIsRespected)
     world.setRobotHeading(0.0F);
     const float obstacleX = kRobotCollisionRadius + 0.4F + (ForwardClearanceProbe::kSafetyMargin / 2.0F);
     world.setObstaclePosition(0, Vec3{obstacleX, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     ForwardClearanceProbe probe(world);
 

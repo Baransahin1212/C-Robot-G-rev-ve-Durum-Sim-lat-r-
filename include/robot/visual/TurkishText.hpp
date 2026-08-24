@@ -146,4 +146,26 @@ constexpr std::string_view turkishText(AvoidanceState value) noexcept
     return "Bilinmiyor";
 }
 
+// Phase 13W: desktop-workspace object names. No current HUD panel
+// displays an object list (per this phase's own brief - "avoid new UI
+// clutter"), so nothing calls this yet; it exists so a future panel that
+// DOES want to name a desk object has the correct Turkish terms ready,
+// rather than inventing/translating them ad hoc later. "Şarj İstasyonu"
+// (charging dock/station) has no DeskObjectType of its own (the dock is
+// drawn straight from BasePlatform - see Renderer3D::drawChargingDock())
+// - noted here as the term to use if the dock is ever named in the UI.
+constexpr std::string_view turkishText(DeskObjectType value) noexcept
+{
+    switch (value)
+    {
+        case DeskObjectType::Monitor: return "Monitör";
+        case DeskObjectType::Keyboard: return "Klavye";
+        case DeskObjectType::Mouse: return "Fare";
+        case DeskObjectType::Mug: return "Kupa";
+        case DeskObjectType::Notebook: return "Defter";
+        case DeskObjectType::LampBase: return "Masa Lambası";
+    }
+    return "Bilinmiyor";
+}
+
 } // namespace robot::visual

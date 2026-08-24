@@ -2,14 +2,18 @@
 
 #include <gtest/gtest.h>
 
+#include "robot/visual/DifferentialDrive.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/VirtualCliffSensor.hpp"
 
 namespace
 {
 
+using robot::visual::aggregateTableOverhang;
+using robot::visual::areAllCornersSafelyInsideTable;
 using robot::visual::CliffSensorReadings;
 using robot::visual::computeCliffSensorReadings;
+using robot::visual::DifferentialDrive;
 using robot::visual::RobotPose;
 using robot::visual::TableEdgeSafetyController;
 using robot::visual::TableSurface;
@@ -38,6 +42,41 @@ CliffSensorReadings rearCliff()
 // asserted on by these tests.
 const TableSurface kTable{-6.0F, 6.0F, -6.0F, 6.0F};
 const RobotPose kArbitraryPose{Vec3{0.0F, 0.125F, 5.6F}, 0.0F};
+
+// Drives a real TableEdgeSafetyController through an actual recovery
+// incident using a real DifferentialDrive (kDefaultWheelTrack, tied to
+// RobotDimensions::kBodyWidth - never a hand-picked wheelbase) for
+// kinematics - the SAME per-step wiring main3d.cpp itself uses each
+// frame (readings -> controller.update() -> recoveryWheelSpeeds() ->
+// drive.setWheelSpeeds() -> drive.update(pose, dt)), just without
+// VirtualRobotHardware/VirtualWorld's own additional state. Table-edge
+// recovery bugfix #3 (BackingAway/MovingForwardFromRearEdge/
+// AdvancingInward blindly translating along a heading-derived direction
+// that does not reduce the actual triggering overhang) can only be
+// proven fixed by actually letting a full incident play out like this -
+// hand-crafted single-step scenarios (as used elsewhere in this file)
+// cannot exercise it. Returns true once the controller releases
+// (state() == Inactive) within maxSteps 0.05s steps, false if it never
+// does - a false return is itself the deadlock this bugfix eliminates.
+bool driveRecoveryToCompletion(TableEdgeSafetyController& controller, RobotPose& pose, const TableSurface& table,
+                                int maxSteps = 400)
+{
+    DifferentialDrive drive;
+    constexpr float dt = 0.05F;
+    for (int step = 0; step < maxSteps; ++step)
+    {
+        const CliffSensorReadings readings = computeCliffSensorReadings(pose, table);
+        controller.update(readings, pose, table);
+        if (!controller.active())
+        {
+            return true;
+        }
+        const WheelSpeeds speeds = controller.recoveryWheelSpeeds();
+        drive.setWheelSpeeds(speeds.left, speeds.right);
+        drive.update(pose, dt);
+    }
+    return false;
+}
 
 } // namespace
 
@@ -172,13 +211,13 @@ TEST(TableEdgeSafetyControllerTest, DoesNotReleaseOnSensorsAloneWhenHeadingStill
     // robot on the table's X centerline so the recovery target heading
     // works out to a clean 180 degrees (straight back toward the table
     // center).
-    RobotPose pose{Vec3{0.0F, 0.125F, 5.65F}, 0.0F};
+    RobotPose pose{Vec3{0.0F, 0.125F, 5.80F}, 0.0F};
     controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
     ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
 
     // BackingAway clears with a modest margin (front corner at Z 5.7,
     // comfortably inside the Z 6.0 boundary - not hair-trigger-exact).
-    pose.position.z = 5.3F;
+    pose.position.z = 5.45F;
     ASSERT_FALSE(computeCliffSensorReadings(pose, kTable).anyCliff()); // confirm: genuinely all safe already
     controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
     ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
@@ -199,11 +238,11 @@ TEST(TableEdgeSafetyControllerTest, DoesNotReleaseOnSensorsAloneWhenHeadingStill
 TEST(TableEdgeSafetyControllerTest, ReleasesOnlyAfterSensorsSafeAndHeadingAligned)
 {
     TableEdgeSafetyController controller;
-    RobotPose pose{Vec3{0.0F, 0.125F, 5.65F}, 0.0F};
+    RobotPose pose{Vec3{0.0F, 0.125F, 5.80F}, 0.0F};
     controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
     ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
 
-    pose.position.z = 5.6F;
+    pose.position.z = 5.75F;
     controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
     ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
 
@@ -254,10 +293,10 @@ TEST(TableEdgeSafetyControllerTest, TurnDirectionFollowsShortestPathToTarget)
     // ReactiveObstacleAvoidance's own convention).
     {
         TableEdgeSafetyController controller;
-        RobotPose pose{Vec3{-3.0F, 0.125F, 5.65F}, 0.0F};
+        RobotPose pose{Vec3{-3.0F, 0.125F, 5.80F}, 0.0F};
         controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
         ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
-        pose.position.z = 5.6F;
+        pose.position.z = 5.75F;
         controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
         ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
         ASSERT_GT(controller.currentHeadingErrorDegrees(), 0.0F);
@@ -271,10 +310,10 @@ TEST(TableEdgeSafetyControllerTest, TurnDirectionFollowsShortestPathToTarget)
     // turn is the opposite (negative-error) direction.
     {
         TableEdgeSafetyController controller;
-        RobotPose pose{Vec3{3.0F, 0.125F, 5.65F}, 0.0F};
+        RobotPose pose{Vec3{3.0F, 0.125F, 5.80F}, 0.0F};
         controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
         ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
-        pose.position.z = 5.6F;
+        pose.position.z = 5.75F;
         controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
         ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
         ASSERT_LT(controller.currentHeadingErrorDegrees(), 0.0F);
@@ -292,7 +331,7 @@ TEST(TableEdgeSafetyControllerTest, TargetHeadingPointsTowardTableCenter)
 
     // Triggered at the +X edge, heading 90 (facing +X) - table center is
     // due -X from here, i.e. target heading -90 (== 270).
-    RobotPose pose{Vec3{5.65F, 0.125F, 0.0F}, 90.0F};
+    RobotPose pose{Vec3{5.80F, 0.125F, 0.0F}, 90.0F};
     controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
 
     ASSERT_TRUE(controller.active());
@@ -350,11 +389,11 @@ TEST(TableEdgeSafetyControllerTest, SimultaneousFrontAndRearPrefersBackingAway)
 TEST(TableEdgeSafetyControllerTest, TurningTransitionsToAdvancingInwardWhenHeadingSafeButCornerStillEdge)
 {
     TableEdgeSafetyController controller;
-    RobotPose pose{Vec3{0.0F, 0.125F, 5.65F}, 0.0F};
+    RobotPose pose{Vec3{0.0F, 0.125F, 5.80F}, 0.0F};
     controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
     ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
 
-    pose.position.z = 5.6F;
+    pose.position.z = 5.75F;
     controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
     ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
 
@@ -392,4 +431,242 @@ TEST(TableEdgeSafetyControllerTest, TurningTransitionsToAdvancingInwardWhenHeadi
     const WheelSpeeds speeds = controller.recoveryWheelSpeeds();
     EXPECT_GT(speeds.left, 0.0F);
     EXPECT_FLOAT_EQ(speeds.left, speeds.right);
+}
+
+// --- Table-edge recovery bugfix #3 regression (Phase 13W human
+// validation blocker: robot stuck at a table edge after the robot/table
+// rescale, never recovering) ---
+//
+// Root cause: BackingAway/MovingForwardFromRearEdge/AdvancingInward all
+// translated purely along a direction derived from the robot's CURRENT
+// heading (reverse/forward respectively), without ever checking that
+// this motion actually reduces the overhang that triggered recovery in
+// the first place. "Front"/"rear" are robot-relative, not table-
+// relative: an edge encountered at a shallow/lateral angle (heading
+// nearly parallel to the edge, not perpendicular to it) can trigger a
+// cliff whose overhang is on an axis the current heading barely moves
+// along - blindly continuing can drive the robot toward/off a DIFFERENT
+// edge, eventually reaching VirtualRobotHardware's full-off-table hard
+// guard, which then rejects every further translation forever. The
+// tests below drive a REAL recovery incident to completion (via
+// driveRecoveryToCompletion() above, not hand-picked single-step
+// scenarios) at exactly this shallow-angle geometry, for all four table
+// edges plus a corner, and confirm the incident always resolves.
+
+// RightEdgeRecoversInward
+TEST(TableEdgeSafetyControllerTest, RightEdgeRecoversInward)
+{
+    TableEdgeSafetyController controller;
+    // Shallow angle relative to the +X edge (heading 15 is nearly
+    // parallel to it, not perpendicular) - the geometry class bugfix #3
+    // addresses. Center already 0.05 past the boundary guarantees at
+    // least one corner is off-table regardless of heading (see this
+    // file's driveRecoveryToCompletion() docs).
+    RobotPose pose{Vec3{6.05F, 0.125F, 1.5F}, 15.0F};
+    ASSERT_TRUE(computeCliffSensorReadings(pose, kTable).anyCliff());
+
+    ASSERT_TRUE(driveRecoveryToCompletion(controller, pose, kTable))
+        << "recovery never resolved - permanently stuck at final pose x=" << pose.position.x
+        << " z=" << pose.position.z << " heading=" << pose.headingDegrees
+        << " state=" << static_cast<int>(controller.state());
+
+    EXPECT_LE(pose.position.x, kTable.maxX);
+    EXPECT_TRUE(areAllCornersSafelyInsideTable(pose, kTable, 0.0F));
+}
+
+// LeftEdgeRecoversInward
+TEST(TableEdgeSafetyControllerTest, LeftEdgeRecoversInward)
+{
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{-6.05F, 0.125F, -1.2F}, 165.0F}; // mirror of the right-edge case
+    ASSERT_TRUE(computeCliffSensorReadings(pose, kTable).anyCliff());
+
+    ASSERT_TRUE(driveRecoveryToCompletion(controller, pose, kTable))
+        << "recovery never resolved - permanently stuck at final pose x=" << pose.position.x
+        << " z=" << pose.position.z << " heading=" << pose.headingDegrees
+        << " state=" << static_cast<int>(controller.state());
+
+    EXPECT_GE(pose.position.x, kTable.minX);
+    EXPECT_TRUE(areAllCornersSafelyInsideTable(pose, kTable, 0.0F));
+}
+
+// FrontEdgeRecoversInward
+TEST(TableEdgeSafetyControllerTest, FrontEdgeRecoversInward)
+{
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{1.3F, 0.125F, 6.05F}, 100.0F}; // shallow relative to the +Z edge
+    ASSERT_TRUE(computeCliffSensorReadings(pose, kTable).anyCliff());
+
+    ASSERT_TRUE(driveRecoveryToCompletion(controller, pose, kTable))
+        << "recovery never resolved - permanently stuck at final pose x=" << pose.position.x
+        << " z=" << pose.position.z << " heading=" << pose.headingDegrees
+        << " state=" << static_cast<int>(controller.state());
+
+    EXPECT_LE(pose.position.z, kTable.maxZ);
+    EXPECT_TRUE(areAllCornersSafelyInsideTable(pose, kTable, 0.0F));
+}
+
+// RearEdgeRecoversInward
+TEST(TableEdgeSafetyControllerTest, RearEdgeRecoversInward)
+{
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{-1.3F, 0.125F, -6.05F}, 280.0F}; // mirror of the front-edge case
+    ASSERT_TRUE(computeCliffSensorReadings(pose, kTable).anyCliff());
+
+    ASSERT_TRUE(driveRecoveryToCompletion(controller, pose, kTable))
+        << "recovery never resolved - permanently stuck at final pose x=" << pose.position.x
+        << " z=" << pose.position.z << " heading=" << pose.headingDegrees
+        << " state=" << static_cast<int>(controller.state());
+
+    EXPECT_GE(pose.position.z, kTable.minZ);
+    EXPECT_TRUE(areAllCornersSafelyInsideTable(pose, kTable, 0.0F));
+}
+
+// CornerRecoversInwardWithSmallerRobotGeometry
+//
+// Corner regression required alongside the per-edge tests above,
+// retested with the current (post-rescale, smaller) RobotDimensions -
+// there is only one geometry in the codebase now (no separate old/new
+// to switch between), so this exercises the same final footprint every
+// other test in this file already uses.
+TEST(TableEdgeSafetyControllerTest, CornerRecoversInwardWithSmallerRobotGeometry)
+{
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{6.05F, 0.125F, 6.05F}, 45.0F}; // +X/+Z corner, facing straight out
+    ASSERT_TRUE(computeCliffSensorReadings(pose, kTable).anyCliff());
+
+    ASSERT_TRUE(driveRecoveryToCompletion(controller, pose, kTable))
+        << "recovery never resolved - permanently stuck at final pose x=" << pose.position.x
+        << " z=" << pose.position.z << " heading=" << pose.headingDegrees
+        << " state=" << static_cast<int>(controller.state());
+
+    EXPECT_LE(pose.position.x, kTable.maxX);
+    EXPECT_LE(pose.position.z, kTable.maxZ);
+    EXPECT_TRUE(areAllCornersSafelyInsideTable(pose, kTable, 0.0F));
+}
+
+// HeadingOutwardCannotEnterAdvanceInward
+//
+// Turning must never hand off to AdvancingInward while the heading is
+// still meaningfully outward-facing (large error against the recovery
+// target), no matter how many updates pass - AdvancingInward drives
+// FORWARD, and doing so at a bad heading is exactly the kind of blind
+// translation bugfix #3 removes.
+TEST(TableEdgeSafetyControllerTest, HeadingOutwardCannotEnterAdvanceInward)
+{
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{0.0F, 0.125F, 5.80F}, 0.0F};
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+    ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
+
+    pose.position.z = 5.75F;
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+    ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
+
+    // Target heading is 180 (straight back toward the table center).
+    // Hold the heading near 20 - still ~160 degrees of error, well
+    // outside kRecoveryHeadingToleranceDegrees - for many updates.
+    pose.headingDegrees = 20.0F;
+    for (int i = 0; i < 30; ++i)
+    {
+        controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+        ASSERT_NE(controller.state(), TableEdgeSafetyController::RecoveryState::AdvancingInward);
+    }
+
+    EXPECT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
+    EXPECT_GT(std::fabs(controller.currentHeadingErrorDegrees()), TableEdgeSafetyController::kRecoveryHeadingToleranceDegrees);
+}
+
+// AdvancingInwardWithBadHeadingReturnsToTurning
+//
+// Once in AdvancingInward, if the heading drifts outside tolerance
+// (e.g. a rejected translation, or accumulated drift), the controller
+// must reorient rather than keep driving forward at a bad angle.
+TEST(TableEdgeSafetyControllerTest, AdvancingInwardWithBadHeadingReturnsToTurning)
+{
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{0.0F, 0.125F, 5.80F}, 0.0F};
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+    ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
+
+    pose.position.z = 5.75F;
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+    ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
+
+    // Heading aligned with the 180-degree target, but RearLeft/RearRight
+    // sit exactly at the Z 6.0 boundary (only the front corners were
+    // ever pulled back during BackingAway) - not margin-safe yet, so
+    // this hands off to AdvancingInward (matches
+    // ReleasesOnlyAfterSensorsSafeAndHeadingAligned above).
+    pose.headingDegrees = 180.0F;
+    ASSERT_FALSE(computeCliffSensorReadings(pose, kTable).anyCliff());
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+    ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::AdvancingInward);
+
+    // Heading drifts 30 degrees off target - outside the 10-degree
+    // tolerance.
+    pose.headingDegrees = 150.0F;
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+
+    EXPECT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
+}
+
+// RecoveryMakesSupportMarginMonotonicallySaferWhereApplicable
+//
+// The whole point of bugfix #3's proposed-motion check: whenever the
+// controller is in one of the three TRANSLATING states (BackingAway,
+// MovingForwardFromRearEdge, AdvancingInward), a step must never make
+// the aggregate table overhang WORSE - translatingWouldNotHelp() is
+// exactly the guard that reroutes to Turning instead of letting a
+// translation increase it. "Where applicable" deliberately excludes
+// Turning: in-place ROTATION has no such guard (this fix is scoped to
+// translation only, per the bugfix brief), and rotating a non-point
+// footprint about its center can genuinely swing an already-clear
+// corner back out over the edge even though the center itself never
+// moves - confirmed empirically while writing this test (overhang rose
+// from 0 across several consecutive steps immediately after a
+// BackingAway->Turning handoff). That is expected, unavoidable
+// geometry, not a regression - so this test checks monotonicity only
+// across the translating states' own steps.
+TEST(TableEdgeSafetyControllerTest, RecoveryMakesSupportMarginMonotonicallySaferWhereApplicable)
+{
+    using RecoveryState = TableEdgeSafetyController::RecoveryState;
+
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{6.05F, 0.125F, 1.5F}, 15.0F};
+    ASSERT_TRUE(computeCliffSensorReadings(pose, kTable).anyCliff());
+
+    DifferentialDrive drive;
+    constexpr float dt = 0.05F;
+    bool resolved = false;
+    for (int step = 0; step < 400; ++step)
+    {
+        const CliffSensorReadings readings = computeCliffSensorReadings(pose, kTable);
+        controller.update(readings, pose, kTable);
+        if (!controller.active())
+        {
+            resolved = true;
+            break;
+        }
+        const RecoveryState stateThisStep = controller.state();
+        const bool translating = stateThisStep == RecoveryState::BackingAway ||
+                                  stateThisStep == RecoveryState::MovingForwardFromRearEdge ||
+                                  stateThisStep == RecoveryState::AdvancingInward;
+        const float overhangBeforeStep = aggregateTableOverhang(pose, kTable);
+
+        const WheelSpeeds speeds = controller.recoveryWheelSpeeds();
+        drive.setWheelSpeeds(speeds.left, speeds.right);
+        drive.update(pose, dt);
+
+        const float overhangAfterStep = aggregateTableOverhang(pose, kTable);
+        if (translating)
+        {
+            EXPECT_LE(overhangAfterStep, overhangBeforeStep + 1.0e-4F)
+                << "aggregate overhang increased during a translating step (" << static_cast<int>(stateThisStep)
+                << ") at step " << step << ": " << overhangBeforeStep << " -> " << overhangAfterStep;
+        }
+    }
+
+    ASSERT_TRUE(resolved);
+    EXPECT_LE(aggregateTableOverhang(pose, kTable), 1.0e-4F);
 }

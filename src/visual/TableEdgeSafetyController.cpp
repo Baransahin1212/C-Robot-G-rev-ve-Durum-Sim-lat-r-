@@ -7,6 +7,42 @@
 namespace robot::visual
 {
 
+namespace
+{
+
+// Table-edge recovery bugfix #3: false only when there IS a genuine
+// aggregate overhang right now (currentOverhang > 0 - if the footprint is
+// already fully supported, translating further is never itself unsafe,
+// regardless of direction) AND one more kSupportCheckLookaheadDistance-
+// sized step in `travelDirection` (a unit vector - reverse of
+// forwardDirection() for BackingAway, forwardDirection() itself for
+// MovingForwardFromRearEdge/AdvancingInward) would not shrink it. False
+// means continuing to translate this way is not addressing the actual
+// problem (the triggering overhang is on an axis this direction barely
+// moves the robot along, or this direction is actively making it worse) -
+// the caller should reorient toward the target heading instead of
+// blindly continuing. Deliberately NOT `projected < current` alone: at
+// exactly zero overhang that comparison is always false (0 is never less
+// than 0), which would wrongly block perfectly safe forward motion once
+// the footprint is already fully supported but the (separate, margin-
+// based) release condition has not yet fired.
+bool translatingWouldNotHelp(const RobotPose& pose, const TableSurface& table, const Vec3& travelDirection) noexcept
+{
+    const float currentOverhang = aggregateTableOverhang(pose, table);
+    if (currentOverhang <= 0.0F)
+    {
+        return false;
+    }
+    const RobotPose projectedPose{
+        Vec3{pose.position.x + (travelDirection.x * TableEdgeSafetyController::kSupportCheckLookaheadDistance),
+             pose.position.y,
+             pose.position.z + (travelDirection.z * TableEdgeSafetyController::kSupportCheckLookaheadDistance)},
+        pose.headingDegrees};
+    return aggregateTableOverhang(projectedPose, table) >= currentOverhang;
+}
+
+} // namespace
+
 void TableEdgeSafetyController::beginRecovery(const RobotPose& pose, const TableSurface& table) noexcept
 {
     const float tableCenterX = (table.minX + table.maxX) / 2.0F;
@@ -61,11 +97,26 @@ void TableEdgeSafetyController::update(const CliffSensorReadings& readings, cons
             {
                 state_ = RecoveryState::Turning;
             }
+            else if (translatingWouldNotHelp(pose, table, Vec3{-forwardDirection(pose).x, 0.0F, -forwardDirection(pose).z}))
+            {
+                // Bugfix #3: backing away further is not actually helping
+                // (the triggering overhang is on an axis this reverse
+                // direction barely moves along, or is being made worse) -
+                // reorient toward the known-safe target instead of
+                // continuing to drive further off table.
+                state_ = RecoveryState::Turning;
+            }
             break;
 
         case RecoveryState::MovingForwardFromRearEdge:
             if (!readings.anyRearCliff())
             {
+                state_ = RecoveryState::Turning;
+            }
+            else if (translatingWouldNotHelp(pose, table, forwardDirection(pose)))
+            {
+                // Bugfix #3: same proposed-motion safety check, mirrored
+                // for the forward-away-from-a-rear-edge direction.
                 state_ = RecoveryState::Turning;
             }
             break;
@@ -105,6 +156,18 @@ void TableEdgeSafetyController::update(const CliffSensorReadings& readings, cons
             else if (supportSafe)
             {
                 state_ = RecoveryState::Inactive;
+            }
+            else if (translatingWouldNotHelp(pose, table, forwardDirection(pose)))
+            {
+                // Bugfix #3: heading reads "safe" (within tolerance of
+                // the target), but one more forward step would not
+                // actually reduce the aggregate overhang - the recovery
+                // target itself may be stale/imprecise this close to the
+                // tolerance boundary. Reorient (Turning recomputes the
+                // shortest-path direction toward the same fixed target
+                // every call) rather than keep driving a direction that
+                // is not helping.
+                state_ = RecoveryState::Turning;
             }
             // else: remain AdvancingInward - recoveryWheelSpeeds() keeps
             // driving straight forward.

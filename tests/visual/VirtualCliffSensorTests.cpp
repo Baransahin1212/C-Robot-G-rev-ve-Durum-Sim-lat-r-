@@ -2,6 +2,7 @@
 
 #include "robot/visual/VirtualCliffSensor.hpp"
 #include "robot/visual/VirtualWorld.hpp"
+#include "robot/visual/VisualRobot.hpp"
 
 namespace
 {
@@ -16,6 +17,7 @@ using robot::visual::TableSurface;
 using robot::visual::Vec3;
 using robot::visual::VirtualCliffSensor;
 using robot::visual::VirtualWorld;
+namespace RobotDimensions = robot::visual::RobotDimensions;
 
 constexpr float kEpsilon = 0.001F;
 
@@ -49,8 +51,13 @@ TEST(VirtualCliffSensorTest, RobotCenteredAllSensorsSafe)
 // (x, z) offsets, so a single corner can be isolated.
 TEST(VirtualCliffSensorTest, FrontLeftDetectsEdge)
 {
+    // Phase 13W final workspace redesign: with the rescaled robot's
+    // half-width/half-length (0.20F/0.25F), FrontLeft's Z-offset at a
+    // 45-degree heading is (halfLength+halfWidth)/sqrt(2) =~ 0.318F - this
+    // position clears the table's 2.0F Z boundary by that corner alone
+    // (1.75F + 0.318F > 2.0F) while every other corner stays inside.
     VirtualWorld world;
-    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.6F});
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 1.75F});
     world.setRobotHeading(45.0F);
     VirtualCliffSensor sensor(world);
 
@@ -65,8 +72,10 @@ TEST(VirtualCliffSensorTest, FrontLeftDetectsEdge)
 // 3: FrontRightDetectsEdge
 TEST(VirtualCliffSensorTest, FrontRightDetectsEdge)
 {
+    // Phase 13W final workspace redesign: same corner-offset reasoning as
+    // FrontLeftDetectsEdge above, mirrored onto the X boundary (4.0F).
     VirtualWorld world;
-    world.setRobotPosition(Vec3{5.6F, 0.125F, 0.0F});
+    world.setRobotPosition(Vec3{3.75F, 0.125F, 0.0F});
     world.setRobotHeading(45.0F);
     VirtualCliffSensor sensor(world);
 
@@ -81,8 +90,10 @@ TEST(VirtualCliffSensorTest, FrontRightDetectsEdge)
 // 4: RearLeftDetectsEdge
 TEST(VirtualCliffSensorTest, RearLeftDetectsEdge)
 {
+    // Phase 13W final workspace redesign: same corner-offset reasoning as
+    // FrontLeftDetectsEdge above, mirrored onto the -X boundary (-4.0F).
     VirtualWorld world;
-    world.setRobotPosition(Vec3{-5.6F, 0.125F, 0.0F});
+    world.setRobotPosition(Vec3{-3.75F, 0.125F, 0.0F});
     world.setRobotHeading(45.0F);
     VirtualCliffSensor sensor(world);
 
@@ -97,8 +108,10 @@ TEST(VirtualCliffSensorTest, RearLeftDetectsEdge)
 // 5: RearRightDetectsEdge
 TEST(VirtualCliffSensorTest, RearRightDetectsEdge)
 {
+    // Phase 13W final workspace redesign: same corner-offset reasoning as
+    // FrontLeftDetectsEdge above, mirrored onto the -Z boundary (-2.0F).
     VirtualWorld world;
-    world.setRobotPosition(Vec3{0.0F, 0.125F, -5.6F});
+    world.setRobotPosition(Vec3{0.0F, 0.125F, -1.75F});
     world.setRobotHeading(45.0F);
     VirtualCliffSensor sensor(world);
 
@@ -119,12 +132,14 @@ TEST(VirtualCliffSensorTest, HeadingRotationMovesSensorPositionsCorrectly)
     const Vec3 frontLeftAt0 = cliffSensorWorldPosition(poseHeading0, CliffSensorPosition::FrontLeft);
     const Vec3 frontLeftAt90 = cliffSensorWorldPosition(poseHeading90, CliffSensorPosition::FrontLeft);
 
-    // Heading 0: FrontLeft = center + (-0.3, 0, 0.4). Heading 90: FrontLeft
-    // = center + (0.4, 0, 0.3) - genuinely different world positions.
-    EXPECT_NEAR(frontLeftAt0.x, -0.3F, kEpsilon);
-    EXPECT_NEAR(frontLeftAt0.z, 0.4F, kEpsilon);
-    EXPECT_NEAR(frontLeftAt90.x, 0.4F, kEpsilon);
-    EXPECT_NEAR(frontLeftAt90.z, 0.3F, kEpsilon);
+    // Heading 0: FrontLeft = center + (-halfWidth, 0, halfLength) =
+    // center + (-0.20, 0, 0.25). Heading 90: FrontLeft = center +
+    // (halfLength, 0, halfWidth) = center + (0.25, 0, 0.20) - genuinely
+    // different world positions.
+    EXPECT_NEAR(frontLeftAt0.x, -0.20F, kEpsilon);
+    EXPECT_NEAR(frontLeftAt0.z, 0.25F, kEpsilon);
+    EXPECT_NEAR(frontLeftAt90.x, 0.25F, kEpsilon);
+    EXPECT_NEAR(frontLeftAt90.z, 0.20F, kEpsilon);
 }
 
 // 7: Heading90Works
@@ -134,8 +149,8 @@ TEST(VirtualCliffSensorTest, Heading90Works)
 
     const Vec3 frontLeft = cliffSensorWorldPosition(pose, CliffSensorPosition::FrontLeft);
 
-    EXPECT_NEAR(frontLeft.x, 1.4F, kEpsilon);
-    EXPECT_NEAR(frontLeft.z, 2.3F, kEpsilon);
+    EXPECT_NEAR(frontLeft.x, 1.25F, kEpsilon);
+    EXPECT_NEAR(frontLeft.z, 2.20F, kEpsilon);
 }
 
 // 8: Heading180Works
@@ -145,8 +160,8 @@ TEST(VirtualCliffSensorTest, Heading180Works)
 
     const Vec3 frontLeft = cliffSensorWorldPosition(pose, CliffSensorPosition::FrontLeft);
 
-    EXPECT_NEAR(frontLeft.x, 1.3F, kEpsilon);
-    EXPECT_NEAR(frontLeft.z, 1.6F, kEpsilon);
+    EXPECT_NEAR(frontLeft.x, 1.20F, kEpsilon);
+    EXPECT_NEAR(frontLeft.z, 1.75F, kEpsilon);
 }
 
 // 9: Heading270Works
@@ -156,8 +171,8 @@ TEST(VirtualCliffSensorTest, Heading270Works)
 
     const Vec3 frontLeft = cliffSensorWorldPosition(pose, CliffSensorPosition::FrontLeft);
 
-    EXPECT_NEAR(frontLeft.x, 0.6F, kEpsilon);
-    EXPECT_NEAR(frontLeft.z, 1.7F, kEpsilon);
+    EXPECT_NEAR(frontLeft.x, 0.75F, kEpsilon);
+    EXPECT_NEAR(frontLeft.z, 1.80F, kEpsilon);
 }
 
 // 10: SensorExactlyOnBoundaryHandledDeterministically
@@ -178,10 +193,11 @@ TEST(VirtualCliffSensorTest, SensorExactlyOnBoundaryHandledDeterministically)
 // 11: MultipleSensorsCanDetectEdge
 TEST(VirtualCliffSensorTest, MultipleSensorsCanDetectEdge)
 {
-    // Heading 0: FrontLeft/FrontRight share Z 0.4 ahead of center - both
-    // trip together when the front edge crosses the table's Z boundary.
+    // Heading 0: FrontLeft/FrontRight share Z halfLength (0.25F) ahead of
+    // center - both trip together when the front edge crosses the
+    // table's Z boundary (2.0F): 1.85F + 0.25F > 2.0F.
     VirtualWorld world;
-    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.7F});
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 1.85F});
     world.setRobotHeading(0.0F);
     VirtualCliffSensor sensor(world);
 
@@ -200,8 +216,11 @@ TEST(VirtualCliffSensorTest, MultipleSensorsCanDetectEdge)
 // 12: RobotNearButNotOverEdgeIsSafe
 TEST(VirtualCliffSensorTest, RobotNearButNotOverEdgeIsSafe)
 {
+    // Phase 13W human-visual-redesign v2: same margin pattern against the
+    // table's new Z half-extent (2.0F, was 6.0F) - safely below the
+    // crossing threshold.
     VirtualWorld world;
-    world.setRobotPosition(Vec3{0.0F, 0.125F, 5.5F});
+    world.setRobotPosition(Vec3{0.0F, 0.125F, 1.5F});
     world.setRobotHeading(0.0F);
     VirtualCliffSensor sensor(world);
 
@@ -219,8 +238,60 @@ TEST(VirtualCliffSensorTest, ComputeCliffSensorReadingsIsPureAndReusable)
 {
     const TableSurface table{-6.0F, 6.0F, -6.0F, 6.0F};
     const RobotPose safePose{Vec3{0.0F, 0.125F, 0.0F}, 0.0F};
-    const RobotPose unsafePose{Vec3{0.0F, 0.125F, 5.7F}, 0.0F};
+    // 5.85F + halfLength (0.25F) = 6.1F, strictly beyond the 6.0F boundary.
+    const RobotPose unsafePose{Vec3{0.0F, 0.125F, 5.85F}, 0.0F};
 
     EXPECT_FALSE(computeCliffSensorReadings(safePose, table).anyCliff());
     EXPECT_TRUE(computeCliffSensorReadings(unsafePose, table).anyCliff());
+}
+
+// --- Phase 13W final workspace redesign: robot scale ---
+
+// 13: CliffSensorsMatchRobotCorners
+//
+// Each sensor corner must sit exactly at the physical body's own corner -
+// derived from RobotDimensions, never a hand-duplicated offset - so
+// resizing the robot again later automatically keeps the sensors tied to
+// the real footprint.
+TEST(VirtualCliffSensorTest, CliffSensorsMatchRobotCorners)
+{
+    const RobotPose pose{Vec3{0.0F, 0.125F, 0.0F}, 0.0F};
+    const Vec3 frontLeft = cliffSensorWorldPosition(pose, CliffSensorPosition::FrontLeft);
+
+    const float halfWidth = RobotDimensions::kBodyWidth / 2.0F;
+    const float halfLength = RobotDimensions::kBodyLength / 2.0F;
+    EXPECT_NEAR(frontLeft.x, -halfWidth, kEpsilon);
+    EXPECT_NEAR(frontLeft.z, halfLength, kEpsilon);
+}
+
+// 14: SmallerRobotGeometryUsesCorrectCliffCorners
+//
+// Table-edge recovery bugfix #3 regression: pins the POST-rescale
+// (0.40 x 0.50, not the old 0.60 x 0.80) body dimensions explicitly, and
+// checks all four corners at once, not just FrontLeft - a stale/half-
+// updated constant (as happened to kDockHousingIndex during the same
+// rescale) would otherwise silently keep using stale geometry for cliff
+// sensing/recovery while everything else moved to the smaller footprint.
+TEST(VirtualCliffSensorTest, SmallerRobotGeometryUsesCorrectCliffCorners)
+{
+    ASSERT_FLOAT_EQ(RobotDimensions::kBodyWidth, 0.40F);
+    ASSERT_FLOAT_EQ(RobotDimensions::kBodyLength, 0.50F);
+
+    const RobotPose pose{Vec3{0.0F, 0.125F, 0.0F}, 0.0F};
+    const float halfWidth = RobotDimensions::kBodyWidth / 2.0F;
+    const float halfLength = RobotDimensions::kBodyLength / 2.0F;
+
+    const Vec3 frontLeft = cliffSensorWorldPosition(pose, CliffSensorPosition::FrontLeft);
+    const Vec3 frontRight = cliffSensorWorldPosition(pose, CliffSensorPosition::FrontRight);
+    const Vec3 rearLeft = cliffSensorWorldPosition(pose, CliffSensorPosition::RearLeft);
+    const Vec3 rearRight = cliffSensorWorldPosition(pose, CliffSensorPosition::RearRight);
+
+    EXPECT_NEAR(frontLeft.x, -halfWidth, kEpsilon);
+    EXPECT_NEAR(frontLeft.z, halfLength, kEpsilon);
+    EXPECT_NEAR(frontRight.x, halfWidth, kEpsilon);
+    EXPECT_NEAR(frontRight.z, halfLength, kEpsilon);
+    EXPECT_NEAR(rearLeft.x, -halfWidth, kEpsilon);
+    EXPECT_NEAR(rearLeft.z, -halfLength, kEpsilon);
+    EXPECT_NEAR(rearRight.x, halfWidth, kEpsilon);
+    EXPECT_NEAR(rearRight.z, -halfLength, kEpsilon);
 }

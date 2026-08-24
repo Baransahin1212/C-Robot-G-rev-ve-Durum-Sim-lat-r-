@@ -133,6 +133,17 @@ public:
     // positional drift at kRecoveryInwardSpeed.
     static constexpr float kRecoverySupportMargin = 0.15F;
 
+    // Proposed-motion lookahead distance, in world units (table-edge
+    // recovery bugfix #3 - see update()'s own docs for the full defect
+    // this fixes): a small, fixed step used ONLY to ask "if I keep
+    // translating this way, does the overall situation get better or
+    // worse" - never tied to any specific delta-time, since update()
+    // itself receives none. Small enough to be a genuine one-step probe
+    // (comparable to a single simulation frame's worth of motion at
+    // kRecoveryLinearSpeed with a typical ~0.05s step), never a lookahead
+    // far enough to function as path planning.
+    static constexpr float kSupportCheckLookaheadDistance = 0.05F;
+
     // Advances the recovery state machine by one frame/step, given this
     // frame's real cliff-sensor readings and the robot's current pose/
     // table geometry (needed to compute and track the recovery target
@@ -152,8 +163,13 @@ public:
     //                                  13S, for the simultaneous-both-
     //                                  edges corner case) - captures the
     //                                  same kind of target heading
-    //   BackingAway                -> Turning (once no front cliff)
-    //   MovingForwardFromRearEdge  -> Turning (once no rear cliff)
+    //   BackingAway                -> Turning (once no front cliff, OR the
+    //                                  proposed-motion safety check below
+    //                                  finds one more reverse step would
+    //                                  not reduce the aggregate overhang -
+    //                                  see bugfix #3)
+    //   MovingForwardFromRearEdge  -> Turning (once no rear cliff, OR the
+    //                                  same proposed-motion safety check)
     //   Turning                    -> Inactive (once heading is safe AND
     //                                  the whole footprint is already
     //                                  safely inside the table by
@@ -170,10 +186,43 @@ public:
     //                                  outside tolerance while driving
     //                                  forward - realign before
     //                                  continuing, per the brief's
-    //                                  robustness requirement)
+    //                                  robustness requirement - OR if the
+    //                                  proposed-motion safety check finds
+    //                                  one more forward step would not
+    //                                  reduce the aggregate overhang - see
+    //                                  bugfix #3)
     //   AdvancingInward            -> Inactive (once heading is (still)
     //                                  safe AND the support margin is now
     //                                  satisfied)
+    //
+    // BUGFIX #3 CONTEXT (human manual validation, Phase 13W after the
+    // robot/table rescale): BackingAway/MovingForwardFromRearEdge/
+    // AdvancingInward all translate along a direction derived purely from
+    // the robot's CURRENT heading (reverse/forward respectively) - never
+    // validated against which axis the actual triggering overhang is on.
+    // "Front"/"rear" are ROBOT-relative labels, not TABLE-relative ones:
+    // a table edge encountered at a shallow/lateral angle (the robot's
+    // heading roughly PARALLEL to that edge, not perpendicular to it) can
+    // trip a front-corner cliff whose overhang is almost entirely along
+    // the axis the robot's current heading barely moves it on - backing
+    // away then does essentially nothing to fix it, and can just as
+    // easily carry the robot toward or past a DIFFERENT edge, growing
+    // the problem instead of solving it, potentially reaching
+    // `VirtualRobotHardware`'s own ALL-four-corners-off-table hard
+    // fail-safe (which then rejects every further translation - a
+    // genuine, reproducible permanent freeze; see
+    // TableEdgeSafetyControllerTests.cpp's own
+    // BackingAwayAtShallowAngleDoesNotDriveOffADifferentEdge and
+    // docs/technical-decisions.md for the sweep that found it). Fixed by
+    // a small "does this actually help" probe
+    // (`VirtualCliffSensor::aggregateTableOverhang()` before vs. after one
+    // `kSupportCheckLookaheadDistance`-sized step in the state's own
+    // travel direction) applied to all three translating states: if one
+    // more step would not reduce the aggregate overhang, the state
+    // reorients toward the already-known-safe target heading (Turning)
+    // instead of continuing to blindly translate. This is a lookahead
+    // PROBE, not a planner - one fixed-distance step, never search/
+    // iteration over multiple candidate directions.
     //
     // The target heading is captured ONCE per incident (on the Inactive
     // -> BackingAway/MovingForwardFromRearEdge transition) and held fixed

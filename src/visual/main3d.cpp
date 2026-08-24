@@ -357,9 +357,14 @@ int main()
             // below has HardwareEventSource sample this new geometry through
             // VirtualRobotHardware::obstacleDetected() and emit the real
             // edge-triggered event, exactly like any other sensor change.
-            const bool currentlyEnabled =
-                world.obstacleEnabled(robot::visual::VirtualWorld::kBlockingObstacleIndex);
-            world.setObstacleEnabled(robot::visual::VirtualWorld::kBlockingObstacleIndex, !currentlyEnabled);
+            // Phase 13W human-visual-redesign v2: toggles the Keyboard's
+            // registered obstacle (a named, semantic lookup via
+            // deskObjectObstacleIndex() - never a raw magic index) now that
+            // the old standalone "legacy blocking cube" is gone entirely.
+            const std::size_t keyboardIndex =
+                world.deskObjectObstacleIndex(robot::visual::DeskObjectType::Keyboard);
+            const bool currentlyEnabled = world.obstacleEnabled(keyboardIndex);
+            world.setObstacleEnabled(keyboardIndex, !currentlyEnabled);
         }
 
         if (IsKeyPressed(KEY_M))

@@ -63,13 +63,14 @@ TEST(VirtualObstacleSensorArrayTest, EmptyWorldAllRaysClear)
 // 2: CenterObstacleDetectedByCenterRay
 TEST(VirtualObstacleSensorArrayTest, CenterObstacleDetectedByCenterRay)
 {
-    // Near face 0.6, sensor origin Z 0.4 -> distance 0.2, within
+    // Near face 0.6, sensor origin Z 0.25 -> distance 0.35, within
     // kDetectionDistance (1.0).
     VirtualWorld world;
     disableAllObstacles(world);
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     VirtualObstacleSensorArray array(world);
 
@@ -77,14 +78,14 @@ TEST(VirtualObstacleSensorArrayTest, CenterObstacleDetectedByCenterRay)
 
     EXPECT_TRUE(readings.frontCenterDetected);
     ASSERT_TRUE(readings.frontCenterDistance.has_value());
-    EXPECT_NEAR(*readings.frontCenterDistance, 0.2F, kEpsilon);
+    EXPECT_NEAR(*readings.frontCenterDistance, 0.35F, kEpsilon);
 }
 
 // 3: LeftOffsetObstacleDetectedByLeftRay
 //
-// VirtualWorld's demo obstacles have fixed sizes (only position/enabled
-// are mutable) - obstacle index 3 is the narrowest available (0.7 wide,
-// half-width 0.35). Positioned at X -0.5, its X range is
+// Explicitly resized to 0.7 wide (half-width 0.35) via
+// VirtualWorld::setObstacleSize() (Phase 13W human-visual-redesign v2) -
+// narrow enough that positioned at X -0.5, its X range is
 // [-0.85, -0.15]: contains the left ray's origin X (-0.25) but neither
 // center's (0.0) nor right's (+0.25).
 TEST(VirtualObstacleSensorArrayTest, LeftOffsetObstacleDetectedByLeftRay)
@@ -94,6 +95,7 @@ TEST(VirtualObstacleSensorArrayTest, LeftOffsetObstacleDetectedByLeftRay)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(3, Vec3{-0.5F, 0.4F, 1.5F});
+    world.setObstacleSize(3, Vec3{0.7F, 0.8F, 1.2F});
     world.setObstacleEnabled(3, true);
     VirtualObstacleSensorArray array(world);
 
@@ -114,6 +116,7 @@ TEST(VirtualObstacleSensorArrayTest, RightOffsetObstacleDetectedByRightRay)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(3, Vec3{0.5F, 0.4F, 1.5F});
+    world.setObstacleSize(3, Vec3{0.7F, 0.8F, 1.2F});
     world.setObstacleEnabled(3, true);
     VirtualObstacleSensorArray array(world);
 
@@ -132,6 +135,7 @@ TEST(VirtualObstacleSensorArrayTest, LeftOffsetObstacleMissesCenterRayButAggrega
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(3, Vec3{-0.5F, 0.4F, 1.5F});
+    world.setObstacleSize(3, Vec3{0.7F, 0.8F, 1.2F});
     world.setObstacleEnabled(3, true);
     VirtualObstacleSensorArray array(world);
 
@@ -149,6 +153,7 @@ TEST(VirtualObstacleSensorArrayTest, RightOffsetObstacleMissesCenterRayButAggreg
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(3, Vec3{0.5F, 0.4F, 1.5F});
+    world.setObstacleSize(3, Vec3{0.7F, 0.8F, 1.2F});
     world.setObstacleEnabled(3, true);
     VirtualObstacleSensorArray array(world);
 
@@ -166,6 +171,7 @@ TEST(VirtualObstacleSensorArrayTest, DisabledObstacleIgnored)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     // Deliberately left disabled (disableAllObstacles() above).
     VirtualObstacleSensorArray array(world);
 
@@ -182,6 +188,7 @@ TEST(VirtualObstacleSensorArrayTest, ObstacleBehindRobotIgnored)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, -2.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     VirtualObstacleSensorArray array(world);
 
@@ -212,6 +219,7 @@ TEST(VirtualObstacleSensorArrayTest, HeadingNinety)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(90.0F);
     world.setObstaclePosition(0, Vec3{1.0F, 0.4F, 0.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     VirtualObstacleSensorArray array(world);
 
@@ -231,6 +239,7 @@ TEST(VirtualObstacleSensorArrayTest, HeadingMinusNinety)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(-90.0F);
     world.setObstaclePosition(0, Vec3{-1.0F, 0.4F, 0.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     VirtualObstacleSensorArray array(world);
 
@@ -250,6 +259,7 @@ TEST(VirtualObstacleSensorArrayTest, HeadingOneEighty)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(180.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, -1.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     VirtualObstacleSensorArray array(world);
 
@@ -275,6 +285,7 @@ TEST(VirtualObstacleSensorArrayTest, ClosestDistancePerRayIsCorrect)
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
     world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 2.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F});
     world.setObstacleEnabled(0, true);
     VirtualObstacleSensorArray array(world);
 
@@ -283,9 +294,9 @@ TEST(VirtualObstacleSensorArrayTest, ClosestDistancePerRayIsCorrect)
     ASSERT_TRUE(readings.frontLeftDistance.has_value());
     ASSERT_TRUE(readings.frontCenterDistance.has_value());
     ASSERT_TRUE(readings.frontRightDistance.has_value());
-    EXPECT_NEAR(*readings.frontLeftDistance, 1.2F, kEpsilon);
-    EXPECT_NEAR(*readings.frontCenterDistance, 1.2F, kEpsilon);
-    EXPECT_NEAR(*readings.frontRightDistance, 1.2F, kEpsilon);
+    EXPECT_NEAR(*readings.frontLeftDistance, 1.35F, kEpsilon);
+    EXPECT_NEAR(*readings.frontCenterDistance, 1.35F, kEpsilon);
+    EXPECT_NEAR(*readings.frontRightDistance, 1.35F, kEpsilon);
 }
 
 // 14: MultipleObstaclesHandled
@@ -298,16 +309,18 @@ TEST(VirtualObstacleSensorArrayTest, MultipleObstaclesHandled)
     disableAllObstacles(world);
     world.setRobotPosition(Vec3{0.0F, 0.125F, 0.0F});
     world.setRobotHeading(0.0F);
-    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 2.0F}); // near: distance 1.2
+    world.setObstaclePosition(0, Vec3{0.0F, 0.4F, 2.0F});
+    world.setObstacleSize(0, Vec3{0.8F, 0.8F, 0.8F}); // near: distance 1.2
     world.setObstacleEnabled(0, true);
-    world.setObstaclePosition(1, Vec3{0.0F, 0.4F, 3.2F}); // far: distance 2.4
+    world.setObstaclePosition(1, Vec3{0.0F, 0.4F, 3.2F});
+    world.setObstacleSize(1, Vec3{0.8F, 0.8F, 0.8F}); // far: distance 2.4
     world.setObstacleEnabled(1, true);
     VirtualObstacleSensorArray array(world);
 
     const ObstacleSensorArrayReadings readings = array.readings();
 
     ASSERT_TRUE(readings.frontCenterDistance.has_value());
-    EXPECT_NEAR(*readings.frontCenterDistance, 1.2F, kEpsilon);
+    EXPECT_NEAR(*readings.frontCenterDistance, 1.35F, kEpsilon);
 }
 
 // 15: BodyDimensionsAreReusedRatherThanDuplicated

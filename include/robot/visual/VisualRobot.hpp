@@ -9,13 +9,23 @@ namespace robot::visual
 // per Phase 13M's brief. Named constants so other code (Renderer3D, and
 // a future movement phase) has one source of truth instead of scattered
 // magic numbers.
+//
+// Phase 13W final workspace redesign: rescaled from the original
+// 0.60x0.80 down to ~0.40x0.50 - human validation of the first 8x4-desk
+// pass found the robot still read as oversized next to the (also
+// rescaled) monitor/keyboard/mouse, and its collision footprint left too
+// little clearance in the desk's own corridors. At this project's
+// ~20cm-per-world-unit design scale (docs/technical-decisions.md, Phase
+// 13W), 0.40x0.50 corresponds to an ~8x10cm miniature body - every other
+// dimension below is scaled by the same ~2/3 factor from its own
+// original value, kept proportionate rather than picked independently.
 namespace RobotDimensions
 {
-inline constexpr float kBodyWidth = 0.60F;
-inline constexpr float kBodyLength = 0.80F;
-inline constexpr float kBodyHeight = 0.25F;
-inline constexpr float kWheelRadius = 0.15F;
-inline constexpr float kWheelThickness = 0.08F;
+inline constexpr float kBodyWidth = 0.40F;
+inline constexpr float kBodyLength = 0.50F;
+inline constexpr float kBodyHeight = 0.16F;
+inline constexpr float kWheelRadius = 0.10F;
+inline constexpr float kWheelThickness = 0.05F;
 } // namespace RobotDimensions
 
 // Draws the two-wheel mobile robot model (body, left/right wheels, and a
