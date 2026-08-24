@@ -18,6 +18,7 @@
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
+#include "robot/visual/TurkishText.hpp"
 #include "robot/visual/VirtualCliffSensor.hpp"
 #include "robot/visual/VirtualDistanceSensor.hpp"
 #include "robot/visual/VirtualObstacleSensorArray.hpp"
@@ -249,12 +250,15 @@ int main()
     // setting (see VirtualRobotHardware::driveAuthority()).
     bool avoidanceEnabled = true;
 
-    // HUD detail level (UX polish) - `H` toggles Full <-> Compact.
-    // Presentation-only: read by Renderer3D's drawHud() alone, never
-    // consulted by any FSM/hardware/safety/avoidance decision below.
-    // Starts Full so RobotSimulator3D shows full engineering telemetry
-    // immediately, matching every other toggle's own documented default.
-    robot::visual::HudMode hudMode = robot::visual::HudMode::Full;
+    // HUD detail level (UX polish) - `H` toggles Full <-> Compact, shown
+    // to the user as Ayrıntılı (detailed) <-> Sade (simple). Presentation-
+    // only: read by Renderer3D's drawHud() alone, never consulted by any
+    // FSM/hardware/safety/avoidance decision below. Final UI/HUD polish:
+    // starts Compact (Sade) so RobotSimulator3D shows the small,
+    // easy-to-read operational summary immediately - the new default per
+    // this phase's brief - with the full engineering telemetry panel one
+    // `H` press away.
+    robot::visual::HudMode hudMode = robot::visual::HudMode::Compact;
 
     while (!WindowShouldClose())
     {
@@ -538,12 +542,20 @@ int main()
         }
 
         robot::visual::VisualTelemetry telemetry{};
-        telemetry.stateText = robot::toString(stateMachine.currentState());
-        telemetry.commandText = robot::visual::toString(hardware.currentCommand());
-        // Manual-validation bugfix: optional Full-HUD-only diagnostic -
-        // Renderer3D never uses this to decide anything, it only displays
-        // it.
-        telemetry.returnHomeReasonText = robot::toString(stateMachine.returnHomeReason());
+        // Final UI/HUD polish: these six fields are now populated through
+        // TurkishText.hpp's turkishText() overloads instead of each type's
+        // own English toString() - main3d.cpp is the one place in this
+        // codebase allowed to know both the real domain/visual-simulation
+        // enums AND the Turkish presentation mapping (see TurkishText.hpp's
+        // own docs for why this must not move into Renderer3D). The
+        // English toString() overloads themselves are untouched and still
+        // used everywhere else (CLI report output, existing tests).
+        telemetry.stateText = robot::visual::turkishText(stateMachine.currentState());
+        telemetry.commandText = robot::visual::turkishText(hardware.currentCommand());
+        // Manual-validation bugfix: optional Ayrıntılı(detailed)-HUD-only
+        // diagnostic - Renderer3D never uses this to decide anything, it
+        // only displays it.
+        telemetry.returnHomeReasonText = robot::visual::turkishText(stateMachine.returnHomeReason());
         telemetry.sensorOrigin = sensor.sensorOrigin();
         telemetry.sensorDirection = sensor.sensorDirection();
         telemetry.obstacleDistance = sensor.distanceToNearestObstacle();
@@ -552,8 +564,9 @@ int main()
         const robot::visual::WheelSpeeds wheelSpeeds = hardware.wheelSpeeds();
         telemetry.leftWheelSpeed = wheelSpeeds.left;
         telemetry.rightWheelSpeed = wheelSpeeds.right;
-        telemetry.driveAuthorityText = robot::visual::toString(hardware.driveAuthority());
+        telemetry.driveAuthorityText = robot::visual::turkishText(hardware.driveAuthority());
         telemetry.collidedLastUpdate = hardware.collidedLastUpdate();
+        telemetry.batteryPercent = hardware.batteryLevelPercent();
         telemetry.avoidanceEnabled = avoidanceEnabled;
         telemetry.avoidanceActive = avoidance.active();
         telemetry.forwardClearanceClear = forwardCorridorClear;
@@ -563,7 +576,7 @@ int main()
         telemetry.cliffRearLeft = cliffReadings.rearLeft;
         telemetry.cliffRearRight = cliffReadings.rearRight;
         telemetry.edgeSafetyActive = tableEdgeSafety.active();
-        telemetry.edgeRecoveryStateText = robot::visual::toString(tableEdgeSafety.state());
+        telemetry.edgeRecoveryStateText = robot::visual::turkishText(tableEdgeSafety.state());
         telemetry.edgeTargetHeadingDegrees = tableEdgeSafety.targetRecoveryHeadingDegrees();
         telemetry.edgeHeadingErrorDegrees = tableEdgeSafety.currentHeadingErrorDegrees();
 
@@ -589,7 +602,7 @@ int main()
         // Phase 13T: already-computed HomeNavigator telemetry - Renderer3D
         // never has any notion of the Aligning/Driving/Arrived policy
         // itself.
-        telemetry.homeNavigationStateText = robot::visual::toString(homeNavigation.state);
+        telemetry.homeNavigationStateText = robot::visual::turkishText(homeNavigation.state);
         telemetry.homeNavigationDistance = homeNavigation.distanceToHome;
         telemetry.homeNavigationTargetHeadingDegrees = homeNavigation.targetHeadingDegrees;
         telemetry.homeNavigationHeadingErrorDegrees = homeNavigation.headingErrorDegrees;
@@ -603,7 +616,8 @@ int main()
         // exactly like "Position: X/Z" above already reads
         // world.robotPose() directly rather than through another
         // component.
-        telemetry.missionTaskText = robot::visual::toString(missionTask);
+        telemetry.missionTaskText = robot::visual::turkishText(missionTask);
+        telemetry.returningHomeTask = missionTask == robot::visual::MissionTask::ReturnHome;
         {
             const robot::visual::Vec3& robotPosition = world.robotPose().position;
             const robot::visual::Vec3& basePosition = world.basePlatform().position;

@@ -508,6 +508,43 @@ target_link_libraries(RobotSimulator3D PRIVATE
     robot_polling_composite
 )
 
+# Final font delivery fix: copy the repository-local Turkish-capable font
+# (assets/fonts/anonymous_pro_bold.ttf - see
+# assets/fonts/LICENSE-AnonymousPro.txt for its source/license) next to
+# RobotSimulator3D.exe at build time, so the shipped executable never
+# depends on the source tree's location - a checkout built on a different
+# machine still finds its font. Renderer3D.cpp resolves the matching
+# runtime path (its own directory + assets/fonts/...) via
+# GetModuleFileNameA(); see that file's own docs. copy_if_different (not a
+# raw copy) so this is a no-op, not a rebuild trigger, when the asset
+# hasn't changed.
+add_custom_command(TARGET RobotSimulator3D POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:RobotSimulator3D>/assets/fonts"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/assets/fonts/anonymous_pro_bold.ttf"
+        "$<TARGET_FILE_DIR:RobotSimulator3D>/assets/fonts/anonymous_pro_bold.ttf"
+    COMMENT "Copying Turkish-capable font next to RobotSimulator3D.exe"
+)
+
+# Final Turkish-font polish: MSVC's narrow-string-literal execution
+# character set defaults to the active Windows code page (not guaranteed to
+# be UTF-8) unless told otherwise, while raylib's DrawTextEx()/
+# MeasureTextEx() always decode the C-string they are given as UTF-8 - so a
+# real (non-ASCII-folded) Turkish literal compiled without this flag risks
+# being baked into the binary as single-byte code-page bytes that raylib's
+# UTF-8 decoder then misreads, corrupting the very letters this phase adds.
+# /utf-8 forces both source- and execution-charset to UTF-8, matching what
+# this project's UTF-8-saved source files and raylib's decoder both already
+# assume. Scoped to exactly the two targets whose translation units contain
+# a Turkish string literal (TurkishText.hpp is only included by
+# main3d.cpp/RobotSimulator3D; Renderer3D.cpp/robot_visual has its own
+# literal Turkish labels) - never applied project-wide.
+if (MSVC)
+    target_compile_options(robot_visual PRIVATE /utf-8)
+    target_compile_options(RobotSimulator3D PRIVATE /utf-8)
+endif()
+
 # --- Tests (GoogleTest via FetchContent, pinned to a stable tagged release) ---
 enable_testing()
 

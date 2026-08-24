@@ -17,6 +17,17 @@ namespace robot::visual
 // changes which already-computed VisualTelemetry fields Renderer3D
 // chooses to draw. Deliberately lives here (the presentation layer),
 // never in a core robot/domain header.
+//
+// Final UI/HUD polish: user-facing terminology is now Sade ("simple" -
+// a small ~6-8-line operational summary, the new default) and Ayrıntılı
+// ("detailed" - the full engineering telemetry panel, unchanged in
+// content from before this pass, only relabeled). The enum identifiers
+// themselves (Full/Compact) are kept exactly as-is - only drawHud()'s
+// Turkish presentation output changed, per this phase's own instruction
+// to translate presentation, not rename internal identifiers -
+// Full now BACKS the Ayrıntılı (detailed) panel and Compact now BACKS the
+// Sade (simple) panel; main3d.cpp's initial hudMode is Compact so Sade is
+// what a user sees by default.
 enum class HudMode
 {
     Full,
@@ -217,6 +228,24 @@ struct VisualTelemetry
     std::string_view missionTaskText;
     bool homeZoneInside = true;
     float baseDistance = 0.0F;
+
+    // Final UI/HUD polish: true exactly when missionTaskText corresponds
+    // to MissionTask::ReturnHome - a plain bool computed once in main3d.cpp
+    // (from the real MissionTask enum it already has in scope) rather than
+    // Renderer3D string-comparing missionTaskText's Turkish text, matching
+    // every other "main3d.cpp decides, Renderer3D only displays" telemetry
+    // field above. Drives the simple/Sade HUD's single optional contextual
+    // line (distance-to-base, only shown while actually returning home).
+    bool returningHomeTask = false;
+
+    // Final UI/HUD polish: VirtualRobotHardware::batteryLevelPercent(),
+    // already-read directly from IRobotHardware exactly like every other
+    // telemetry field above - Renderer3D never queries hardware itself.
+    // Currently always 100 (see VirtualRobotHardware::batteryLevelPercent()'s
+    // own docs: no battery-drain simulation exists yet in the visual
+    // simulator), wired through now so the simple/Sade HUD's "Batarya"
+    // line reflects the real getter rather than a hardcoded display value.
+    int batteryPercent = 100;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,
@@ -235,6 +264,19 @@ class Renderer3D
 {
 public:
     Renderer3D();
+
+    // Final Turkish-font polish: font_ owns a loaded GPU texture (see
+    // constructor), so Renderer3D is no longer trivially copyable/
+    // destructible - UnloadFont() must run before the raylib window
+    // closes. Not copyable (there is exactly one instance, constructed
+    // once in main3d.cpp - a copy would double-free the same GPU texture
+    // on destruction); left movable is unnecessary for the same reason,
+    // so move is deleted too, matching "not copyable" for simplicity.
+    Renderer3D(const Renderer3D&) = delete;
+    Renderer3D& operator=(const Renderer3D&) = delete;
+    Renderer3D(Renderer3D&&) = delete;
+    Renderer3D& operator=(Renderer3D&&) = delete;
+    ~Renderer3D();
 
     // Draws one complete frame for `world`. When `updateCamera` is true,
     // the camera is first advanced per raylib's built-in CAMERA_FREE
@@ -262,7 +304,33 @@ private:
     // HudMode, so task controls stay visible in both Full and Compact.
     void drawMissionControlPanel(const VisualTelemetry& telemetry) const;
 
+    // Final Turkish-font polish: thin wrappers around raylib's
+    // DrawTextEx()/MeasureTextEx() using font_ (below) plus a fixed
+    // spacing-per-fontSize ratio matching DrawText()/MeasureText()'s own
+    // internal default (fontSize/10) - added purely so drawHud()'s and
+    // drawMissionControlPanel()'s per-line loops stay simple find/replace
+    // changes (DrawText(...) -> drawText(...), MeasureText(...) ->
+    // measureTextWidth(...)) with no other logic change. No raylib type
+    // appears in either signature, so this adds no new public surface
+    // beyond what font_ already requires internally.
+    void drawText(const char* text, int x, int y, int fontSize, Color color) const;
+    int measureTextWidth(const char* text, int fontSize) const;
+
     Camera3D camera_;
+
+    // Final Turkish-font polish: the Turkish-capable Unicode font loaded
+    // in the constructor (assets/fonts/anonymous_pro_bold.ttf, resolved at
+    // runtime relative to this executable's own directory - see the
+    // constructor's exeDirectory() helper, CMakeLists.txt's POST_BUILD
+    // copy step, and assets/fonts/LICENSE-AnonymousPro.txt) - replaces
+    // raylib's built-in
+    // default font (Unicode U+0000-U+00FF only) for every string this
+    // class draws, so Turkish's four extended-Latin letters (ğ/Ğ, ı, ş/Ş,
+    // İ) render correctly instead of as missing glyphs. Falls back to
+    // GetFontDefault() if the file cannot be loaded (see the constructor)
+    // - Renderer3D never fails to render, only degrades gracefully to the
+    // old ASCII-only appearance.
+    Font font_;
 };
 
 } // namespace robot::visual

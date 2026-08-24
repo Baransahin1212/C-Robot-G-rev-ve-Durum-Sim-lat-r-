@@ -44,14 +44,20 @@ Tested development environment:
 - Git is optional for users — only needed if you want to clone the
   repository yourself rather than download a copy
 
-Two dependencies are used and are **not** something you need to install
+Three dependencies are used and are **not** something you need to install
 yourself:
 
 - [GoogleTest](https://github.com/google/googletest) (`v1.15.2`)
 - [nlohmann/json](https://github.com/nlohmann/json) (`v3.11.3`)
+- [raylib](https://github.com/raysan5/raylib) (`6.0`) — used only by the
+  `RobotSimulator3D` visual simulator's rendering/window/input layer (see
+  [3D visual simulator](#3d-visual-simulator-phase-13m13n13o13p13q) below);
+  the CLI `RobotSimulator` executable does not depend on it at all (see
+  [CMake / library structure](#cmake--library-structure)).
 
-Both are fetched automatically at configure time via CMake `FetchContent`
-(requires network access the first time you configure the project).
+All three are fetched automatically at configure time via CMake
+`FetchContent` (requires network access the first time you configure the
+project).
 
 ## Build instructions
 
@@ -79,7 +85,7 @@ To see the exact number of discovered tests without running them:
 ctest -C Debug -N
 ```
 
-As of this writing, this discovers and passes **77 automated tests**
+As of this writing, this discovers and passes **565 automated tests**
 (verified immediately before writing this document — re-run the command
 above to confirm the current count, since it will grow as the project
 grows).
@@ -353,6 +359,25 @@ Run it directly - no arguments:
 .\build\Debug\RobotSimulator3D.exe
 ```
 
+**Final UI/HUD polish: all on-screen interface text is Turkish by
+default.** The HUD, Mission Control panel, and key hints described
+throughout this section now render in Turkish (see the exact key labels
+and HUD structure just below) - only the internal C++ identifiers/enum
+names and this document's own English prose describing them are
+unchanged. Where this section quotes an internal value name (`State`,
+`Command: Stopped`, `Authority: AUTONOMOUS`, etc.) below, that documents
+the underlying telemetry concept, not the literal text now drawn on
+screen. Turkish diacritics (ç/Ç, ğ/Ğ, ı, i/İ, ö/Ö, ş/Ş, ü/Ü) render via a
+bundled, repository-local font - **Anonymous Pro Bold** by Mark Simonson,
+SIL Open Font License 1.1, at `assets/fonts/anonymous_pro_bold.ttf` (see
+`assets/fonts/LICENSE-AnonymousPro.txt`) - used only for RobotSimulator3D's
+own UI text, loaded via `raylib`'s `LoadFontEx()`. The build copies this
+font next to `RobotSimulator3D.exe` (`assets/fonts/anonymous_pro_bold.ttf`,
+relative to the executable), and `Renderer3D` resolves that same path at
+runtime from the executable's own directory (`GetModuleFileNameA()`) -
+never a developer machine's source-tree path - falling back to raylib's
+built-in default font if the file cannot be read.
+
 It opens a real 1280x720 window titled **"Robot Simulator 3D"** (starting
 in borderless fullscreen - press `F11` to toggle windowed) showing a small
 hard-coded demo world: a ground plane and grid, a two-wheel robot model
@@ -366,10 +391,10 @@ with the on-screen **Mission Control** panel (top-right) reading
 `Task: NONE` - you explicitly assign a task:
 
 ```text
-1  Start Roam     (Idle/Ready -> ... -> Moving)
-2  Return Home    (Moving/Ready -> ReturningHome)
-3  Stop Task      (cancels whatever is currently running -> Ready)
-R  Return Home    (alias for 2, preserved from Phase 13T)
+1  Gezinmeyi Başlat  (Start Roam: Idle/Ready -> ... -> Moving)
+2  Eve Dön           (Return Home: Moving/Ready -> ReturningHome)
+3  Görevi Durdur     (Stop Task: cancels whatever is currently running -> Ready)
+R  Eve Dön           (Return Home, alias for 2, preserved from Phase 13T)
 ```
 
 `1` reaches `Moving` through the FSM's own real transition rules -
@@ -388,8 +413,9 @@ Control" below for the full command-to-Event mapping, the automatic Home
 Zone return trigger, and why a normal Stop never cancels an active table-
 edge safety recovery.
 
-An on-screen engineering HUD (top-left, `H` toggles Full/Compact, see
-below) additionally shows
+An on-screen engineering HUD (top-left, `H` toggles Sade/Ayrıntılı - see
+below - shown internally as `HudMode::Compact`/`HudMode::Full`)
+additionally shows
 the robot's live FSM state/command, (Phase 13Q/13S/13T) drive authority
 (`FSM`/`NAVIGATION`/`AUTONOMOUS`/`MANUAL`/`SAFETY`) and whether reactive
 avoidance is enabled, (Phase 13R) whether the avoidance latch is currently
@@ -411,15 +437,16 @@ keys drive the wheels directly (`UP`/`DOWN` forward/reverse,
 priority over every other key, for as long as it is held. `A` toggles
 reactive obstacle avoidance (Phase 13Q, ON by default). `1`/`2`/`3`/`R`
 are Mission Control's task-assignment keys - see above and "Mission
-Control" below. `H` toggles the HUD
-between **Full** (the detailed engineering telemetry described above, the
-default) and **Compact** (a genuinely smaller panel showing only
-high-value operational/safety state: `State`, `Authority`, `Safety`,
-`Avoidance`, `Obstacle`, `Edge`, `Home` - never hiding an active `SAFETY`
-authority, an obstacle hazard, or edge recovery). This is a
+Control" below. `H` toggles the HUD between **Sade** ("simple" - a small
+~6-8-line summary: `Durum`/`Görev`/`Kontrol`/`Engel`/`Kenar`/`Batarya`
+plus at most one contextual line, never hiding an active safety recovery
+or obstacle hazard - the **default** as of the final UI/HUD polish) and
+**Ayrıntılı** ("detailed" - the full engineering telemetry panel
+described above, translated but otherwise unchanged). This is a
 presentation-only toggle - it has no effect on robot behavior in either
-mode; see `docs/technical-decisions.md` (UX polish) for the full Compact-
-mode field list and why. Close the window normally to exit.
+mode; see `docs/technical-decisions.md` (UX polish) for the original
+Compact-mode field list this Sade panel superseded. Close the window
+normally to exit.
 
 **As of Phase 13N, the on-screen robot is actually driven by the real,
 unmodified robot-control stack** - the same `RobotStateMachine`/
@@ -898,10 +925,11 @@ naturally take one extra frame to be consumed (`HomeNavigator::update()`
 runs after `runtime.step()` each frame, matching the existing
 `hardware.update()` ordering) - an accepted, deterministic one-frame
 latency, not a bug. The HUD gained `Home nav: .../Home distance: .../Home
-target heading: .../Home heading error: ...` (Full) or a single `Home:
-<state> <distance>m` line (Compact), plus an optional cyan target-
-direction guide line while actively steering; `Drive authority` now also
-shows `NAVIGATION`.
+target heading: .../Home heading error: ...` (Ayrıntılı/detailed mode) or,
+in Sade/simple mode, an `Eve uzaklık: ...` line shown only while the
+current task is actually Return Home, plus an optional cyan target-
+direction guide line while actively steering; `Drive authority`/`Kontrol`
+now also shows `NAVIGATION`/`Eve Dönüş`.
 
 **Manual-validation bugfix: `R` can be pressed repeatedly, indefinitely.**
 Human testing found that after one successful user-requested Return Home,
@@ -935,12 +963,18 @@ that want a fixed automatic sequence). Mission assignment is fully
 explicit through a new **Mission Control** panel and its single event
 source, `MissionControlEventSource`:
 
-| Key | Command | Event(s) |
-|---|---|---|
-| `1` | Start Roam | `ScenarioLoaded` + `StartMission` (from `Idle`) or just `StartMission` (from `Ready`) - never both forced through in one frame; a no-op if already `Moving`/`ReturningHome` |
-| `2` | Return Home | `ReturnHomeRequested` |
-| `R` | Return Home (alias) | `ReturnHomeRequested` - the exact same call as `2`, never a second implementation |
-| `3` | Stop Task | `StopTaskRequested` (new `EventType` - audited first; `MissionCompleted` implies success, `EmergencyStop` is a physical fault, `Reset` is reserved for clearing `EmergencyStopped`/`Error`, so none fit a normal task cancellation) |
+On-screen (final UI/HUD polish, Turkish by default) the panel shows this
+same table's `Command` column as `Gezinmeyi Başlat`/`Eve Dön`/`Görevi
+Durdur`/`Eve Dön` - presentation text only, computed in `main3d.cpp` from
+these exact same `MissionControlEventSource` calls/`Event` values, never a
+second implementation:
+
+| Key | Command | Turkish label shown | Event(s) |
+|---|---|---|---|
+| `1` | Start Roam | `Gezinmeyi Başlat` | `ScenarioLoaded` + `StartMission` (from `Idle`) or just `StartMission` (from `Ready`) - never both forced through in one frame; a no-op if already `Moving`/`ReturningHome` |
+| `2` | Return Home | `Eve Dön` | `ReturnHomeRequested` |
+| `R` | Return Home (alias) | `Eve Dön` | `ReturnHomeRequested` - the exact same call as `2`, never a second implementation |
+| `3` | Stop Task | `Görevi Durdur` | `StopTaskRequested` (new `EventType` - audited first; `MissionCompleted` implies success, `EmergencyStop` is a physical fault, `Reset` is reserved for clearing `EmergencyStopped`/`Error`, so none fit a normal task cancellation) |
 
 `StopTaskRequested` is accepted from `Moving`, `ReturningHome`, and
 `WaitingForObstacleClear` (an obstacle-paused Roam or Return Home), always
@@ -1259,3 +1293,39 @@ RobotSimulator/
 `logs/` and `reports/` are created at runtime and are not part of the
 tracked project structure (see [Generated runtime outputs](#generated-runtime-outputs)
 above).
+
+## Known Limitations
+
+These are documented, audited **V1 scope limitations** — deliberate
+boundaries of what this project set out to build, not delivery blockers or
+undiscovered defects. Each is discussed in full (root cause, geometry, and
+rationale) in [`docs/technical-decisions.md`](docs/technical-decisions.md).
+
+- **Reactive avoidance/navigation resonance.** `ReactiveObstacleAvoidance`
+  and `HomeNavigator` can, for certain obstacle placements relative to the
+  straight line to base, repeatedly re-trigger each other — the avoidance
+  turn changes heading, `HomeNavigator` immediately re-aims back toward
+  base, and the cycle repeats with little or no net forward progress. A
+  real fix would need obstacle-aware approach-angle memory in
+  `HomeNavigator`, which is out of scope for V1.
+- **Reactive navigation only — not global path planning.** Both obstacle
+  avoidance and Return Home navigation are purely reactive ("turn until
+  clear," "steer straight at the target") — there is no A*, Dijkstra,
+  SLAM/mapping, occupancy grid, or waypoint graph anywhere in this project,
+  and the robot never attempts to recover its original heading/path once a
+  reactive layer releases.
+- **Table-edge corner case.** If a front and a rear cliff sensor both
+  detect an edge at the same instant (a robot straddling two edges near a
+  table corner), `TableEdgeSafetyController`'s recovery choice
+  (`BackingAway`) is not guaranteed correct for the rear edge too — a
+  narrow, geometrically unusual case that remains unresolved.
+- **Discrete-ray obstacle perception.** `VirtualObstacleSensorArray` casts
+  three parallel forward rays (not a continuous sensor field), which by
+  construction leaves small unswept gaps between rays; a secondary
+  body-corridor hazard check (`ForwardClearanceProbe`) closes most of that
+  gap but the underlying perception is still discrete, not continuous.
+- **Fixed V1 constants.** Detection ranges, safety margins, arrival radii,
+  hysteresis thresholds, and similar geometry/timing constants throughout
+  the visual simulator are hardcoded, tuned against this project's own demo
+  scene — they are not runtime-configurable or auto-tuned for arbitrary
+  geometry.
