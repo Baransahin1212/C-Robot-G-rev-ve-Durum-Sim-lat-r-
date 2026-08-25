@@ -4571,3 +4571,549 @@ state machine, `DriveAuthority` priority, Home Zone removal,
 lifecycle, and `RobotRuntime::step()` ordering are all untouched - this
 phase is world geometry, derived robot dimensions, and tests only, as
 scoped.
+
+## Phase 13X: Map-aware navigation and autonomous frontier exploration
+
+### The human-observed problem
+
+Two residual product problems remained after Phase 13W:
+
+**Return Home spin.** With an obstacle sitting between the robot and the
+dock, `HomeNavigator` continuously recomputes a straight-line target
+heading toward `BasePlatform.position` from the robot's CURRENT pose
+every frame (by design - see Phase 13T). Combined with
+`ReactiveObstacleAvoidance`'s own release condition, the robot could
+rotate away from an obstacle, have `HomeNavigator` immediately re-aim
+back through the same obstacle the instant the corridor read momentarily
+clear, and repeat - net translation near zero, heading oscillating or
+sweeping large angles, indefinitely. Local reactive navigation has no
+notion of "this direction is known to be blocked, try a fundamentally
+different route" - it only ever knows the immediate sensor state. The
+fix could not be another local reactive tweak (the brief explicitly
+ruled out a timer, random turn, cooldown, or a larger `AdvanceClear`
+distance): the robot has an occupancy map by Phase 13V; the fix was to
+use it for planning, not just perception.
+
+**Aimless exploration.** `MissionTask::Roam` mapped straight to plain FSM
+`moveForward()` plus reactive avoidance - "wandering," not seeking.
+Nothing about that loop ever consulted `ExplorationMap` to notice large
+Unknown regions remained while the robot kept re-traversing already-known
+territory.
+
+### Why local reactive navigation was insufficient
+
+`ReactiveObstacleAvoidance` and `HomeNavigator` both operate on exactly
+one frame's sensor/pose state; neither has any persistent notion of
+"space already known to be occupied elsewhere on the desk." An occupancy
+map turns "elsewhere" into a queryable fact. This phase's entire
+architecture is the consequence of that one observation: promote
+`ExplorationMap` from a purely observational/display artifact (Phase
+13V) to a genuine planning input, for two new consumers -
+`GridPathPlanner` (global route planning) and `FrontierExplorer`
+(frontier-based exploration target selection) - while leaving the local
+reactive layer in place underneath, exactly as before, for hazards the
+map does not yet know about.
+
+**This is occupancy-grid path planning and frontier-based exploration,
+NOT SLAM.** `VirtualWorld`'s `RobotPose` remains the one authoritative
+pose throughout; there is no scan matching, loop closure, or particle
+localization anywhere in this phase's code.
+
+### Files created
+
+- `include/robot/visual/GridPathPlanner.hpp` / `src/visual/GridPathPlanner.cpp`
+- `include/robot/visual/FrontierExplorer.hpp` / `src/visual/FrontierExplorer.cpp`
+- `include/robot/visual/NavigationProgressTracker.hpp` / `.cpp`
+- `include/robot/visual/WaypointNavigator.hpp` / `.cpp`
+- `include/robot/visual/WaypointArrivalEventSource.hpp` / `.cpp`
+- `include/robot/visual/ExplorationCompletionEventSource.hpp` / `.cpp`
+- `tests/visual/GridPathPlannerTests.cpp`,
+  `tests/visual/FrontierExplorerTests.cpp`,
+  `tests/visual/WaypointNavigatorTests.cpp`,
+  `tests/visual/MapAwareNavigationIntegrationTests.cpp`
+
+### Files modified
+
+`CMakeLists.txt` (new sources/targets, `robot_visual_simulation` now
+links `robot_exploration`), `src/visual/main3d.cpp` (map-aware navigation
+wiring, frontier-selection loop, completion debounce), `include/robot/visual/Renderer3D.hpp`
+/ `src/visual/Renderer3D.cpp` (`renderFrame()` gains a `plannedRoute`
+parameter; draws the route and a frontier-target marker on the HARİTA
+panel), `include/robot/visual/TurkishText.hpp` (`WaypointNavigatorState`
+mapping), README.md.
+
+### GridPathPlanner: API, A* design, connectivity, clearance
+
+`GridPathPlanner(const ExplorationMap&)` precomputes a traversability
+grid at construction (Free, ≥ `RobotCollision::kRobotCollisionRadius +
+kPlanningSafetyMargin` from every Occupied cell and every table edge) -
+`isTraversable(col,row)` is then O(1). `planPath(startWorld, goalWorld)`
+runs deterministic A*: 8-connected, corner-cutting prevented (a diagonal
+step is rejected unless both orthogonal cells it would cut across are
+also traversable), f-score ties broken by ascending row-major cell index
+(never insertion order or pointer/hash), diagonal cost `cellSize*sqrt(2)`.
+The START cell is exempted from the traversability requirement (the
+robot may legitimately already sit inside another obstacle's
+planning-clearance margin without actually colliding) - every other cell
+in the path must be traversable. **Unknown cells are never traversable**
+- both Return Home and frontier navigation refuse to plan through
+unobserved space. If the literal goal cell is untraversable (e.g.
+`BasePlatform.position` sits close enough to the dock's own rear-housing
+obstacle that its planning-clearance margin overlaps - see "dock goal
+snapping" below), a bounded expanding-ring search finds the nearest
+traversable cell to plan to instead, and the literal goal point is
+appended as one final waypoint so local steering closes the last few
+centimeters via its own existing arrival-radius logic - exactly as it
+already did before this phase. `simplifyPath()` is deterministic
+greedy line-of-sight ("string pulling") collapse of the raw cell path
+into the minimal waypoint set whose straight segments never cross a
+non-traversable cell.
+
+**4- vs. 8-connected:** 8-connected was chosen for materially
+shorter/more natural routes at this project's grid resolution (0.12F
+cells over an 8x4 table, ≈67x33 cells), at negligible extra cost for a
+map this small.
+
+**Dock goal snapping:** `BasePlatform.position` (1.3, -1.5) sits only
+~0.30-0.35 world units from the dock's rear-housing obstacle center along
+one axis - closer than `kRobotCollisionRadius + kPlanningSafetyMargin`
+(~0.40). The EXISTING system already treats "arrival" as reaching within
+`HomeNavigator::kHomeArrivalRadius` (0.40F) of the exact point, never
+requiring the robot's center to reach it precisely - the goal-snapping
+design simply gives the global planner the same tolerance, rather than
+requiring an artificially-inflated Occupied margin around the dock or a
+planner that fails outright on the production desk's own real geometry.
+
+### FrontierExplorer: frontier definition, clustering, scoring, reachability
+
+A **frontier cell** is a planner-traversable Free cell 4-connected-
+adjacent (deliberately not 8-connected - a merely diagonal Unknown
+neighbor is a much weaker "boundary of the known" signal) to at least one
+Unknown cell. Frontier cells are grouped into **clusters** by
+8-connected adjacency to each other (flood-fill), and clusters smaller
+than `kMinimumFrontierClusterSize` (3) are discarded as sensor-noise-
+scale. Each cluster's representative candidate is its member closest
+(straight-line) to the robot; a single `GridPathPlanner::planPath()` call
+per cluster then proves reachability and supplies the real path cost -
+never a plain Euclidean-distance target choice. Score = `pathCost -
+kInformationGainWeight(0.05) * clusterSize` (lower wins) - a nearby,
+large cluster beats a distant, tiny one, without letting cluster size
+dominate distance. `FrontierExplorer` constructs a fresh
+`GridPathPlanner` internally on every call (never caches one across
+frames), since `ExplorationMap` changes underneath it continuously via
+`ExplorationMapper`.
+
+### Completion semantics: raw vs. reachable, why Unknown is never mutated
+
+`ExplorationCompletion` has three values: `Exploring` (a frontier cell
+exists somewhere), `Complete` (no frontier cell exists anywhere on the
+map at all), `NoReachableFrontier` (frontier cells exist but none are
+reachable from the queried position). Both `Complete` and
+`NoReachableFrontier` are terminal for the exploration loop - "nothing
+reachable left to seek this session" - distinguished only for
+diagnostics. Completion NEVER mutates `ExplorationMap`'s own Unknown
+cells to manufacture a rounder percentage; the map stays truthful.
+Interior/occluded cells a real sensor geometrically cannot observe (e.g.
+directly beneath a desk object, from every angle the robot can approach)
+can legitimately remain Unknown forever - raw `exploredPercentage()` is
+not required to reach 100% for the reachable environment to be logically
+complete.
+
+**"Not merely waiting for a temporary map update":** the very first
+frontier-selection attempt on a freshly-started Haritalama session can
+legitimately fail (the robot's own initial footprint hasn't yet grown a
+frontier cluster past `kMinimumFrontierClusterSize`) - naively latching
+`complete=true` on that first failure sent the robot to ReturningHome
+before it had explored anywhere near the dock, and Return Home then
+correctly (per the Unknown-blocked policy above) found no route through
+still-Unknown space, deadlocking. The fix (`main3d.cpp`'s frontier-
+selection block): repeated failed attempts are throttled to once every
+`kFrontierRetryIntervalFrames` (20) - the map keeps growing between
+attempts via plain `moveForward()`, since no frontier target means no
+Navigation-authority goal - and completion only latches after
+`kRequiredConsecutiveNoTargetAttempts` (5) consecutive throttled failures
+agree.
+
+### Map-aware Return Home: WaypointNavigator, replanning, anti-spin
+
+`WaypointNavigator` sits above the UNCHANGED `HomeNavigator` (owned
+internally, never deleted or replaced): `GridPathPlanner` produces a
+simplified route, `WaypointNavigator` tracks the current waypoint index
+and asks `HomeNavigator` to steer toward it - never the final goal
+directly - so a local reactive maneuver can no longer cause the robot to
+re-aim back through a KNOWN obstacle (the old bug's exact mechanism).
+Replanning (a fresh `GridPathPlanner` construction, never every frame) is
+event/state-driven: fresh enable, caller-supplied `forceReplan` (set by
+`main3d.cpp` on the exact frame avoidance or Safety just released - "if
+robot is meaningfully displaced from planned route, replan from the
+CURRENT pose, never force it back to an obsolete waypoint behind it"),
+the remaining route's cells now containing a newly-discovered Occupied
+cell, `NavigationProgressTracker` reporting stuck, or a previous attempt
+having reported `Failed` (retried every call while `Failed`, so a growing
+map can unblock Return Home with no external stimulus).
+`NavigationProgressTracker` is the anti-spin bookkeeping, extracted as
+its own independently-tested component: accumulated ABSOLUTE heading
+change (two opposite 180° turns still sum to 360°, never cancel) versus
+net displacement over a 60-frame window - `isStuck()` only fires once
+≥720° has accumulated while displacement stayed below 0.10 world units
+for the whole window, so a legitimate Aligning phase (which can
+legitimately reach a full turn) is never mistaken for spinning.
+
+### Frontier navigation, drive authority, FSM
+
+Frontier exploration reuses the EXISTING `DriveAuthority::Navigation`
+tier - `MissionTask::Roam` + a held frontier target produces a
+`setNavigationWheelSpeeds()` request through the same `WaypointNavigator`
+instance Return Home uses (mutually exclusive per frame: `returningHome
+|| (roaming && target held)`), never a new authority tier. Zero
+`RobotStateMachine` changes were needed: `ExplorationCompletionEventSource`
+reuses the EXISTING `ReturnHomeRequested` EventType and
+`ReturnHomeReason::UserRequest` outcome (arrival → `Ready`, the same
+reusable, non-terminal destination `2`/`R` already produces) -
+`MissionAbort` was considered and rejected, since it would incorrectly
+classify a SUCCESSFULLY COMPLETED mapping session as a mission failure
+(`ReturningHome` + `HomeReached` sends `MissionAbort` to the terminal
+`Aborted` state). `WaypointArrivalEventSource` mirrors
+`HomeArrivalEventSource`'s exact edge-triggered shape, observing
+`WaypointNavigator::state() == Arrived` (the FULL route, never once per
+intermediate waypoint) instead of plain `HomeNavigator`. Both
+`HomeNavigator`/`HomeArrivalEventSource` remain fully compiled and
+tested, simply no longer in `main3d.cpp`'s production wiring - the same
+precedent `HomeZoneMonitor` already established (Phase 13V
+human-validation fix).
+
+### Interaction with Manual, Stop Task, Safety, and persistence
+
+Manual driving remains above Navigation authority unchanged; leaving
+Manual mode naturally causes the next frame's pose-based replan check to
+run against the NEW pose (never a stale waypoint). Stop Task
+(`StopTaskRequested`) cancels the active frontier/route intent by driving
+`RobotState` to `Ready`, at which point `main3d.cpp`'s own `!roaming`
+branch clears `currentFrontierTarget`/the blacklist - a subsequent Start
+Haritalama begins target selection clean while still resuming from the
+EXISTING map (never reset). `TableEdgeSafetyController` is unmodified and
+remains the highest authority; its own release is one of the two
+`forceReplan` triggers. Per the Phase 13X brief, NO planner/frontier/
+waypoint/blacklist state is ever persisted - `ExplorationMapStorage`
+still only saves `ExplorationMap`/`CoverageTrail`; on restart, frontiers
+are derived fresh from whatever map was loaded, and a compatible
+already-complete loaded map simply reports `NoReachableFrontier`/
+`Complete` immediately, without needing any special-cased startup logic.
+
+### Perception boundary
+
+`GridPathPlanner` and `FrontierExplorer` may read ONLY `ExplorationMap` -
+neither includes `VirtualWorld.hpp` beyond the plain `Vec3`/`TableSurface`
+data `ExplorationMap.hpp` itself already exposes, and neither can reach
+`VirtualWorld::obstacles()` or `DeskObjectType` even by accident (no such
+member/include exists to call). This is the exact same perception
+boundary `ExplorationMapper` already established in Phase 13V, extended
+to the two new planning consumers.
+
+### Known limitations (Phase 13X)
+
+**ReactiveObstacleAvoidance enclosure geometry (pre-existing, not
+introduced by this phase).** `ReactiveObstacleAvoidance`'s `TurnAway`
+phase releases only once `forwardCorridorClear` becomes true; it has no
+notion of "I have swept a full rotation and never found one" (its own
+header docs already acknowledge "no guaranteed solution for two or more
+obstacles forming an actual enclosure" - see the Phase 13W "long Gezinme"
+regression test's own docs for an equivalent, independently-discovered
+instance of this same limitation). Investigation during this phase (real
+end-to-end integration runs, deterministic and reproducible) confirmed:
+the robot can reach a desk position where a full 360° `TurnAway` sweep
+never finds a clear heading, and - since `AutonomousAvoidance` authority
+always outranks `Navigation` - nothing at the `WaypointNavigator`/
+exploration-loop level can un-wedge it once that happens; replanning the
+route does not help, because the local reactive layer is the one
+physically holding the wheels. `GridPathPlanner`'s own planned routes
+never route closer than clearance to any KNOWN obstacle - the wedge only
+arises when a REACTIVE local-avoidance incident (triggered by real-time
+sensing of geometry the global plan did not need to route around)
+displaces the robot into a position the planner itself would never have
+chosen. Frontier-driven exploration visits more varied desk positions
+(deliberately seeking corners/edges to maximize coverage) than plain
+undirected Roam did, so it can expose this pre-existing limitation
+somewhat more readily. Explicitly out of scope for this phase (the brief
+preserves `ReactiveObstacleAvoidance` as the unchanged local reactive
+layer); a follow-up phase giving that component its own deterministic,
+map-aware enclosure-escape behavior (e.g. consulting `ExplorationMap` to
+pick a turn direction known to lead toward Free space, rather than a
+fixed per-incident sign) is the recommended fix if unattended full-map
+completion needs to be reliable in every possible desk geometry. The
+`MapAwareNavigationIntegrationTests.cpp` test suite's own
+`ReturnHomeAroundProductionObjectTest`/`AutonomousExplorationCompletesAndAutoReturnsHome`
+tests document this in detail at their exact failure/mitigation points.
+
+### Validation
+
+681 pre-existing tests plus 56 new tests (18 `GridPathPlannerTests`, 15
+`FrontierExplorerTests`, 12 `WaypointNavigatorTests`/
+`NavigationProgressTrackerTest`, 11 `MapAwareNavigationIntegrationTests`)
+= 737/737 passing, 0 compiler warnings on `robot_exploration`/
+`robot_visual_simulation`/`RobotSimulator3D`/all new test targets. Human
+GUI validation (per this phase's own brief) has NOT yet been performed -
+see the phase's final report for the exact validation checklist.
+
+## Phase 13X blocker fix: bounded reactive avoidance + map-aware replan
+## handoff
+
+The "known limitation" documented immediately above - `TurnAway` able to
+rotate indefinitely with no guaranteed termination - was explicitly
+rejected as an acceptable resting state. This section documents the fix,
+why the previous limitation was actually visible in the first place, and a
+second, independent, still-open limitation this investigation uncovered
+along the way.
+
+### Reproduction (before any fix)
+
+Instrumented `ReactiveObstacleAvoidance::update()` and the `main3d.cpp`-
+mirroring `MapAwareHarness::driveFrame()` test harness to capture, every
+frame while `TurnAway` was active: pose, heading, latched turn direction,
+per-side sensor distances, accumulated rotation, current waypoint/route,
+and frontier/home target. Running a live, sensor-driven autonomous
+exploration session past a few thousand frames reliably reproduced the
+defect: accumulated rotation climbing past 700° (multiple full turns) with
+`forwardCorridorClear` never once becoming true, and zero net translation
+the entire time. Root cause confirmed exactly as suspected: `TurnAway` has
+no notion of "I have now swept every possible heading" - it only ever
+asks "is the corridor clear *right now*," which for a genuine local
+enclosure (geometry a single rotation-in-place can never route around) is
+never true.
+
+### Local vs. global responsibility - the architectural rule this fix
+### establishes
+
+`ReactiveObstacleAvoidance` is, and remains, a purely LOCAL, REACTIVE
+policy - it deliberately knows nothing about `ExplorationMap`,
+`GridPathPlanner`, or `WaypointNavigator` (see its own class docs,
+unchanged by this fix). A single rotation-in-place can only ever resolve
+geometry that is actually solvable by rotation - i.e. a clear heading
+exists RIGHT NOW from the CURRENT position. Once a full 360° sweep proves
+no such heading exists, the problem is provably no longer local: either
+the current position is a genuine dead end (only a different APPROACH
+position, chosen by global planning, can help) or the map itself needs to
+grow before any route exists at all. Continuing to rotate past 360° can
+never discover a heading a full revolution did not already sample - it is
+not merely undesirable, it is mathematically pointless. The fix therefore
+draws a hard line: LOCAL avoidance owns "is there a heading, right now,
+this incident can use," and hands off to GLOBAL replanning the instant
+that question is answered "no" - it never tries to solve routing itself.
+
+### The bounded sweep: `kMaximumTurnAwaySweepDegrees`
+
+`ReactiveObstacleAvoidance` now tracks accumulated ABSOLUTE heading
+rotation for the CURRENT incident (`accumulatedTurnAwayRotationDegrees_`,
+summed via `shortestSignedHeadingErrorDegrees()` across consecutive
+`update()` calls while `TurnAway` is active). This accumulator resets only
+on a brand new incident (`Inactive -> TurnAway`) or a full, successful
+release (`AdvanceClear -> Inactive`) - never on an `AdvanceClear ->
+TurnAway` re-block within the same incident, since that is still the same
+continuous incident and its rotation budget must not be silently
+refreshed. `kMaximumTurnAwaySweepDegrees = 360.0F`: since `TurnAway`
+always rotates continuously in one fixed (latched) direction, a full
+360° sweep is the mathematically COMPLETE search of this incident's one
+rotational degree of freedom - not a tuned magic number. Once reached
+without `forwardCorridorClear` ever having become true, the class
+releases itself to `Inactive` immediately (it never continues occupying
+the `AutonomousAvoidance` drive-authority tier once local avoidance has
+exhausted its own search) and reports `localRouteBlockedThisUpdate()` true
+for exactly that one `update()` call - a one-frame EDGE signal, mirroring
+this codebase's other edge-triggered signals (e.g. `HomeArrivalEventSource`),
+never a persistent state a caller must remember to clear.
+
+### `LocalRouteBlocked` handoff API
+
+The smallest possible surface was chosen: a single new
+`bool localRouteBlockedThisUpdate() const noexcept` accessor, true for
+precisely the one `update()` call that exhausted the sweep. No new
+`DriveAuthority` tier was invented - `AutonomousAvoidance` already covers
+"a reactive maneuver currently wants the wheels," and the moment this
+signal fires, `ReactiveObstacleAvoidance` has ALREADY released that
+authority (state is `Inactive`, `active()` is false, `wheelSpeeds()`
+returns `{0, 0}`), so the existing authority ordering
+(`Safety > Manual > AutonomousAvoidance > Navigation > Fsm`) is untouched
+by construction - there is nothing left for `AutonomousAvoidance` to
+contend for on that frame.
+
+### Why the forced replan is deferred by one frame (map update before
+### replan)
+
+`main3d.cpp` (and the `MapAwareHarness` test mirror) capture
+`avoidance.localRouteBlockedThisUpdate()` into a persistent
+`localRouteBlockedPendingReplan` flag at the END of the frame that raised
+it, then consume that flag as `forceReplan` at the START of the NEXT
+frame's `WaypointNavigator::update()` call - deliberately not forcing the
+replan within the SAME frame the signal fired. This guarantees the
+sensor observations gathered during the blocked incident's own final
+frame have already reached `ExplorationMapper::update()` (which runs
+later in that same frame's fixed order) before any replanning attempt
+reads the map, without ever calling `RobotRuntime::step()` a second time
+per frame - the "exactly one `step()` per frame" invariant is preserved
+throughout; this is pure frame-local bookkeeping, not an extra scheduler
+tick.
+
+### Why the resume-aware `returningHome`/`navigationEnabled` fix was
+### required
+
+The bounded sweep alone was NOT sufficient: the very first end-to-end
+test run still produced an unbounded SEQUENCE of individually-bounded
+incidents, because `main3d.cpp`'s existing `returningHome` flag was
+derived from `hardware.currentCommand() == ReturnToBase`, which collapses
+to `Stopped` for the ENTIRE `WaitingForObstacleClear` pause (a real,
+pre-existing FSM behavior, unrelated to this fix) - meaning
+`WaypointNavigator` was force-disabled for the whole pause, so the instant
+one bounded `TurnAway` incident released, there was no `Navigation`
+command available yet to actually move the robot before the very same
+still-present obstacle re-triggered a brand new incident on the next
+frame. Fixed by deriving `returningHome`/`navigationEnabled` from
+`MissionTask::deriveMissionTask()` instead, which is deliberately
+resume-aware (already true before this fix, for other reasons - see
+`MissionTask.hpp`) and correctly reports `ReturnHome`/`Roam` even mid-pause.
+
+### The two-condition suppression-release gate
+
+Even with `WaypointNavigator` now able to drive during the pause, a
+second failure mode appeared: the instant avoidance released,
+`hardware.obstacleDetected()` (a real-time sensor reading) still read
+true (the robot has not physically moved yet), so a fresh incident could
+re-trigger before `Navigation`'s freshly-replanned command ever got a
+single frame to actually turn the robot - each individual incident was
+correctly bounded, but the SEQUENCE never converged. Fixed with
+`avoidanceSuppressedAfterBlock`, released only once EITHER the robot's
+heading has changed by at least `kAvoidanceResumeHeadingChangeDegrees`
+(30°) since the block OR `hardware.collidedLastUpdate()` reports a
+rejected proposed motion. The heading-change condition alone covers
+`WaypointNavigator`'s `Aligning` phase (rotating toward a new waypoint);
+it does NOT cover `Driving` (translating in a straight line - heading
+does not change) getting stuck against an obstacle the replanned route
+did not anticipate, which is what the `collidedLastUpdate()` condition
+additionally covers. Both are real, independently-observed failure modes
+during investigation, not hypothetical.
+
+### The frontier-completion short-circuit
+
+A third failure mode, specific to full-map exploration: the existing
+`kRequiredConsecutiveNoTargetAttempts` debounce (Phase 13X, prevents
+premature completion) left a window where, between throttled frontier
+re-attempts, the exploration loop kept commanding blind forward driving
+with no active target - even after the map was ALREADY definitively
+complete (`FrontierExplorer::frontierCells()` empty - no frontier exists
+anywhere, not merely "none reachable this attempt"). This blind window was
+enough, in one investigated run, to drive the robot into a bad corner
+before completion ever latched. Fixed by checking
+`frontierExplorer.frontierCells().empty()` FIRST, bypassing the debounce
+entirely for this genuinely non-transient case - the debounce still
+applies to its original case (a temporarily-unreachable frontier that
+future exploration might unblock), just not to "there is provably nothing
+left to find."
+
+### Why random escape, reversing, or a resume-through-obstacle timeout
+### were rejected
+
+All three were considered and explicitly rejected, per this task's own
+constraints and this codebase's standing determinism requirement (no
+randomness anywhere): a random turn/reverse/waypoint would make the same
+input produce different outcomes across runs, is untestable
+deterministically, and does not actually address the root cause (it just
+gambles that a different heading happens to be clear); a bare timeout that
+"simply resumes through an obstacle" would violate every collision/
+Safety guarantee this codebase otherwise enforces. The bounded sweep +
+global replan handoff is fully deterministic (same map + same pose always
+produces the same outcome) and never bypasses collision or table-edge
+protection - it only ever hands control to `WaypointNavigator`, which
+itself only ever plans through cells `ExplorationMap` already reports
+Free at the required clearance.
+
+### How A* replanning actually resolves a locally-impossible route
+
+Once `WaypointNavigator` receives `forceReplan=true`, it constructs a
+FRESH `GridPathPlanner` from the CURRENT `ExplorationMap` (never a stale
+cached planner - see `WaypointNavigator`'s own class docs) and re-runs A*
+from the robot's CURRENT pose. Two outcomes are possible: a genuine
+alternate route exists (a detour through cells the original plan did not
+use), in which case the robot re-aims onto it; or no route exists at all
+(the goal is provably unreachable from the current position given the
+CURRENT map), in which case `WaypointNavigator` reports
+`WaypointNavigatorState::Failed`. For Return Home, this manifests as the
+FSM staying in `WaitingForObstacleClear`/retrying every subsequent call
+(per `WaypointNavigator`'s own "retried every call while Failed" policy -
+a growing map, from continued sensing, can unblock it with no external
+stimulus) rather than ever silently spinning. For exploration, a `Failed`
+target gets pushed onto the existing frontier blacklist
+(`frontierBlacklist`) and a DIFFERENT, still-reachable frontier is
+selected on the next attempt - reusing the exact mechanism Phase 13X
+already built for "this frontier turned out to be unreachable," never a
+new one.
+
+### `NavigationProgressTracker`'s relationship to the bounded local sweep
+
+`NavigationProgressTracker` remains, unmodified in its own stuck-detection
+logic, a SECOND-LEVEL, GLOBAL safeguard: it watches the WAYPOINT-FOLLOWING
+layer's own displacement/rotation over a much longer window (60 frames,
+720° threshold) than any single local avoidance incident ever spans, and
+triggers a replan if `WaypointNavigator` itself appears stuck for reasons
+OTHER than an active local avoidance incident (e.g. a planned route that
+is technically clear but geometrically awkward). The bounded `TurnAway`
+sweep's own 360° limit is derived purely from local rotational geometry
+(see above) and does NOT read, depend on, or share state with
+`NavigationProgressTracker` in any way - keeping the two safeguards' scopes
+disjoint (one incident-local, one route-global) avoids exactly the kind
+of circular "which layer is actually responsible" ambiguity this whole
+investigation was triggered by in the first place.
+
+### A second, independent, still-open limitation discovered during this
+### investigation: `TableEdgeSafetyController::AdvancingInward`
+
+With the `ReactiveObstacleAvoidance` defect genuinely fixed (see
+Validation below - all avoidance/handoff-specific regression and
+integration tests pass), one integration test still fails:
+`FullMapCompletionIntegrationTest::AutonomousExplorationCompletesAndAutoReturnsHome`,
+whose non-fatal diagnostic workaround has been REMOVED per this task's own
+explicit instruction (the test now hard-requires genuine physical dock
+arrival). Root-cause diagnosis (via the same full-telemetry approach used
+above): the robot reliably gets wedged in `TableEdgeSafetyController`'s
+`AdvancingInward` recovery state, specifically inside
+`translatingWouldNotHelp()` in `src/visual/TableEdgeSafetyController.cpp`,
+which unconditionally returns `false` ("keep translating forward, it's
+fine") the instant `aggregateTableOverhang() <= 0` - i.e. the moment the
+robot's footprint is fully back on the table surface, with ZERO awareness
+of solid obstacles. Confirmed via telemetry: `safetyState=AdvancingInward`,
+`overhang=0.0000`, `collided=1` (the proposed forward motion is rejected
+by `RobotCollision` every single frame, since `AdvancingInward` is driving
+the robot straight into a real desk object - the Monitor, in every
+attempted reproduction), all cliff sensors clear, heading and position
+frozen for 10,000+ consecutive frames. This is structurally the SAME
+class of bug as the one this section just fixed - a local reactive
+maneuver (this time `Safety`'s own recovery behavior, not
+`AutonomousAvoidance`'s) with zero cross-domain awareness of obstacles -
+but fixing it is UNCONDITIONALLY out of scope for this task, whose own
+instructions explicitly forbid changing `TableEdgeSafetyController` logic
+with no exception clause (unlike this same task's more permissive
+treatment of, e.g., `ReturnHomeReason` semantics "unless strictly
+required"). It reproduces at very similar desk coordinates regardless of
+which start position is attempted, since it is tied to the fixed desk
+geometry and dock placement, not to any one starting configuration - it is
+therefore not a flaky/rare edge case but a reliably-reproducible, genuinely
+separate defect, disclosed here in full rather than worked around. A
+follow-up phase giving `TableEdgeSafetyController` its own bounded,
+obstacle-aware recovery search (mirroring the exact bounded-sweep +
+handoff shape this section just built for `ReactiveObstacleAvoidance`) is
+the recommended fix.
+
+### Validation (blocker fix)
+
+751 tests total (737 pre-existing + 8 new `ReactiveObstacleAvoidanceTest`
+cases proving the bounded sweep/`LocalRouteBlocked` signal, in
+`tests/visual/ReactiveObstacleAvoidanceTests.cpp`, plus 6 new
+`HandoffTest` cases proving the forced-replan/blacklist/alternate-route
+handoff contract, in `tests/visual/MapAwareNavigationIntegrationTests.cpp`)
+= 750/751 passing, 0 compiler warnings. The single failing test is
+`FullMapCompletionIntegrationTest::AutonomousExplorationCompletesAndAutoReturnsHome`,
+failing for the independent, out-of-scope `TableEdgeSafetyController`
+reason documented immediately above - not for any `ReactiveObstacleAvoidance`/
+`WaypointNavigator` reason this section's own fix addresses. The Phase
+13X "Known limitations" entry above, describing unbounded `TurnAway`
+rotation, is superseded by this section: that specific defect is fixed;
+the residual limitation is the newly-documented, separate
+`TableEdgeSafetyController` one.

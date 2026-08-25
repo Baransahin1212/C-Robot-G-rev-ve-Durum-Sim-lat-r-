@@ -140,6 +140,10 @@ constexpr Color kExplorationUnknownColor = kHudPanelBackground; // "not yet obse
 constexpr Color kExplorationFreeColor = Color{70, 90, 70, 255};
 constexpr Color kExplorationOccupiedColor = Color{200, 70, 60, 255};
 constexpr Color kExplorationTrailColor = Color{80, 220, 220, 255}; // matches kHomeGuideColor's cyan - "where the robot has been"
+// Phase 13X: distinct from kExplorationTrailColor (cyan, "where the robot
+// HAS been") - amber/orange reads as "intent/plan," never confusable with
+// the travel trail even at this panel's small scale.
+constexpr Color kPlannedRouteColor = Color{240, 170, 40, 255};
 constexpr Color kExplorationBoundaryColor = LIGHTGRAY;
 constexpr Color kExplorationRobotColor = Color{255, 220, 100, 255}; // matches kMissionControlTaskColor
 constexpr Color kExplorationHeadingColor = RED;
@@ -287,7 +291,8 @@ int Renderer3D::measureTextWidth(const char* text, int fontSize) const
 }
 
 void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry,
-                              const ExplorationMap& map, const CoverageTrail& trail)
+                              const ExplorationMap& map, const CoverageTrail& trail,
+                              const std::vector<Vec3>& plannedRoute)
 {
     if (updateCamera)
     {
@@ -303,7 +308,7 @@ void Renderer3D::renderFrame(const VirtualWorld& world, bool updateCamera, const
 
     drawHud(world, telemetry);
     drawMissionControlPanel(telemetry);
-    drawExplorationMapPanel(world, map, trail, telemetry);
+    drawExplorationMapPanel(world, map, trail, telemetry, plannedRoute);
 
     EndDrawing();
 }
@@ -902,7 +907,7 @@ void Renderer3D::drawMissionControlPanel(const VisualTelemetry& telemetry) const
     const HudLine lines[] = {
         {"GÖREV KONTROLÜ", 20, kHudTitleColor},
         {taskLine, 18, kMissionControlTaskColor},
-        {"1  Gezinmeyi Başlat", 16, kHudControlsColor},
+        {"1  Haritalamayı Başlat", 16, kHudControlsColor},
         {"2  Eve Dön", 16, kHudControlsColor},
         {"3  Görevi Durdur", 16, kHudControlsColor},
         {"R  Eve Dön", 16, kHudControlsColor},
@@ -933,7 +938,8 @@ void Renderer3D::drawMissionControlPanel(const VisualTelemetry& telemetry) const
 }
 
 void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const ExplorationMap& map,
-                                          const CoverageTrail& trail, const VisualTelemetry& telemetry) const
+                                          const CoverageTrail& trail, const VisualTelemetry& telemetry,
+                                          const std::vector<Vec3>& plannedRoute) const
 {
     char exploredLine[48];
     std::snprintf(exploredLine, sizeof(exploredLine), "Keşfedilen: %%%d", static_cast<int>(map.exploredPercentage()));
@@ -1040,6 +1046,31 @@ void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const Explor
         const Vector2 from = worldToPanel(trailPoints[i - 1].x, trailPoints[i - 1].z);
         const Vector2 to = worldToPanel(trailPoints[i].x, trailPoints[i].z);
         DrawLineEx(from, to, 2.0F, kExplorationTrailColor);
+    }
+
+    // --- Planned route (Phase 13X): the currently intended route
+    // (GridPathPlanner + simplifyPath, already fully computed by
+    // main3d.cpp - this class performs no A*/planning of its own), drawn
+    // in a visually distinct, restrained style so it never reads as the
+    // travel trail above - trail = where the robot HAS been, planned
+    // route = where it currently INTENDS to go. Drawn on the HARİTA panel
+    // unconditionally (this panel itself is not gated by HudMode), so the
+    // route stays visible regardless of Sade/Ayrıntılı.
+    for (std::size_t i = 1; i < plannedRoute.size(); ++i)
+    {
+        const Vector2 from = worldToPanel(plannedRoute[i - 1].x, plannedRoute[i - 1].z);
+        const Vector2 to = worldToPanel(plannedRoute[i].x, plannedRoute[i].z);
+        DrawLineEx(from, to, 2.0F, kPlannedRouteColor);
+    }
+
+    // --- Frontier target marker (Phase 13X): a small ring around the
+    // current exploration target, only while one is actually held (never
+    // shown during Return Home or once mapping is complete).
+    if (telemetry.frontierTargetVisible)
+    {
+        const Vector2 targetPanel =
+            worldToPanel(telemetry.frontierTargetPosition.x, telemetry.frontierTargetPosition.z);
+        DrawCircleLines(static_cast<int>(targetPanel.x), static_cast<int>(targetPanel.y), 5.0F, kPlannedRouteColor);
     }
 
     // --- Base marker: BasePlatform's own live position - never a

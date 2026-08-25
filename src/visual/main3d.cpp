@@ -1,5 +1,6 @@
 #include <array>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,12 +14,13 @@
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/CoverageTrail.hpp"
 #include "robot/visual/ExecutableDirectory.hpp"
+#include "robot/visual/ExplorationCompletionEventSource.hpp"
 #include "robot/visual/ExplorationMap.hpp"
 #include "robot/visual/ExplorationMapStorage.hpp"
 #include "robot/visual/ExplorationMapper.hpp"
 #include "robot/visual/ForwardClearanceProbe.hpp"
-#include "robot/visual/HomeArrivalEventSource.hpp"
-#include "robot/visual/HomeNavigator.hpp"
+#include "robot/visual/FrontierExplorer.hpp"
+#include "robot/visual/GridPathPlanner.hpp"
 #include "robot/visual/ManualDriveInput.hpp"
 #include "robot/visual/MissionControlEventSource.hpp"
 #include "robot/visual/MissionTask.hpp"
@@ -32,6 +34,9 @@
 #include "robot/visual/VirtualObstacleSensorArray.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
+#include "robot/visual/VisualMath.hpp"
+#include "robot/visual/WaypointArrivalEventSource.hpp"
+#include "robot/visual/WaypointNavigator.hpp"
 
 namespace
 {
@@ -63,6 +68,29 @@ constexpr float kMapSaveIntervalSeconds = 5.0F;
 // is read-only shipped content) signals this is generated data - see
 // .gitignore.
 constexpr const char* kMapStorageRelativePath = "\\runtime\\maps\\exploration_map.json";
+
+// Phase 13X: frontier-selection retry throttle - see the frontier-target-
+// selection block's own docs below for the "not merely waiting for a
+// temporary map update" reasoning this exists for.
+constexpr int kFrontierRetryIntervalFrames = 20;
+constexpr int kRequiredConsecutiveNoTargetAttempts = 5;
+
+// Phase 13X blocker fix: minimum heading change (degrees) the robot must
+// exhibit, since the moment ReactiveObstacleAvoidance last reported
+// localRouteBlockedThisUpdate(), before `triggerAvoidance` is allowed to
+// arm a brand new incident again - see the avoidance-wiring block's own
+// docs below for why this is required (without it, avoidance would
+// re-claim AutonomousAvoidance authority on the very next frame, before
+// Navigation's freshly-replanned command ever gets a chance to actually
+// turn the robot, since obstacleDetected() is a real-time reading that
+// has not yet had a chance to change). Deterministic and physically
+// grounded (tied to genuine rotation the robot has performed, never a
+// frame-count/wall-clock timer) - comparable in spirit to
+// HomeNavigator::kStartDrivingHeadingToleranceDegrees (8.0F), but
+// deliberately larger: this only needs to prove the robot has started
+// executing a MEANINGFULLY different command, not that it has finished
+// aligning to one.
+constexpr float kAvoidanceResumeHeadingChangeDegrees = 30.0F;
 
 } // namespace
 
@@ -154,29 +182,56 @@ int main()
     // sequence with no keyboard involved.)
     robot::visual::MissionControlEventSource missionControl;
 
-    // HomeNavigator is raylib-free navigation logic (Aligning/Driving/
-    // Arrived toward world.basePlatform()); HomeArrivalEventSource
-    // observes ITS OWN Arrived state (edge-triggered) to produce
-    // HomeReached, exactly like HardwareEventSource observes
-    // VirtualRobotHardware's sensors - see HomeNavigator.hpp/
-    // HomeArrivalEventSource.hpp for why neither ever decides FSM
-    // transitions itself.
-    robot::visual::HomeNavigator homeNavigator;
-    robot::visual::HomeArrivalEventSource homeArrivalEventSource(homeNavigator);
+    // Phase 13X: WaypointNavigator is the map-aware waypoint-following
+    // orchestrator that now DRIVES Return Home (and, while Haritalama is
+    // actively seeking a frontier target, exploration navigation too) -
+    // it owns its own internal HomeNavigator for per-waypoint local
+    // steering (HomeNavigator itself is UNCHANGED - still exists, still
+    // does exactly the Aligning/Driving/Arrived job it always has - see
+    // HomeNavigator.hpp), asked each frame to steer toward the CURRENT
+    // waypoint of a GridPathPlanner-produced route rather than blindly
+    // straight at a possibly-obstructed final goal. WaypointArrivalEventSource
+    // observes WaypointNavigator's OWN Arrived state (edge-triggered, once
+    // the FULL route completes) to produce HomeReached, exactly like
+    // HardwareEventSource observes VirtualRobotHardware's sensors - see
+    // WaypointNavigator.hpp/WaypointArrivalEventSource.hpp for why neither
+    // ever decides FSM transitions itself. The old plain HomeNavigator +
+    // HomeArrivalEventSource production wiring is gone from this file
+    // (both classes remain fully compiled/tested elsewhere - see
+    // docs/technical-decisions.md, Phase 13X, and HomeZoneMonitor's own
+    // earlier precedent for a component staying compiled/tested after its
+    // production wiring changes).
+    robot::visual::WaypointNavigator mapNavigator;
+    robot::visual::WaypointArrivalEventSource waypointArrivalEventSource(mapNavigator);
+
+    // Phase 13X: edge-triggered ReturnHomeRequested once autonomous
+    // Haritalama has no reachable frontier left - see
+    // ExplorationCompletionEventSource.hpp for the full semantics
+    // (deliberately reuses ReturnHomeRequested/ReturnHomeReason::
+    // UserRequest, never a new Event/reason - zero RobotStateMachine
+    // changes). `completionSignal.complete` is set below, in the
+    // frontier-selection block, at the same low-frequency cadence
+    // frontier target selection itself runs at - never recomputed by a
+    // dedicated per-frame check.
+    robot::visual::ExplorationCompletionSignal completionSignal;
+    robot::visual::ExplorationCompletionEventSource explorationCompletionEventSource(completionSignal);
 
     // CompositePollingEventSource only combines two sources at a time
-    // (Phase 13J, unmodified), so the three effective sources this phase
-    // needs are still composed via nesting - one level flatter than
-    // Phase 13U's own three-level nest, though, since HomeZoneMonitor is
-    // no longer part of this chain at all (Phase 13V human-validation
-    // fix - see this file's own docs above and
-    // docs/technical-decisions.md for the full removal rationale).
-    // Priority (highest first): explicit Mission Control commands >
-    // hardware obstacle/sensor events > HomeReached arrival. Rationale:
-    // explicit user commands must never be starved by an automatic
-    // event; safety-relevant hardware perception must never be lost
-    // underneath a same-frame HomeReached readiness.
-    robot::CompositePollingEventSource innerHardwareGroup(hardwareEventSource, homeArrivalEventSource);
+    // (Phase 13J, unmodified), so the four effective sources this phase
+    // needs are composed via nesting - the same "nest one level deeper"
+    // extension mechanism this file's own comments have documented since
+    // Phase 13U/13V (HomeZoneMonitor was an earlier occupant of this exact
+    // extension point - see docs/technical-decisions.md). Priority
+    // (highest first): explicit Mission Control commands > hardware
+    // obstacle/sensor events > HomeReached arrival > mapping-complete
+    // auto-return. Rationale: explicit user commands must never be
+    // starved by an automatic event; safety-relevant hardware perception
+    // must never be lost underneath a same-frame HomeReached/completion
+    // readiness; a genuine arrival is reported before a same-frame
+    // completion signal in the rare case both are pending at once.
+    robot::CompositePollingEventSource innerCompletionGroup(waypointArrivalEventSource,
+                                                              explorationCompletionEventSource);
+    robot::CompositePollingEventSource innerHardwareGroup(hardwareEventSource, innerCompletionGroup);
     robot::CompositePollingEventSource compositeSource(missionControl, innerHardwareGroup);
     robot::RobotStateMachine stateMachine;
     robot::RobotController controller(hardware);
@@ -244,6 +299,42 @@ int main()
     robot::visual::ExplorationMap explorationMap(world.tableSurface());
     robot::visual::ExplorationMapper explorationMapper(explorationMap);
     robot::visual::CoverageTrail coverageTrail;
+
+    // Phase 13X: frontier-based autonomous exploration target selection -
+    // raylib-free, reads ONLY explorationMap (see FrontierExplorer.hpp).
+    // `currentFrontierTarget`/`frontierBlacklist` are this file's own
+    // exploration-loop state (mirrors avoidanceEnabled/mapSaveTimer's own
+    // plain-local-variable style below) - never persisted (Phase 13X
+    // brief: "DO NOT persist temporary path/waypoint/frontier
+    // blacklists"), and cleared whenever Haritalama is not the active
+    // task (see the per-frame block below), so a fresh Start Haritalama
+    // always begins target selection clean.
+    robot::visual::FrontierExplorer frontierExplorer(explorationMap);
+    std::optional<robot::visual::FrontierTarget> currentFrontierTarget;
+    std::vector<robot::visual::GridCoord> frontierBlacklist;
+    int framesSinceLastFrontierAttempt = 0;
+    int consecutiveNoTargetFound = 0;
+
+    // Phase 13X: edge-detection state for "avoidance/Safety just
+    // released" (see the map-aware-navigation block below, `forceReplan`)
+    // - a robot displaced from its planned route by a reactive maneuver
+    // must replan from where it actually ended up, never keep chasing an
+    // obsolete waypoint behind it.
+    bool previousAvoidanceActive = false;
+    bool previousSafetyActive = false;
+
+    // Phase 13X blocker fix: deferred-by-one-frame consumption of
+    // avoidance's localRouteBlockedThisUpdate() signal - see the
+    // avoidance-wiring block's own docs below for why the forced replan
+    // it triggers must wait one frame (so this same incident's final
+    // sensor observations have already reached explorationMapper before
+    // GridPathPlanner reads the map), and `avoidanceSuppressedAfterBlock`/
+    // `headingAtLastLocalRouteBlocked` for why `triggerAvoidance` must not
+    // immediately re-arm before Navigation's replanned command gets a
+    // genuine chance to actually turn the robot.
+    bool localRouteBlockedPendingReplan = false;
+    bool avoidanceSuppressedAfterBlock = false;
+    float headingAtLastLocalRouteBlocked = 0.0F;
 
     // Runtime-relative persistence path (never a source-tree path - see
     // ExecutableDirectory.hpp/kMapStorageRelativePath's own docs above).
@@ -442,6 +533,19 @@ int main()
         // detection.
         runtime.step();
 
+        // Phase 13X blocker fix: reads the STICKY flag exactly as left by
+        // the END of the PREVIOUS frame (before this frame's own
+        // avoidance.update() call below can overwrite it for the frame
+        // AFTER this one) - by now, last frame's own
+        // explorationMapper.update() call has already run (it is the
+        // last thing driveFrame()/main3d's loop does each frame), so the
+        // map this value's consumer reads from below is guaranteed to
+        // include the observations gathered right up through the exact
+        // frame the block was reported on. See the avoidance-wiring
+        // block's own docs for the full "map update before replan"
+        // reasoning.
+        const bool consumeLocalRouteBlockedReplan = localRouteBlockedPendingReplan;
+
         // Compute this frame's forward BODY-clearance telemetry (Phase
         // 13R) - independent of, and complementary to, the point-ray
         // sensor below. Read once here so the trigger/release decision
@@ -477,13 +581,74 @@ int main()
         // HardwareEventSource observes the sensor's real true -> false
         // edge naturally, once TurnAway has rotated the sensor ray far
         // enough away from the obstacle.
-        const bool triggerAvoidance = avoidanceEnabled &&
+        //
+        // Phase 13X blocker fix: `avoidanceSuppressedAfterBlock` briefly
+        // withholds re-arming a NEW incident right after
+        // ReactiveObstacleAvoidance itself reported
+        // localRouteBlockedThisUpdate() (see below) - without this,
+        // avoidance would reclaim AutonomousAvoidance authority on the
+        // very next frame (obstacleDetected() is a real-time reading that
+        // has had no chance to change yet, since the robot has not moved
+        // at all the instant after release), before Navigation's freshly-
+        // replanned command ever gets a chance to actually turn the
+        // robot - each individual TurnAway incident would be bounded, but
+        // the AGGREGATE behavior would still be an unbroken sequence of
+        // full-sweep incidents, never resolving. The suppression lifts
+        // the moment EITHER: the robot's heading has genuinely changed by
+        // kAvoidanceResumeHeadingChangeDegrees since the block (by then
+        // Navigation's own Aligning phase has had a real chance to steer
+        // the robot toward a genuinely different heading); OR the most
+        // recent hardware.update() rejected the proposed position due to
+        // collision (hardware.collidedLastUpdate(), read one frame
+        // naturally-lagging, same as every other "last update" telemetry
+        // in this file) - a second, independent deterministic release
+        // condition needed because Navigation's own Driving phase (unlike
+        // Aligning) translates in a straight line without rotating at
+        // all: if the CURRENT waypoint's straight-line direction from
+        // wherever the robot actually ended up happens to clip a
+        // different obstacle than the originally-planned route did (a
+        // real, reproduced scenario - see docs/technical-decisions.md,
+        // Phase 13X blocker fix), heading alone would never change and
+        // the suppression would never lift, even though the robot is
+        // just as genuinely stuck as the original TurnAway incident was.
+        // Both conditions are deterministic and physically grounded -
+        // never a frame-count/wall-clock timer. Safety/Manual/
+        // RobotCollision's own hard guard remain fully active and
+        // unaffected throughout - this only withholds the LOCAL reactive
+        // layer's own re-arming, never any of those.
+        if (avoidanceSuppressedAfterBlock)
+        {
+            const float headingChangeSinceBlock = std::fabs(robot::visual::shortestSignedHeadingErrorDegrees(
+                headingAtLastLocalRouteBlocked, world.robotPose().headingDegrees));
+            if (headingChangeSinceBlock >= kAvoidanceResumeHeadingChangeDegrees || hardware.collidedLastUpdate())
+            {
+                avoidanceSuppressedAfterBlock = false;
+            }
+        }
+
+        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock &&
                                        stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
                                        hardware.obstacleDetected();
         const robot::visual::ObstacleHazardSample avoidanceHazard{
             obstacleRays.frontLeftDistance, obstacleRays.frontCenterDistance, obstacleRays.frontRightDistance};
         avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear, world.robotPose(),
                           avoidanceHazard);
+
+        // Phase 13X blocker fix: capture the block signal immediately
+        // after the update() call that can produce it - `localRouteBlockedPendingReplan`
+        // is consumed one frame later (see the map-aware-navigation
+        // block's own `forceReplan` computation below) so this incident's
+        // final sensor observations have already reached
+        // explorationMapper (which runs at the END of this same frame,
+        // AFTER navigation) before GridPathPlanner ever reads the map for
+        // the forced replan - never solved by adding a second
+        // RobotRuntime::step() call.
+        if (avoidance.localRouteBlockedThisUpdate())
+        {
+            avoidanceSuppressedAfterBlock = true;
+            headingAtLastLocalRouteBlocked = world.robotPose().headingDegrees;
+        }
+        localRouteBlockedPendingReplan = avoidance.localRouteBlockedThisUpdate();
 
         // Compute this frame's cliff-sensor readings and advance the
         // table-edge safety recovery latch (Phase 13S) - runs
@@ -493,41 +658,209 @@ int main()
         const robot::visual::CliffSensorReadings cliffReadings = cliffSensor.readings();
         tableEdgeSafety.update(cliffReadings, world.robotPose(), world.tableSurface());
 
-        // Advance HomeNavigator (Phase 13T) - runs every frame,
-        // unconditionally, enabled exactly when RobotController/the FSM's
-        // current intent is ReturnToBase (VirtualRobotHardware::
-        // currentCommand()), never decided by HomeNavigator itself. This
-        // single condition naturally covers every interruption/resumption
-        // case with no extra bookkeeping: it goes false the moment
-        // WaitingForObstacleClear's stop() runs (HomeNavigator resets to
-        // Inactive), and true again the instant ReturningHome resumes
-        // (HomeNavigator recomputes a fresh target from the new pose) -
-        // while it stays true throughout a Manual/Safety interruption
-        // (RobotController's command tracking is independent of
-        // DriveAuthority override state), so a temporarily-overridden
-        // Return Home request is never cancelled, only outranked. Reads
-        // world.robotPose()/world.basePlatform() directly - HomeNavigator
-        // never duplicates base coordinates of its own. This runs AFTER
-        // runtime.step() above, so a same-frame arrival is naturally
-        // consumed by HardwareEventSource's polling composite on the NEXT
-        // frame - an accepted, deterministic one-frame latency (see
-        // docs/technical-decisions.md, Phase 13T), never worked around by
-        // calling runtime.step() twice.
-        const bool navigationEnabled =
-            hardware.currentCommand() == robot::visual::VirtualDriveCommand::ReturnToBase;
-        const robot::visual::HomeNavigationOutput homeNavigation =
-            homeNavigator.update(world.robotPose(), world.basePlatform(), navigationEnabled);
-
         // Phase 13U: this frame's user-facing task status - derived
         // fresh from RobotStateMachine's own public state, never a second
         // authority over the robot (see MissionTask.hpp). Drives the
-        // Mission Control HUD panel below. Phase 13V human-validation
-        // fix: no longer also drives a HomeZoneMonitor activation
-        // condition - that automatic distance-based trigger was removed
-        // from this executable entirely (see this file's own docs
-        // above).
+        // Mission Control HUD panel below, and (Phase 13X) decides which
+        // goal map-aware navigation is currently working toward.
         const robot::visual::MissionTask missionTask =
             robot::visual::deriveMissionTask(stateMachine.currentState(), stateMachine.returnHomeReason());
+
+        // Phase 13X: frontier target selection - dirty-driven (a fresh
+        // FrontierExplorer::selectTarget() call, itself internally
+        // constructing a fresh GridPathPlanner, only when actually
+        // needed), never re-run every frame (this phase's own brief). A
+        // new target is needed when: Haritalama just became the active
+        // task and none is held yet; the previously-held target's cell no
+        // longer qualifies as a frontier (its region has been explored);
+        // or mapNavigator reports Failed/Arrived for the current target
+        // (Failed -> blacklist it and pick another; Arrived -> this
+        // frontier is reached, seek the next one). Outside Haritalama,
+        // any held target/blacklist is dropped, so a fresh Start
+        // Haritalama session always begins target selection clean (this
+        // phase's own brief on map-reset/new-session semantics).
+        const bool roaming = missionTask == robot::visual::MissionTask::Roam;
+        if (!roaming)
+        {
+            currentFrontierTarget.reset();
+            frontierBlacklist.clear();
+            framesSinceLastFrontierAttempt = 0;
+            consecutiveNoTargetFound = 0;
+        }
+        else
+        {
+            bool needNewTarget = !currentFrontierTarget.has_value();
+            if (currentFrontierTarget.has_value())
+            {
+                int targetCol = -1;
+                int targetRow = -1;
+                const bool stillFree = explorationMap.worldToCell(currentFrontierTarget->worldPosition, targetCol,
+                                                                    targetRow) &&
+                                        explorationMap.cellAt(targetCol, targetRow) == robot::visual::MapCell::Free;
+                if (!stillFree)
+                {
+                    needNewTarget = true;
+                }
+            }
+            if (mapNavigator.state() == robot::visual::WaypointNavigatorState::Failed)
+            {
+                if (currentFrontierTarget.has_value())
+                {
+                    frontierBlacklist.push_back(currentFrontierTarget->cell);
+                }
+                needNewTarget = true;
+            }
+            if (mapNavigator.state() == robot::visual::WaypointNavigatorState::Arrived)
+            {
+                needNewTarget = true;
+            }
+
+            // Phase 13X "not merely waiting for a temporary map update"
+            // debounce: once no target is currently held at all (as
+            // opposed to a fresh Failed/Arrived/stale transition, which
+            // always retries immediately below), further attempts are
+            // throttled to once every kFrontierRetryIntervalFrames -
+            // while no target is held, plain Fsm MoveForward keeps
+            // driving the robot (Navigation authority is not engaged),
+            // so the map keeps growing between attempts. A just-formed
+            // explored blob's border frequently has not yet grown a
+            // cluster past kMinimumFrontierClusterSize on the very first
+            // check - treating that transient state as genuine
+            // completion would send the robot home before it has
+            // explored anywhere near the dock, and Return Home would then
+            // correctly (per this phase's own Unknown-blocked policy)
+            // fail to find a route through the still-Unknown space
+            // between it and the dock, deadlocking. completionSignal is
+            // only ever latched true once kRequiredConsecutiveNoTargetAttempts
+            // consecutive THROTTLED attempts all agree nothing is
+            // reachable.
+            if (needNewTarget && !currentFrontierTarget.has_value() &&
+                framesSinceLastFrontierAttempt < kFrontierRetryIntervalFrames)
+            {
+                needNewTarget = false;
+            }
+
+            if (needNewTarget)
+            {
+                framesSinceLastFrontierAttempt = 0;
+
+                // Phase 13X blocker fix: if NO frontier cell exists
+                // anywhere on the map at all (ExplorationCompletion::
+                // Complete - see FrontierExplorer.hpp), that is an
+                // immediate, non-transient fact - it can never improve by
+                // waiting, since the map cannot change without the robot
+                // moving, and the robot is not moving while no target is
+                // held. Confirmed on the spot, bypassing the
+                // kRequiredConsecutiveNoTargetAttempts debounce below
+                // (which exists ONLY for the different, genuinely
+                // transient ExplorationCompletion::NoReachableFrontier
+                // case - frontier cells exist, but reachability keeps
+                // failing, which CAN legitimately improve as the map
+                // grows). This closes a real, reproduced risk: the
+                // original debounce let the robot drive blindly forward
+                // (plain Fsm MoveForward, zero map awareness) for up to
+                // kFrontierRetryIntervalFrames * kRequiredConsecutiveNoTargetAttempts
+                // frames even when the map was ALREADY fully known (e.g.
+                // a resumed/loaded already-complete map) - see
+                // docs/technical-decisions.md, Phase 13X blocker fix, for
+                // the full reproduced incident this caused. No extra map
+                // scan cost: selectTarget() below would call the exact
+                // same frontierCells() detection internally regardless.
+                if (frontierExplorer.frontierCells().empty())
+                {
+                    currentFrontierTarget.reset();
+                    completionSignal.complete = explorationMap.exploredCellCount() > 0;
+                    consecutiveNoTargetFound = 0;
+                }
+                else
+                {
+                    const robot::visual::FrontierTarget target =
+                        frontierExplorer.selectTarget(world.robotPose().position, frontierBlacklist);
+                    if (target.found)
+                    {
+                        currentFrontierTarget = target;
+                        completionSignal.complete = false;
+                        consecutiveNoTargetFound = 0;
+                    }
+                    else
+                    {
+                        currentFrontierTarget.reset();
+                        ++consecutiveNoTargetFound;
+                        // Never "complete" before any exploration has
+                        // actually happened yet (e.g. the very first frame
+                        // of a fresh Haritalama session, before the
+                        // robot's own footprint has produced a single Free
+                        // cell) - see docs/technical-decisions.md (Phase
+                        // 13X).
+                        completionSignal.complete =
+                            explorationMap.exploredCellCount() > 0 &&
+                            consecutiveNoTargetFound >= kRequiredConsecutiveNoTargetAttempts;
+                    }
+                }
+            }
+            else
+            {
+                ++framesSinceLastFrontierAttempt;
+            }
+        }
+
+        // Phase 13X: map-aware waypoint navigation - now drives BOTH
+        // Return Home (goal = world.basePlatform().position) and, while
+        // Haritalama holds a frontier target, exploration navigation
+        // (goal = the current frontier target). `forceReplan` fires on
+        // the exact frame avoidance or Safety just released, so the
+        // robot replans from wherever it ACTUALLY ended up rather than
+        // continuing to chase a waypoint that may now be behind/beside it
+        // (this phase's own brief, "replanning + avoidance" - the core
+        // fix for the human-observed Return Home spin problem). Runs
+        // AFTER runtime.step() above, so a same-frame arrival is
+        // naturally consumed by the polling composite on the NEXT frame -
+        // the same accepted, deterministic one-frame latency Phase 13T
+        // already established for plain HomeNavigator.
+        // Phase 13X blocker fix: derived from `missionTask` (already
+        // resume-aware via MissionTask::deriveMissionTask()'s own
+        // resumeState_ handling - see MissionTask.hpp), NOT
+        // hardware.currentCommand() (which collapses to Stopped the
+        // moment WaitingForObstacleClear's stop() runs - RobotController
+        // is unchanged and still does exactly that). Without this,
+        // WaypointNavigator itself would be force-disabled for the ENTIRE
+        // WaitingForObstacleClear pause (mirroring
+        // navigationEnabled=false -> reset()), so once
+        // ReactiveObstacleAvoidance suppresses its own re-arming after a
+        // LocalRouteBlocked handoff (see the avoidance-wiring block
+        // above), NOTHING would be left able to drive the robot at
+        // all - Fsm's own Stopped intent is the lowest authority and
+        // Navigation was disabled too, a silent total deadlock (the
+        // robot never moves, the suppression never lifts since heading
+        // never changes, obstacleDetected() never clears since the robot
+        // never moves away - reproduced and confirmed during this
+        // phase's own investigation). This is an orchestration-layer
+        // decision only (which input feeds `navigationEnabled` here in
+        // main3d.cpp) - RobotController/RobotStateMachine/DriveAuthority
+        // ordering are all unchanged; Navigation still only ever outranks
+        // Fsm, exactly as before.
+        const bool returningHome = missionTask == robot::visual::MissionTask::ReturnHome;
+        const bool navigationEnabled = returningHome || (roaming && currentFrontierTarget.has_value());
+        const robot::visual::Vec3 navigationGoal =
+            returningHome ? world.basePlatform().position
+                          : (currentFrontierTarget.has_value() ? currentFrontierTarget->worldPosition
+                                                                 : robot::visual::Vec3{});
+        // Phase 13X blocker fix: `consumeLocalRouteBlockedReplan` (captured
+        // at the TOP of this frame, before this frame's own avoidance
+        // update could overwrite the pending flag - see that capture's
+        // own docs) is the deferred, map-fresh trigger for the
+        // ReactiveObstacleAvoidance handoff: "Navigation stops using the
+        // stale route... WaypointNavigator forces GLOBAL replanning from
+        // CURRENT pose." If the replanned route is STILL unreachable,
+        // WaypointNavigator reports Failed, which the frontier-selection
+        // block above already blacklists on (see its own `needNewTarget`
+        // Failed-state handling) - never a second, duplicate blacklist
+        // mechanism here.
+        const bool forceReplan = consumeLocalRouteBlockedReplan ||
+                                  (previousAvoidanceActive && !avoidance.active()) ||
+                                  (previousSafetyActive && !tableEdgeSafety.active());
+        const robot::visual::WaypointNavigatorOutput navOutput =
+            mapNavigator.update(world.robotPose(), explorationMap, navigationGoal, navigationEnabled, forceReplan);
 
         // Apply drive authority (Safety > Manual > AutonomousAvoidance >
         // Navigation > Fsm - see VirtualRobotHardware::driveAuthority()).
@@ -565,27 +898,31 @@ int main()
             hardware.clearAutonomousWheelOverride();
         }
 
-        // The navigation override is kept in sync with HomeNavigator
+        // The navigation override is kept in sync with WaypointNavigator
         // unconditionally, even while manual/autonomous/safety currently
         // wins physically - exactly the same always-latched-underneath
         // pattern the safety/autonomous overrides above already use, so
-        // Return Home resumes automatically the instant a higher
-        // authority releases, with no need to be re-triggered. Only set
-        // while Aligning/Driving: Arrived/Inactive need no override,
-        // since currentCommand() == ReturnToBase's own FSM-mapped wheel
-        // speeds are already zero (see
-        // VirtualRobotHardware::wheelSpeedsForCommand()) - avoiding
-        // unnecessary override churn for an identical physical result.
-        const bool navigationDriving = homeNavigation.state == robot::visual::HomeNavigationState::Aligning ||
-                                        homeNavigation.state == robot::visual::HomeNavigationState::Driving;
+        // navigation resumes automatically the instant a higher authority
+        // releases, with no need to be re-triggered. Only set while
+        // Following: Arrived/Inactive/Failed need no override (Failed
+        // reports zero wheel speeds itself; the FSM-mapped speeds for
+        // ReturnToBase are already zero, and plain Fsm MoveForward simply
+        // takes back over for Roam once no frontier target is held).
+        const bool navigationDriving = navOutput.state == robot::visual::WaypointNavigatorState::Following;
         if (navigationDriving)
         {
-            hardware.setNavigationWheelSpeeds(homeNavigation.wheelSpeeds.left, homeNavigation.wheelSpeeds.right);
+            hardware.setNavigationWheelSpeeds(navOutput.wheelSpeeds.left, navOutput.wheelSpeeds.right);
         }
         else if (hardware.navigationOverrideActive())
         {
             hardware.clearNavigationWheelOverride();
         }
+
+        // Edge-detection anchors for next frame's forceReplan check (see
+        // above) - updated last, after both avoidance/safety have already
+        // been read for every decision this frame.
+        previousAvoidanceActive = avoidance.active();
+        previousSafetyActive = tableEdgeSafety.active();
 
         if (manualDriveMode)
         {
@@ -725,14 +1062,42 @@ int main()
         telemetry.obstacleHazard = hardware.obstacleDetected();
         telemetry.hudMode = hudMode;
 
-        // Phase 13T: already-computed HomeNavigator telemetry - Renderer3D
-        // never has any notion of the Aligning/Driving/Arrived policy
-        // itself.
-        telemetry.homeNavigationStateText = robot::visual::turkishText(homeNavigation.state);
-        telemetry.homeNavigationDistance = homeNavigation.distanceToHome;
-        telemetry.homeNavigationTargetHeadingDegrees = homeNavigation.targetHeadingDegrees;
-        telemetry.homeNavigationHeadingErrorDegrees = homeNavigation.headingErrorDegrees;
-        telemetry.homeNavigationGuideVisible = navigationDriving;
+        // Phase 13X: already-computed WaypointNavigator telemetry -
+        // Renderer3D never has any notion of the Inactive/Following/
+        // Arrived/Failed policy itself. The guide line (a straight visual
+        // aid toward world.basePlatform()) is only meaningful while
+        // actually returning home - during frontier exploration the
+        // planned-route polyline (passed to renderFrame() below) is the
+        // correct visualization instead, never this straight-line guide.
+        telemetry.homeNavigationStateText = robot::visual::turkishText(navOutput.state);
+        telemetry.homeNavigationGuideVisible = returningHome && navigationDriving;
+        if (navOutput.currentWaypointIndex < navOutput.route.size())
+        {
+            const robot::visual::Vec3& currentWaypoint = navOutput.route[navOutput.currentWaypointIndex];
+            const robot::visual::Vec3& robotPosition = world.robotPose().position;
+            const float dx = currentWaypoint.x - robotPosition.x;
+            const float dz = currentWaypoint.z - robotPosition.z;
+            telemetry.homeNavigationDistance = std::sqrt((dx * dx) + (dz * dz));
+            telemetry.homeNavigationTargetHeadingDegrees =
+                robot::visual::normalizeHeadingDegrees(robot::visual::headingDegreesFromDirection(dx, dz));
+            telemetry.homeNavigationHeadingErrorDegrees = robot::visual::shortestSignedHeadingErrorDegrees(
+                world.robotPose().headingDegrees, telemetry.homeNavigationTargetHeadingDegrees);
+        }
+        else
+        {
+            telemetry.homeNavigationDistance = 0.0F;
+            telemetry.homeNavigationTargetHeadingDegrees = 0.0F;
+            telemetry.homeNavigationHeadingErrorDegrees = 0.0F;
+        }
+
+        // Phase 13X: the current frontier exploration target (if any) -
+        // drawn as a small marker on the HARİTA panel; never visible
+        // during Return Home or once no target is held.
+        telemetry.frontierTargetVisible = roaming && currentFrontierTarget.has_value();
+        if (telemetry.frontierTargetVisible)
+        {
+            telemetry.frontierTargetPosition = currentFrontierTarget->worldPosition;
+        }
 
         // Phase 13U: Mission Control panel telemetry - main3d computes
         // task status and base distance directly (the same simple
@@ -762,7 +1127,7 @@ int main()
         // see the manualDriveMode comment above. cameraCaptured still
         // governs cursor capture/release via TAB independently of this.
         const bool updateCamera = cameraCaptured && !manualDriveMode;
-        renderer.renderFrame(world, updateCamera, telemetry, explorationMap, coverageTrail);
+        renderer.renderFrame(world, updateCamera, telemetry, explorationMap, coverageTrail, navOutput.route);
     }
 
     // Phase 13V: one final unconditional save on clean shutdown (this

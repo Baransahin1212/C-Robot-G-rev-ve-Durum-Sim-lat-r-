@@ -1235,6 +1235,79 @@ simulation, no approach-point controller, no docking-specific sensor
 handling: Return Home still simply drives to `BasePlatform.position`
 exactly as before, now visualized as a dock instead of a flat platform.
 
+### Map-Aware Navigation & Autonomous Exploration (Phase 13X)
+
+Pressing `1` now starts **Haritalama** (mapping), not aimless wandering:
+the robot actively seeks unexplored, reachable regions of the desk using
+its own `ExplorationMap` as a planning input, rather than driving straight
+ahead and reactively bouncing off whatever it happens to run into.
+Pressing `2`/`R` still means Return Home, but the route there is now
+**map-aware**: it plans a collision-safe path around known obstacles
+first, instead of aiming straight at the dock and relying on reactive
+avoidance alone (the source of a human-observed defect where the robot
+could spin in place indefinitely near a known obstacle - see
+`docs/technical-decisions.md`, Phase 13X, for the full root-cause and
+fix).
+
+This is **occupancy-grid path planning and frontier-based exploration -
+explicitly not SLAM**. The simulator still uses `VirtualWorld`'s
+authoritative `RobotPose` throughout; there is no scan matching, loop
+closure, or particle localization anywhere in this codebase.
+
+- **`GridPathPlanner`** (`include/robot/visual/GridPathPlanner.hpp`) - a
+  deterministic A* planner over `ExplorationMap`'s occupancy grid.
+  8-connected, corner-cutting prevented, Unknown cells never traversable,
+  and every candidate cell must sit at least
+  `RobotCollision::kRobotCollisionRadius + kPlanningSafetyMargin` away
+  from both Occupied cells and the table edge. Produces a line-of-sight-
+  simplified waypoint route, never the raw cell-by-cell path.
+- **`FrontierExplorer`** (`include/robot/visual/FrontierExplorer.hpp`) -
+  detects Free cells bordering Unknown space ("frontiers"), groups them
+  into clusters, and scores reachable clusters by path cost (via
+  `GridPathPlanner`) minus a small information-gain bonus for cluster
+  size - never merely the closest Euclidean frontier.
+- **`WaypointNavigator`** (`include/robot/visual/WaypointNavigator.hpp`) -
+  the orchestrator that now drives both Return Home and exploration
+  navigation: it owns the existing `HomeNavigator` for per-waypoint local
+  steering (unchanged, never deleted) and decides *when* to (re)plan a
+  route - on a fresh start, when the map reveals the current route is now
+  blocked, after a reactive avoidance/Safety displacement, or when a
+  `NavigationProgressTracker` (deterministic accumulated-rotation-vs-
+  displacement check) detects the robot is making no progress.
+- **`ExplorationCompletionEventSource`** - once no reachable frontier
+  remains, emits a single `ReturnHomeRequested` (reusing the existing
+  user-request semantics - arriving lands the robot back in the reusable
+  `Ready` state, exactly like pressing `2`/`R` would).
+
+The Ayrıntılı/HARİTA panel now also draws the currently planned route (a
+distinct color from the travel trail) and a small marker at the active
+frontier target.
+
+**Bounded local avoidance + map-aware replan handoff (Phase 13X blocker
+fix):** `ReactiveObstacleAvoidance`'s `TurnAway` phase now gives up after
+one full rotation (`kMaximumTurnAwaySweepDegrees`, mathematically the
+complete search of its own one rotational degree of freedom) if it never
+finds a clear heading, instead of spinning indefinitely. That signal
+(`LocalRouteBlocked`) forces `WaypointNavigator` to replan globally from
+the robot's current pose and current map - Return Home finds an alternate
+route or waits for the map to grow; exploration blacklists the
+unreachable frontier and picks a different, reachable one. See
+`docs/technical-decisions.md`'s "Phase 13X blocker fix" section for the
+full reproduction, design, and rationale (including why random
+turns/reverses/a resume-through-obstacle timeout were all rejected - this
+fix is fully deterministic and never bypasses collision/table-edge
+protection).
+
+**Known limitation (separate, still open):** `TableEdgeSafetyController`'s
+`AdvancingInward` recovery state can drive the robot straight into a real
+desk obstacle once its footprint is back on the table
+(`aggregateTableOverhang() <= 0`), since it currently has no awareness of
+obstacles at all - structurally the same class of issue the fix above
+resolved for reactive avoidance, but in `Safety`'s own recovery logic,
+which is unconditionally out of scope for this task to change. See
+`docs/technical-decisions.md`'s "Phase 13X blocker fix" section for the
+full root-cause and recommended follow-up.
+
 ## The six final scenarios
 
 All under [`scenarios/`](scenarios/):
@@ -1487,16 +1560,30 @@ boundaries of what this project set out to build, not delivery blockers or
 undiscovered defects. Each is discussed in full (root cause, geometry, and
 rationale) in [`docs/technical-decisions.md`](docs/technical-decisions.md).
 
-- **Reactive navigation only — not global path planning.** Both obstacle
-  avoidance and Return Home navigation are purely reactive ("turn away,
-  physically advance clear, then steer straight at the target") — there is
-  no A*, Dijkstra, SLAM/mapping, occupancy grid, or waypoint graph
-  anywhere in this project. `ReactiveObstacleAvoidance` handles a single
-  local obstacle on the direct line to base (turn away → physically
-  advance past it → resume navigation from the new pose — see
-  `docs/technical-decisions.md`'s Phase 13V human-validation fix), but a
-  genuine cul-de-sac of two or more obstacles, where every bypass
-  direction re-encounters another obstacle, is not guaranteed to resolve.
+- **Reactive local avoidance now has a guaranteed bound, and a
+  map-aware handoff (Phase 13X blocker fix).** Return Home and autonomous
+  exploration are both map-aware — `GridPathPlanner`'s A* plans a
+  collision-safe global route over the real `ExplorationMap`, never
+  blindly straight at a target (see the "Map-Aware Navigation &
+  Autonomous Exploration" section above). `ReactiveObstacleAvoidance`
+  remains the LOCAL reactive layer underneath that global route (turn
+  away → physically advance clear → resume the plan from the new pose),
+  handling newly-sensed obstacles the map does not yet know about; its
+  `TurnAway` phase now gives up after one full rotation
+  (`kMaximumTurnAwaySweepDegrees`) if no clear heading is ever found,
+  forcing `WaypointNavigator` to replan globally (Return Home finds an
+  alternate route or waits for the map to grow; exploration blacklists
+  the unreachable frontier and picks another) rather than spinning
+  indefinitely. See `docs/technical-decisions.md`'s "Phase 13X blocker
+  fix" section for the full design.
+- **`TableEdgeSafetyController`'s `AdvancingInward` recovery has no
+  obstacle awareness (separate, still open).** Once the robot's footprint
+  is fully back on the table, `AdvancingInward` can command forward motion
+  directly into a real desk obstacle with no fallback — structurally the
+  same class of issue the bounded-avoidance fix above resolved, but in
+  `Safety`'s own recovery logic, which was unconditionally out of scope to
+  change in that fix. See `docs/technical-decisions.md`'s "Phase 13X
+  blocker fix" section for the full root cause and recommended follow-up.
 - **Table-edge corner case.** If a front and a rear cliff sensor both
   detect an edge at the same instant (a robot straddling two edges near a
   table corner), `TableEdgeSafetyController`'s recovery choice

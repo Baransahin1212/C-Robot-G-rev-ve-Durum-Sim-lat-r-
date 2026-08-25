@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #include "raylib.h"
 
@@ -270,6 +271,16 @@ struct VisualTelemetry
     // phase's own brief ("Durum" reflects how the SESSION started, not
     // whether the map is read-only afterward - it never is).
     bool mapWasLoaded = false;
+
+    // Phase 13X: the current frontier exploration target, if Haritalama
+    // currently holds one - already-computed by main3d.cpp's
+    // FrontierExplorer::selectTarget() (Renderer3D never selects a
+    // target, or performs any frontier/A* computation of its own). Drawn
+    // as a small marker on the HARİTA panel; frontierTargetVisible false
+    // while Return Home is active, no target is currently held, or
+    // exploration is complete.
+    Vec3 frontierTargetPosition;
+    bool frontierTargetVisible = false;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,
@@ -320,9 +331,15 @@ public:
     // into VisualTelemetry (see ExplorationMap.hpp/CoverageTrail.hpp's
     // own docs and this class's docs above for why that is
     // architecturally fine for read-only data containers like these,
-    // exactly like VirtualWorld itself).
+    // exactly like VirtualWorld itself). `plannedRoute` (Phase 13X) is
+    // the current map-aware navigation route (Return Home or frontier
+    // exploration - main3d.cpp decides which; Renderer3D has no notion of
+    // either) - already fully computed (GridPathPlanner + simplifyPath)
+    // by the caller, same by-const-reference pattern, never recomputed or
+    // planned here (see GridPathPlanner.hpp's own docs: Renderer receives
+    // path data, it never performs A*).
     void renderFrame(const VirtualWorld& world, bool updateCamera, const VisualTelemetry& telemetry,
-                      const ExplorationMap& map, const CoverageTrail& trail);
+                      const ExplorationMap& map, const CoverageTrail& trail, const std::vector<Vec3>& plannedRoute);
 
 private:
     void drawScene(const VirtualWorld& world, const VisualTelemetry& telemetry) const;
@@ -370,8 +387,15 @@ private:
     // learns anything. `world` is read only for robotPose()/
     // basePlatform() - the robot/base markers' own live positions, never
     // obstacle ground truth.
+    // `plannedRoute` (Phase 13X) is drawn as a visually distinct polyline
+    // over the same panel, in a restrained style that never hides
+    // CoverageTrail (`trail` = where the robot HAS been; `plannedRoute` =
+    // where it currently INTENDS to go - two different concepts, see
+    // GridPathPlanner.hpp's own docs). `telemetry.frontierTargetVisible`/
+    // `frontierTargetPosition` draw a small target marker for an active
+    // exploration goal.
     void drawExplorationMapPanel(const VirtualWorld& world, const ExplorationMap& map, const CoverageTrail& trail,
-                                  const VisualTelemetry& telemetry) const;
+                                  const VisualTelemetry& telemetry, const std::vector<Vec3>& plannedRoute) const;
 
     // Phase 13U: the compact Mission Control panel (task status, 1/2/3/R
     // key hints, Home Zone status) - deliberately separate from drawHud()'s

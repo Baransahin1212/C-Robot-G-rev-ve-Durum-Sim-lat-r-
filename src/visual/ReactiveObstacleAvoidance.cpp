@@ -2,6 +2,8 @@
 
 #include <cmath>
 
+#include "robot/visual/VisualMath.hpp"
+
 namespace robot::visual
 {
 
@@ -56,9 +58,15 @@ float ReactiveObstacleAvoidance::chooseTurnSign(const ObstacleHazardSample& haza
 void ReactiveObstacleAvoidance::update(bool enabled, bool triggerAvoidance, bool forwardCorridorClear,
                                         const RobotPose& pose, const ObstacleHazardSample& hazard) noexcept
 {
+    // Edge signal, reset every call - see localRouteBlockedThisUpdate()'s
+    // own docs: true only for the exact call that produces it below.
+    localRouteBlockedThisUpdate_ = false;
+
     if (!enabled)
     {
         state_ = AvoidanceState::Inactive;
+        accumulatedTurnAwayRotationDegrees_ = 0.0F;
+        turnAwayHeadingSeeded_ = false;
         return;
     }
 
@@ -68,16 +76,56 @@ void ReactiveObstacleAvoidance::update(bool enabled, bool triggerAvoidance, bool
         {
             state_ = AvoidanceState::TurnAway;
             latchedTurnSign_ = chooseTurnSign(hazard);
+            // New incident - see kMaximumTurnAwaySweepDegrees's own docs
+            // on why this never carries over from a prior, already-
+            // released incident.
+            accumulatedTurnAwayRotationDegrees_ = 0.0F;
+            turnAwayHeadingSeeded_ = false;
         }
         return;
     }
 
     if (state_ == AvoidanceState::TurnAway)
     {
+        // Rotation bookkeeping runs BEFORE either release check below, so
+        // the frame that resolves the incident (clear corridor found, or
+        // sweep exhausted) still has its own rotation counted - the
+        // accumulator's meaning ("total rotation performed while TurnAway
+        // was active this incident") stays accurate regardless of which
+        // condition ends up resolving this exact call. Never reset on
+        // re-entry from AdvanceClear (see kMaximumTurnAwaySweepDegrees's
+        // own docs - this is still the SAME incident) - only reseeded
+        // (turnAwayHeadingSeeded_ = false) so the first frame back does
+        // not count whatever heading delta looks like across the
+        // AdvanceClear interlude (AdvanceClear does not rotate at all, so
+        // this reseed is a zero-cost safety measure, not a real gap).
+        if (turnAwayHeadingSeeded_)
+        {
+            accumulatedTurnAwayRotationDegrees_ +=
+                std::fabs(shortestSignedHeadingErrorDegrees(turnAwayPreviousHeadingDegrees_, pose.headingDegrees));
+        }
+        turnAwayPreviousHeadingDegrees_ = pose.headingDegrees;
+        turnAwayHeadingSeeded_ = true;
+
         if (forwardCorridorClear)
         {
             state_ = AvoidanceState::AdvanceClear;
             advanceStartPosition_ = pose.position;
+            return;
+        }
+
+        if (accumulatedTurnAwayRotationDegrees_ >= kMaximumTurnAwaySweepDegrees)
+        {
+            // Phase 13X blocker fix: a full rotation found no clear
+            // heading - this is provably a GLOBAL routing problem (see
+            // this class's own top-level docs), not something further
+            // local rotation could ever resolve. Release immediately
+            // (never keep occupying AutonomousAvoidance authority) and
+            // signal the caller to hand off to global replanning.
+            state_ = AvoidanceState::Inactive;
+            accumulatedTurnAwayRotationDegrees_ = 0.0F;
+            turnAwayHeadingSeeded_ = false;
+            localRouteBlockedThisUpdate_ = true;
         }
         return;
     }
@@ -86,6 +134,7 @@ void ReactiveObstacleAvoidance::update(bool enabled, bool triggerAvoidance, bool
     if (!forwardCorridorClear)
     {
         state_ = AvoidanceState::TurnAway;
+        turnAwayHeadingSeeded_ = false;
         return;
     }
 
@@ -93,12 +142,19 @@ void ReactiveObstacleAvoidance::update(bool enabled, bool triggerAvoidance, bool
     if (travelled >= kMinimumBypassDistanceWorldUnits)
     {
         state_ = AvoidanceState::Inactive;
+        accumulatedTurnAwayRotationDegrees_ = 0.0F;
+        turnAwayHeadingSeeded_ = false;
     }
 }
 
 bool ReactiveObstacleAvoidance::active() const noexcept
 {
     return state_ != AvoidanceState::Inactive;
+}
+
+bool ReactiveObstacleAvoidance::localRouteBlockedThisUpdate() const noexcept
+{
+    return localRouteBlockedThisUpdate_;
 }
 
 AvoidanceState ReactiveObstacleAvoidance::state() const noexcept

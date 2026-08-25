@@ -9,6 +9,7 @@
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/VirtualRobotHardware.hpp"
+#include "robot/visual/WaypointNavigator.hpp"
 
 // Final UI/HUD polish (presentation-only): Turkish display-string mapping
 // for RobotSimulator3D's HUD/Mission Control panel. Every function here is
@@ -118,6 +119,24 @@ constexpr std::string_view turkishText(HomeNavigationState value) noexcept
         case HomeNavigationState::Aligning: return "Yöneliyor";
         case HomeNavigationState::Driving: return "Eve Gidiyor";
         case HomeNavigationState::Arrived: return "Eve Ulaştı";
+    }
+    return "Bilinmiyor";
+}
+
+// Phase 13X: map-aware waypoint-following - the same production/planning
+// state now behind BOTH Return Home and frontier exploration navigation.
+// "Rota İzleniyor" (following the route) is deliberately generic enough to
+// read correctly for either - main3d.cpp's own Mission Control panel text
+// (missionTaskText, MissionTask.hpp's own turkishText()) already
+// disambiguates "Haritalama"/"Keşif" vs. "Eve Dönüş" for the user.
+constexpr std::string_view turkishText(WaypointNavigatorState value) noexcept
+{
+    switch (value)
+    {
+        case WaypointNavigatorState::Inactive: return "Kapalı";
+        case WaypointNavigatorState::Following: return "Rota İzleniyor";
+        case WaypointNavigatorState::Arrived: return "Ulaşıldı";
+        case WaypointNavigatorState::Failed: return "Rota Bulunamadı";
     }
     return "Bilinmiyor";
 }

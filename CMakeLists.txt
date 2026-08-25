@@ -425,11 +425,19 @@ target_link_libraries(robot_visual_world PUBLIC
 # 13V brief, "Mapping never commands the robot"). Declared before
 # robot_visual since robot_visual links it PUBLIC (renderFrame() takes an
 # ExplorationMap/CoverageTrail by const reference - see below).
+# Phase 13X: GridPathPlanner (A* global route planning) and FrontierExplorer
+# (frontier-based exploration target selection) join this library rather
+# than robot_visual_simulation - both read ONLY ExplorationMap (never
+# VirtualWorld::obstacles()/DeskObjectType), preserving the exact same
+# perception boundary ExplorationMapper already established for this
+# library. See GridPathPlanner.hpp/FrontierExplorer.hpp's own docs.
 add_library(robot_exploration STATIC
     src/visual/ExplorationMap.cpp
     src/visual/ExplorationMapper.cpp
     src/visual/CoverageTrail.cpp
     src/visual/ExplorationMapStorage.cpp
+    src/visual/GridPathPlanner.cpp
+    src/visual/FrontierExplorer.cpp
 )
 
 target_link_libraries(robot_exploration
@@ -515,6 +523,16 @@ target_link_libraries(robot_visual PUBLIC
 # Arrived toward VirtualWorld's BasePlatform, reusing VisualMath's existing
 # heading utilities; it has no FSM/Event/IRobotHardware knowledge of its
 # own, driven purely by the `enabled` argument main3d.cpp supplies.
+# Phase 13X: NavigationProgressTracker (anti-360-spin/stuck detection),
+# WaypointNavigator (map-aware waypoint-following orchestrator sitting
+# above HomeNavigator - never replacing it), WaypointArrivalEventSource
+# (the map-aware counterpart to HomeArrivalEventSource), and
+# ExplorationCompletionEventSource (edge-triggered ReturnHomeRequested once
+# autonomous mapping has no reachable frontier left) join this library.
+# WaypointNavigator constructs a GridPathPlanner (robot_exploration) fresh
+# per replan - hence the new robot_exploration link below - but never reads
+# VirtualWorld::obstacles()/DeskObjectType itself, exactly like
+# HomeNavigator.
 add_library(robot_visual_simulation STATIC
     src/visual/VirtualRobotHardware.cpp
     src/visual/VirtualDistanceSensor.cpp
@@ -530,6 +548,10 @@ add_library(robot_visual_simulation STATIC
     src/visual/HomeArrivalEventSource.cpp
     src/visual/MissionControlEventSource.cpp
     src/visual/HomeZoneMonitor.cpp
+    src/visual/NavigationProgressTracker.cpp
+    src/visual/WaypointNavigator.cpp
+    src/visual/WaypointArrivalEventSource.cpp
+    src/visual/ExplorationCompletionEventSource.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -538,6 +560,7 @@ target_link_libraries(robot_visual_simulation PUBLIC
     robot_controller
     robot_runtime
     robot_domain
+    robot_exploration
 )
 
 # --- RobotSimulator3D: the interactive 3D visual simulator executable ---
@@ -1285,6 +1308,78 @@ target_link_libraries(ExplorationIntegrationTests PRIVATE
 
 gtest_discover_tests(ExplorationIntegrationTests)
 
+# --- GridPathPlannerTests: Phase 13X - deterministic A* grid path planning
+# (connectivity, clearance inflation, table-edge margin, goal snapping,
+# determinism) plus line-of-sight path simplification. Links only
+# robot_exploration - never robot_visual_simulation/robot_visual/raylib -
+# genuinely headless, no window is ever created by this target.
+add_executable(GridPathPlannerTests
+    tests/visual/GridPathPlannerTests.cpp
+)
+
+target_link_libraries(GridPathPlannerTests PRIVATE
+    robot_exploration
+    GTest::gtest_main
+)
+
+gtest_discover_tests(GridPathPlannerTests)
+
+# --- FrontierExplorerTests: Phase 13X - frontier cell detection, cluster
+# grouping/noise filtering, reachable-target selection/scoring, and
+# completion semantics. Links only robot_exploration - never
+# robot_visual_simulation/robot_visual/raylib - genuinely headless.
+add_executable(FrontierExplorerTests
+    tests/visual/FrontierExplorerTests.cpp
+)
+
+target_link_libraries(FrontierExplorerTests PRIVATE
+    robot_exploration
+    GTest::gtest_main
+)
+
+gtest_discover_tests(FrontierExplorerTests)
+
+# --- WaypointNavigatorTests: Phase 13X - map-aware waypoint-following
+# orchestration (replanning conditions, waypoint advancement, arrival,
+# Failed-state handling) plus NavigationProgressTracker's own stuck/
+# progress detection in isolation. Links robot_visual_simulation (which
+# transitively provides robot_exploration for ExplorationMap/GridPathPlanner)
+# - never robot_visual/raylib - genuinely headless.
+add_executable(WaypointNavigatorTests
+    tests/visual/WaypointNavigatorTests.cpp
+)
+
+target_link_libraries(WaypointNavigatorTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(WaypointNavigatorTests)
+
+# --- MapAwareNavigationIntegrationTests: Phase 13X - closed-loop tests
+# through the real production stack (mirrors ExplorationIntegrationTests.cpp's
+# own ExplorationHarness, extended with WaypointNavigator/FrontierExplorer/
+# GridPathPlanner/ExplorationCompletionEventSource): map-aware Return Home
+# regressions (routes around known desk objects, replans after avoidance/
+# Safety displacement, the anti-360-spin regression), autonomous frontier
+# exploration over the real production desk, full-map completion with
+# automatic Return Home, and coverage/completion semantics.
+add_executable(MapAwareNavigationIntegrationTests
+    tests/visual/MapAwareNavigationIntegrationTests.cpp
+)
+
+target_link_libraries(MapAwareNavigationIntegrationTests PRIVATE
+    robot_visual_simulation
+    robot_exploration
+    robot_controller
+    robot_core
+    robot_hardware_events
+    robot_polling_composite
+    GTest::gtest_main
+)
+
+gtest_discover_tests(MapAwareNavigationIntegrationTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -1311,6 +1406,8 @@ if (MSVC)
         HomeZoneMonitorTests MissionControlIntegrationTests
         ExplorationMapTests ExplorationMapperTests CoverageTrailTests
         ExplorationMapStorageTests ExplorationIntegrationTests
+        GridPathPlannerTests FrontierExplorerTests WaypointNavigatorTests
+        MapAwareNavigationIntegrationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

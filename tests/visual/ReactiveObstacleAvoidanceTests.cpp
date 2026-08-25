@@ -1,4 +1,6 @@
 #include <cmath>
+#include <cstddef>
+#include <iterator>
 
 #include <gtest/gtest.h>
 
@@ -415,4 +417,202 @@ TEST(ReactiveObstacleAvoidanceTest, ReEnableDoesNotActivateWithoutTrigger)
 
     // Assert
     EXPECT_FALSE(avoidance.active());
+}
+
+// --- Phase 13X blocker fix: bounded TurnAway sweep / LocalRouteBlocked ---
+//
+// TurnAway rotates in one latched direction; accumulated ABSOLUTE heading
+// rotation for the current incident is the sum of |headingDelta| across
+// consecutive update() calls (the very first call after entering TurnAway
+// only SEEDS the previous heading, per the class' own docs, so it never
+// contributes a delta itself). Driving heading in fixed 90-degree steps
+// therefore reaches exactly kMaximumTurnAwaySweepDegrees (360) after four
+// 90-degree deltas - a clean, exact way to land precisely on the sweep
+// limit without depending on any wall-clock or frame-count notion.
+namespace
+{
+RobotPose poseAtHeading(float headingDegrees) noexcept
+{
+    RobotPose pose{};
+    pose.headingDegrees = headingDegrees;
+    return pose;
+}
+} // namespace
+
+// 19: TurnAwayFindsClearDirectionBeforeSweepLimit
+TEST(ReactiveObstacleAvoidanceTest, TurnAwayFindsClearDirectionBeforeSweepLimit)
+{
+    // Arrange
+    ReactiveObstacleAvoidance avoidance;
+    avoidance.update(true, /*triggerAvoidance=*/true, /*forwardCorridorClear=*/false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(0.0F), kNoHazard);   // seed
+    avoidance.update(true, false, false, poseAtHeading(90.0F), kNoHazard); // 90 accumulated
+
+    // Act: corridor clears well before the 360-degree sweep limit.
+    avoidance.update(true, false, /*forwardCorridorClear=*/true, poseAtHeading(180.0F), kNoHazard);
+
+    // Assert
+    EXPECT_EQ(avoidance.state(), AvoidanceState::AdvanceClear);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+}
+
+// 20: TurnAwayCannotRotateForever
+TEST(ReactiveObstacleAvoidanceTest, TurnAwayCannotRotateForever)
+{
+    // Arrange: a hazard that never clears at any sampled heading.
+    ReactiveObstacleAvoidance avoidance;
+    avoidance.update(true, true, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(0.0F), kNoHazard);    // seed, 0
+    avoidance.update(true, false, false, poseAtHeading(90.0F), kNoHazard);   // 90
+    avoidance.update(true, false, false, poseAtHeading(180.0F), kNoHazard); // 180
+    avoidance.update(true, false, false, poseAtHeading(270.0F), kNoHazard); // 270
+
+    // Act: the fourth 90-degree step reaches exactly the 360-degree bound.
+    avoidance.update(true, false, false, poseAtHeading(360.0F), kNoHazard);
+
+    // Assert: released, never left spinning indefinitely.
+    EXPECT_EQ(avoidance.state(), AvoidanceState::Inactive);
+    EXPECT_FALSE(avoidance.active());
+}
+
+// 21: FullSweepWithoutClearanceReportsLocalRouteBlocked
+TEST(ReactiveObstacleAvoidanceTest, FullSweepWithoutClearanceReportsLocalRouteBlocked)
+{
+    // Arrange
+    ReactiveObstacleAvoidance avoidance;
+    avoidance.update(true, true, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(90.0F), kNoHazard);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+    avoidance.update(true, false, false, poseAtHeading(180.0F), kNoHazard);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+    avoidance.update(true, false, false, poseAtHeading(270.0F), kNoHazard);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+
+    // Act: exactly the call that exhausts the sweep.
+    avoidance.update(true, false, false, poseAtHeading(360.0F), kNoHazard);
+
+    // Assert: true for precisely this one call - a one-frame edge signal.
+    EXPECT_TRUE(avoidance.localRouteBlockedThisUpdate());
+
+    // Assert: the very next call (even if still blocked) does not repeat it,
+    // since the incident already released and a fresh one has not begun.
+    avoidance.update(true, false, false, poseAtHeading(360.0F), kNoHazard);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+}
+
+// 22: LocalRouteBlockedDoesNotCommandForward
+TEST(ReactiveObstacleAvoidanceTest, LocalRouteBlockedDoesNotCommandForward)
+{
+    // Arrange: drive the sweep to exhaustion.
+    ReactiveObstacleAvoidance avoidance;
+    avoidance.update(true, true, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(90.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(180.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(270.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(360.0F), kNoHazard);
+    ASSERT_TRUE(avoidance.localRouteBlockedThisUpdate());
+    ASSERT_EQ(avoidance.state(), AvoidanceState::Inactive);
+
+    // Act
+    const WheelSpeeds speeds = avoidance.wheelSpeeds();
+
+    // Assert: released to Inactive means zero commanded wheel speed -
+    // it is the caller's (main3d.cpp / WaypointNavigator) job to drive,
+    // never this class' once it has given up on this incident.
+    EXPECT_FLOAT_EQ(speeds.left, 0.0F);
+    EXPECT_FLOAT_EQ(speeds.right, 0.0F);
+}
+
+// 23: NewIncidentResetsAccumulatedSweep
+TEST(ReactiveObstacleAvoidanceTest, NewIncidentResetsAccumulatedSweep)
+{
+    // Arrange: exhaust one incident's full sweep.
+    ReactiveObstacleAvoidance avoidance;
+    avoidance.update(true, true, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(90.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(180.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(270.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(360.0F), kNoHazard);
+    ASSERT_EQ(avoidance.state(), AvoidanceState::Inactive);
+
+    // Act: a brand new incident begins. If the accumulator had NOT been
+    // reset, even a single small rotation step would immediately exceed
+    // the (already-at-360) bound and falsely report blocked again.
+    avoidance.update(true, /*triggerAvoidance=*/true, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, false, poseAtHeading(45.0F), kNoHazard);
+
+    // Assert: only 45 degrees into the new incident - nowhere near blocked.
+    EXPECT_EQ(avoidance.state(), AvoidanceState::TurnAway);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+}
+
+// 24: SuccessfulIncidentStillUsesAdvanceClear
+TEST(ReactiveObstacleAvoidanceTest, SuccessfulIncidentStillUsesAdvanceClear)
+{
+    // Arrange / Act: a normal single-obstacle bypass, well under the sweep
+    // bound, must still behave exactly like the pre-Phase-13X-blocker-fix
+    // TurnAway -> AdvanceClear -> Inactive lifecycle.
+    ReactiveObstacleAvoidance avoidance;
+    avoidance.update(true, true, false, poseAtHeading(0.0F), kNoHazard);
+    ASSERT_EQ(avoidance.state(), AvoidanceState::TurnAway);
+    avoidance.update(true, false, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, /*forwardCorridorClear=*/true, poseAtHeading(30.0F), kNoHazard);
+    ASSERT_EQ(avoidance.state(), AvoidanceState::AdvanceClear);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+
+    RobotPose advancing{};
+    advancing.headingDegrees = 30.0F;
+    advancing.position.x = ReactiveObstacleAvoidance::kMinimumBypassDistanceWorldUnits + 0.1F;
+    avoidance.update(true, false, true, advancing, kNoHazard);
+
+    // Assert: released normally, never via the blocked path.
+    EXPECT_EQ(avoidance.state(), AvoidanceState::Inactive);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+}
+
+// 25: BypassDistanceBehaviorUnchanged
+TEST(ReactiveObstacleAvoidanceTest, BypassDistanceBehaviorUnchanged)
+{
+    // Arrange: reach AdvanceClear.
+    ReactiveObstacleAvoidance avoidance;
+    avoidance.update(true, true, false, poseAtHeading(0.0F), kNoHazard);
+    avoidance.update(true, false, true, poseAtHeading(0.0F), kNoHazard);
+    ASSERT_EQ(avoidance.state(), AvoidanceState::AdvanceClear);
+
+    // Act: travel less than the required bypass distance.
+    RobotPose shortOfBypass{};
+    shortOfBypass.position.x = ReactiveObstacleAvoidance::kMinimumBypassDistanceWorldUnits - 0.05F;
+    avoidance.update(true, false, true, shortOfBypass, kNoHazard);
+
+    // Assert: still AdvanceClear - the bounded-sweep fix must not have
+    // changed AdvanceClear's own, separate, pre-existing distance gate.
+    EXPECT_EQ(avoidance.state(), AvoidanceState::AdvanceClear);
+    EXPECT_FALSE(avoidance.localRouteBlockedThisUpdate());
+}
+
+// 26: DeterministicSameInputSameOutcome
+TEST(ReactiveObstacleAvoidanceTest, DeterministicSameInputSameOutcome)
+{
+    // Arrange: two independent instances driven with the identical input
+    // sequence, including one that exhausts the sweep.
+    ReactiveObstacleAvoidance first;
+    ReactiveObstacleAvoidance second;
+    const float headings[] = {0.0F, 0.0F, 90.0F, 180.0F, 270.0F, 360.0F};
+    const bool triggers[] = {true, false, false, false, false, false};
+
+    for (std::size_t i = 0; i < std::size(headings); ++i)
+    {
+        first.update(true, triggers[i], false, poseAtHeading(headings[i]), kLeftCloserHazard);
+        second.update(true, triggers[i], false, poseAtHeading(headings[i]), kLeftCloserHazard);
+
+        // Assert: identical state and blocked-signal at every single step.
+        ASSERT_EQ(first.state(), second.state());
+        ASSERT_EQ(first.localRouteBlockedThisUpdate(), second.localRouteBlockedThisUpdate());
+        ASSERT_EQ(first.wheelSpeeds().left, second.wheelSpeeds().left);
+        ASSERT_EQ(first.wheelSpeeds().right, second.wheelSpeeds().right);
+    }
 }

@@ -87,10 +87,40 @@ struct ObstacleHazardSample
 // turn direction chosen for this incident. Still REACTIVE avoidance only -
 // not pathfinding, not A*, not waypoint planning, not SLAM/mapping, not
 // full navigation: this remains local, single-obstacle bypass, with no
-// memory of any incident once it ends, and no guaranteed solution for two
-// or more obstacles forming an actual enclosure (documented as a known V1
-// limitation, unchanged from before this fix - see
-// docs/technical-decisions.md).
+// memory of any incident once it ends.
+//
+// PHASE 13X BLOCKER FIX (bounded TurnAway sweep): this class's own prior
+// docs acknowledged "no guaranteed solution for two or more obstacles
+// forming an actual enclosure" as an accepted V1 limitation - reproduced
+// deterministically as a genuine defect once autonomous frontier
+// exploration (Phase 13X) started driving the robot into more varied desk
+// positions than plain undirected Roam ever visited: TurnAway rotated
+// >700 degrees (multiple full turns) with zero net translation, because
+// `forwardCorridorClear` never became true at ANY heading sampled during
+// the sweep (see docs/technical-decisions.md, Phase 13X blocker fix, for
+// the full recorded reproduction - pose, hazard distances, accumulated
+// rotation). Root architectural rule: local reactive avoidance must never
+// try to solve geometry that actually requires a GLOBAL route change -
+// that responsibility now belongs to GridPathPlanner + WaypointNavigator
+// (Phase 13X). TurnAway therefore now tracks accumulated ABSOLUTE heading
+// rotation for the CURRENT incident (reset only when a new incident
+// begins or the incident fully releases - never on an AdvanceClear ->
+// TurnAway re-block within the SAME incident, since that is still one
+// continuous incident) and, if `kMaximumTurnAwaySweepDegrees` is reached
+// without ever finding a clear corridor, releases to Inactive and reports
+// `localRouteBlockedThisUpdate()` true for exactly that one update() call
+// - a one-frame edge signal, not a persistent state, so this class never
+// permanently holds the AutonomousAvoidance drive-authority tier hostage.
+// The caller (main3d.cpp) uses that single frame to force WaypointNavigator
+// to replan/blacklist the current global target from the CURRENT pose -
+// see main3d.cpp's own docs on the post-block handoff, including why the
+// caller must ALSO briefly suppress re-arming `triggerAvoidance` until the
+// robot's heading has genuinely changed (otherwise, since obstacleDetected()
+// reflects a real-time sensor reading and the robot has not moved at all
+// the instant after release, a fresh incident would start on the very
+// next frame before Navigation's newly-replanned command ever gets a
+// chance to actually turn the robot - never resolving in aggregate even
+// though each individual incident is now bounded).
 //
 // Still has no knowledge of RobotStateMachine, Event, IRobotHardware,
 // VirtualDistanceSensor, VirtualObstacleSensorArray, or VirtualWorld
@@ -134,6 +164,37 @@ public:
     // variables defined in different headers.
     static const float kMinimumBypassDistanceWorldUnits;
 
+    // Phase 13X blocker fix: the maximum accumulated ABSOLUTE heading
+    // rotation (degrees) TurnAway may perform for a single incident before
+    // giving up and reporting `localRouteBlockedThisUpdate()`. Exactly one
+    // full revolution: TurnAway always rotates continuously in one fixed
+    // (latched) direction, so a full 360-degree sweep genuinely samples
+    // every possible heading exactly once - there is no heading a
+    // continuous rotation could reach that a full revolution does not
+    // already cover, so no larger bound would ever find a corridor a
+    // smaller-than-360 bound could miss, and no amount of EXTRA rotation
+    // beyond 360 could discover a clear heading the first 360 degrees did
+    // not already sample. 360.0F is therefore not an arbitrary tuning
+    // constant - it is the mathematically complete search of this
+    // incident's one rotational degree of freedom.
+    static constexpr float kMaximumTurnAwaySweepDegrees = 360.0F;
+
+    // Phase 13X blocker fix: true for exactly the one update() call on
+    // which TurnAway's bounded sweep was exhausted without ever finding a
+    // clear corridor - a one-frame EDGE signal (mirrors this codebase's
+    // other edge-triggered signals, e.g. HomeArrivalEventSource), not a
+    // persistent state. On that same call, this class has already
+    // released itself back to Inactive (see update()'s own docs) - it
+    // never continues occupying the AutonomousAvoidance drive-authority
+    // tier once local avoidance has given up. The caller (main3d.cpp) is
+    // expected to react on this exact frame: force the global navigation
+    // layer (WaypointNavigator) to replan/blacklist its current target
+    // from the robot's CURRENT pose, and briefly suppress re-arming
+    // `triggerAvoidance` until the robot's heading has genuinely changed
+    // (see this class's own top-level docs for why that second part is
+    // required, not merely the replan itself).
+    bool localRouteBlockedThisUpdate() const noexcept;
+
     // Advances the incident by one frame/step.
     //   - `enabled` false (the `A` toggle off) forces Inactive
     //     immediately, regardless of every other argument - unchanged
@@ -156,6 +217,11 @@ public:
     //     true AND `pose` has moved at least
     //     kMinimumBypassDistanceWorldUnits from the AdvanceClear start
     //     point.
+    //   - TurnAway -> Inactive (Phase 13X blocker fix), reporting
+    //     `localRouteBlockedThisUpdate()` true for this one call, once
+    //     accumulated rotation for the current incident reaches
+    //     kMaximumTurnAwaySweepDegrees without `forwardCorridorClear` ever
+    //     having become true - see this class's own top-level docs.
     // `pose` should be the robot's current, real RobotPose every call
     // (world.robotPose() in main3d.cpp) - this class never mutates it,
     // only reads position for its own displacement bookkeeping.
@@ -189,6 +255,16 @@ private:
     AvoidanceState state_ = AvoidanceState::Inactive;
     float latchedTurnSign_ = 1.0F;
     Vec3 advanceStartPosition_{};
+
+    // Phase 13X blocker fix: accumulated ABSOLUTE heading rotation for the
+    // CURRENT incident (see kMaximumTurnAwaySweepDegrees's own docs) -
+    // spans multiple TurnAway phases within one incident (an AdvanceClear
+    // re-block does not reset it; only a brand new incident, or a full
+    // release, does).
+    float accumulatedTurnAwayRotationDegrees_ = 0.0F;
+    float turnAwayPreviousHeadingDegrees_ = 0.0F;
+    bool turnAwayHeadingSeeded_ = false;
+    bool localRouteBlockedThisUpdate_ = false;
 };
 
 } // namespace robot::visual
