@@ -1,5 +1,6 @@
 #pragma once
 
+#include "robot/visual/NavigationClearance.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 
 namespace robot::visual
@@ -60,7 +61,17 @@ public:
     // threshold, so a released MoveForward is not immediately right back
     // at the rejection boundary. 0.08F sits inside the brief's suggested
     // 0.05F-0.10F range.
-    static constexpr float kSafetyMargin = 0.08F;
+    //
+    // Phase 13X final blocker fix: now DEFINED from
+    // NavigationClearance::kLocalHazardMargin (NavigationClearance.hpp)
+    // instead of its own separately-hand-picked literal - same 0.08F
+    // value as before (no behavior change here), but now the ONE shared
+    // source of truth GridPathPlanner's own planning clearance is also
+    // derived from, so the two layers can never again silently drift
+    // apart the way they did before this phase (see
+    // NavigationClearance.hpp's own top-level docs for the full
+    // reasoning and the traced mismatch this closes).
+    static constexpr float kSafetyMargin = NavigationClearance::kLocalHazardMargin;
 
     // world must outlive this object - the same non-owning-reference
     // pattern VirtualDistanceSensor/RobotCollision use throughout this

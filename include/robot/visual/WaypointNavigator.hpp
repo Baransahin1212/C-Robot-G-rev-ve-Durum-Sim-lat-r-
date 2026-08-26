@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "robot/visual/ExplorationMap.hpp"
+#include "robot/visual/GridPathPlanner.hpp"
 #include "robot/visual/HomeNavigator.hpp"
 #include "robot/visual/NavigationProgressTracker.hpp"
 
@@ -113,9 +114,15 @@ public:
     // Home/exploration itself, only "a goal"). `enabled` false immediately
     // resets to Inactive, mirroring HomeNavigator's own enabled contract
     // exactly. `forceReplan` true forces a fresh plan attempt this call
-    // regardless of every other condition above.
+    // regardless of every other condition above. `extraBlockedCells`
+    // (Phase 13X blocker fix, deadlock repair) is forwarded verbatim to
+    // GridPathPlanner's own identically-named constructor parameter for
+    // every replan this call performs - see that parameter's own docs
+    // (GridPathPlanner.hpp) for why it exists; empty by default, so every
+    // pre-existing caller is completely unaffected.
     WaypointNavigatorOutput update(const RobotPose& pose, const ExplorationMap& map, const Vec3& goalWorld,
-                                    bool enabled, bool forceReplan) noexcept;
+                                    bool enabled, bool forceReplan,
+                                    const std::vector<GridCoord>& extraBlockedCells = {}) noexcept;
 
     // Explicit reset to Inactive - equivalent to the next update() call
     // with enabled=false, exposed for callers/tests that want a clean
@@ -126,7 +133,8 @@ public:
     const std::vector<Vec3>& currentRoute() const noexcept;
 
 private:
-    void planRoute(const RobotPose& pose, const ExplorationMap& map, const Vec3& goalWorld);
+    void planRoute(const RobotPose& pose, const ExplorationMap& map, const Vec3& goalWorld,
+                    const std::vector<GridCoord>& extraBlockedCells);
     bool routeStillClear(const ExplorationMap& map) const;
 
     HomeNavigator localSteering_;

@@ -212,3 +212,64 @@ TEST(MissionControlEventSourceTest, CanStartAnotherRoamAfterPreviousQueueComplet
     EXPECT_EQ(event->type, EventType::StartMission);
     EXPECT_FALSE(source.pollEvent().has_value());
 }
+
+// ============================================================
+// Phase 13X quick fix (Bug C) - TESTS: requestReturnHomeFromIdle()
+// ============================================================
+// Human GUI validation reproduced: launch (Idle) -> M -> manually drive
+// away -> 2. Manual cleared correctly, but plain requestReturnHome() is
+// unconditional and RobotStateMachine has NO Idle + ReturnHomeRequested
+// transition at all (only Ready does) - the event was silently rejected
+// forever, leaving "Durum: Bekliyor / Görev: YOK". requestReturnHomeFromIdle()
+// composes the existing, unmodified Idle->Ready (ScenarioLoaded) and
+// Ready->ReturningHome (ReturnHomeRequested) transitions, mirroring
+// requestStartRoam()'s own Idle branch shape exactly.
+
+// 11: ReturnHomeFromIdleQueuesScenarioLoadedFirst
+TEST(MissionControlEventSourceTest, ReturnHomeFromIdleQueuesScenarioLoadedFirst)
+{
+    // Arrange
+    MissionControlEventSource source;
+
+    // Act
+    source.requestReturnHomeFromIdle();
+    const std::optional<Event> first = source.pollEvent();
+
+    // Assert
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->type, EventType::ScenarioLoaded);
+}
+
+// 12: ReturnHomeFromIdleQueuesReturnHomeSecond
+TEST(MissionControlEventSourceTest, ReturnHomeFromIdleQueuesReturnHomeSecond)
+{
+    // Arrange
+    MissionControlEventSource source;
+    source.requestReturnHomeFromIdle();
+    ASSERT_TRUE(source.pollEvent().has_value()); // consume ScenarioLoaded
+
+    // Act
+    const std::optional<Event> second = source.pollEvent();
+
+    // Assert
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->type, EventType::ReturnHomeRequested);
+    EXPECT_FALSE(source.pollEvent().has_value());
+}
+
+// 13: ReturnHomeFromIdleSequenceNotDuplicatedOnRepeatedPress
+TEST(MissionControlEventSourceTest, ReturnHomeFromIdleSequenceNotDuplicatedOnRepeatedPress)
+{
+    // Arrange: a sequence already in flight (mirrors mashing 2/R twice
+    // before the first ScenarioLoaded has even been delivered).
+    MissionControlEventSource source;
+    source.requestReturnHomeFromIdle();
+
+    // Act
+    source.requestReturnHomeFromIdle();
+
+    // Assert: exactly the original two events, never four.
+    ASSERT_TRUE(source.pollEvent().has_value());
+    ASSERT_TRUE(source.pollEvent().has_value());
+    EXPECT_FALSE(source.pollEvent().has_value());
+}

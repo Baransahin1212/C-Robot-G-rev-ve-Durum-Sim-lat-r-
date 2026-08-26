@@ -1,5 +1,6 @@
 #include <array>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -27,6 +28,7 @@
 #include "robot/visual/RangeObservation.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
 #include "robot/visual/Renderer3D.hpp"
+#include "robot/visual/RobotCollision.hpp"
 #include "robot/visual/TableEdgeSafetyController.hpp"
 #include "robot/visual/TurkishText.hpp"
 #include "robot/visual/VirtualCliffSensor.hpp"
@@ -91,6 +93,151 @@ constexpr int kRequiredConsecutiveNoTargetAttempts = 5;
 // executing a MEANINGFULLY different command, not that it has finished
 // aligning to one.
 constexpr float kAvoidanceResumeHeadingChangeDegrees = 30.0F;
+
+// Phase 13X blocker fix (deadlock repair): the ORIGINAL
+// hardware.collidedLastUpdate() release condition (see
+// avoidanceSuppressedAfterBlock's own docs) fires on a SINGLE collided
+// frame - the instant Navigation's freshly-replanned Driving phase clips
+// an obstacle even once, avoidance immediately re-arms and steals the
+// wheels back for a brand new bounded TurnAway sweep, before Navigation
+// (or its own route-invalidation/NavigationProgressTracker machinery) ever
+// gets more than exactly one frame to actually attempt the escape - a
+// second, slower-motion ping-pong between the two authorities (each
+// individually bounded - a ~44-frame TurnAway sweep, then one Navigation
+// frame - but the AGGREGATE never converging), reproduced by a full
+// autonomous Haritalama+Return Home session once the first (Safety-tier)
+// deadlock above no longer masks it. Requiring
+// kAvoidanceResumeCollisionStallFrames CONSECUTIVE collided frames (never
+// merely one) before honoring the collision-based release gives Navigation
+// a genuine multi-frame window each time, without weakening the heading-
+// change release condition (an unambiguously positive progress signal,
+// never debounced). Small (a quarter-second at this project's ~0.05s/frame
+// convention) - just enough to distinguish "Navigation is persistently
+// wedged against this exact obstacle" from "a single frame's proposed step
+// happened to graze one," never large enough to reintroduce a long stall.
+constexpr int kAvoidanceResumeCollisionStallFrames = 5;
+
+// Phase 13X blocker fix (deadlock repair): minimum positional change
+// (world units), since TableEdgeSafetyController last reported
+// recoveryBlockedThisUpdate(), before its own re-arming is allowed again -
+// see safetyRecoverySuppressedAfterBlock's own docs below for the full
+// "why." Uses RobotCollision::kRobotCollisionRadius as its natural scale
+// (the same "one full body-radius of real displacement proves genuine
+// progress" reasoning ReactiveObstacleAvoidance::kMinimumBypassDistanceWorldUnits
+// already uses for its own AdvanceClear release condition) rather than an
+// arbitrary literal.
+const float kSafetyResumeMinDisplacementWorldUnits = robot::visual::kRobotCollisionRadius;
+
+// Phase 13X blocker fix: unconditional last-resort valve on how long
+// TableEdgeSafetyController's own re-arming may be withheld - never an
+// indefinite suppression regardless of what avoidance/Navigation manage to
+// do with the window. 120 frames (6s of simulated time at this project's
+// ~0.05s/frame convention) is generous enough for a genuine bounded
+// avoidance/replan attempt to run its own course, small relative to the
+// thousands of frames a full autonomous session already budgets.
+constexpr int kSafetyResumeMaxSuppressedFrames = 120;
+
+// Phase 13X final blocker fix ("BLOCKED-CELL REPLAN AUDIT" -
+// docs/technical-decisions.md): excluded neighborhood radius (in grid
+// cells) around a waypoint cell an avoidance incident just proved
+// troublesome, not merely that ONE exact cell. Proven necessary by a
+// traced reproduction: blacklisting only the single exact cell let
+// GridPathPlanner's own A* immediately re-select the immediately-ADJACENT,
+// functionally-equivalent cell (same clearance, same connectivity to the
+// rest of the route), producing a near-identical route that failed again
+// one grid cell over - a deterministic single-cell "walk" that never
+// converged. 0 (the exact single cell only, no extra ring) was proven
+// (same traced reproduction/regression) to already be the right size once
+// combined with kMaxReturnHomeBlockedCells' own bounded-eviction below -
+// a 3x3 ring around EVERY incident, accumulated over an extended Return
+// Home session with the trigger below (any avoidance release, not just a
+// full-sweep exhaustion), was empirically proven to over-exclude the
+// dock's own already-tight goal-snapped approach area entirely
+// (WaypointNavigatorState::Failed - a real regression this file's own
+// test caught), which the brief's own "never arbitrarily large regions"
+// constraint explicitly warns against.
+constexpr int kLocalReplanExclusionRadiusCells = 0;
+
+// Phase 13X final blocker fix: hard cap on how many cells
+// returnHomeBlockedCells may ever hold at once - once exceeded, the
+// OLDEST entries are evicted first (see the FIFO eviction below). This is
+// what keeps the exclusion genuinely TEMPORARY/bounded (never an
+// unbounded accumulation across a long Return Home session that could
+// eventually wall off the goal's own neighborhood) rather than relying on
+// eviction never being needed. Small relative to the ~100x100 exploration
+// grid - comfortably enough live exclusions to break a short repeating
+// cycle, never enough to meaningfully disconnect a real desk-scale
+// region.
+constexpr std::size_t kMaxReturnHomeBlockedCells = 12;
+
+// Phase 13X final blocker fix ("NO OSCILLATION INVARIANT" /
+// "BLOCKED-CELL REPLAN AUDIT"): two regression-tuned constants for the
+// WHOLE-SESSION distance-to-home progress tracker (see the tracking
+// block's own docs, below in main() itself, for the full reasoning). Two
+// EARLIER, per-incident heuristics were tried and both regression-tested
+// away by this project's own pre-existing Return Home test suite
+// (unconditional blacklist-on-every-ordinary-release, and a
+// "did-this-one-incident-net-improve-distance-to-home" heuristic): a
+// single avoidance incident is frequently perfectly benign and fully
+// recoverable (this codebase's whole reactive-avoidance layer exists
+// precisely to handle that case), and even a genuinely converging route
+// routinely includes individual incidents/legs that temporarily move the
+// robot sideways or away from home as a completely normal, NECESSARY part
+// of getting around an obstacle - judging any SINGLE incident in
+// isolation cannot reliably tell that apart from a genuine non-converging
+// attractor. A WHOLE-SESSION window can: kOscillationProgressEpsilonWorldUnits
+// (world units) is how much distance-to-home must improve to count as
+// genuine progress (small - just enough to ignore floating-point/near-
+// zero noise); kOscillationStuckWindowFrames is how many consecutive
+// frames may pass without that much improvement before the current
+// waypoint is treated as the responsible attractor and blacklisted (see
+// the tracking block's own docs for the exact accounting) - large enough
+// that any genuinely converging route (including one with several normal,
+// temporary detour-related non-improving stretches) never spuriously
+// crosses it within this project's own regression suite, small enough
+// relative to the 4000-frame Return Home budget that a real attractor is
+// caught and corrected with many frames still available to actually reach
+// home afterward. `localRouteBlockedThisUpdate()` (the full-360-degree-
+// sweep-exhausted signal) remains its own, separate, unconditional,
+// immediate trigger - see below - since that signal is already a
+// complete, one-incident proof the exact cell is not passable.
+constexpr float kOscillationProgressEpsilonWorldUnits = 0.05F;
+constexpr int kOscillationStuckWindowFrames = 400;
+
+// Phase 13X final blocker fix: shared helper - adds the
+// (radiusCells x radiusCells) neighborhood around (centerCol, centerRow)
+// to `blocked` (deduplicated), then enforces `maxEntries` via FIFO
+// eviction of the OLDEST entries - the one place this logic lives, used
+// by both blacklist triggers below (never two independently-drifting
+// copies of the same bookkeeping).
+void addBlockedCellNeighborhood(std::vector<robot::visual::GridCoord>& blocked, int centerCol, int centerRow,
+                                 int radiusCells, std::size_t maxEntries)
+{
+    for (int dRow = -radiusCells; dRow <= radiusCells; ++dRow)
+    {
+        for (int dCol = -radiusCells; dCol <= radiusCells; ++dCol)
+        {
+            const robot::visual::GridCoord candidate{centerCol + dCol, centerRow + dRow};
+            bool alreadyListed = false;
+            for (const robot::visual::GridCoord& existing : blocked)
+            {
+                if (existing == candidate)
+                {
+                    alreadyListed = true;
+                    break;
+                }
+            }
+            if (!alreadyListed)
+            {
+                blocked.push_back(candidate);
+            }
+        }
+    }
+    while (blocked.size() > maxEntries)
+    {
+        blocked.erase(blocked.begin());
+    }
+}
 
 } // namespace
 
@@ -323,6 +470,14 @@ int main()
     bool previousAvoidanceActive = false;
     bool previousSafetyActive = false;
 
+    // Phase 13X human-validation fix: edge-detection for "Return Home just
+    // became the active task" (missionTask freshly reading
+    // MissionTask::ReturnHome this frame, false -> true) - see the
+    // Manual-override-cancellation block below (in the main loop) for the
+    // full reasoning. Mirrors previousAvoidanceActive/previousSafetyActive's
+    // own shape exactly.
+    bool previousReturningHomeActive = false;
+
     // Phase 13X blocker fix: deferred-by-one-frame consumption of
     // avoidance's localRouteBlockedThisUpdate() signal - see the
     // avoidance-wiring block's own docs below for why the forced replan
@@ -335,6 +490,61 @@ int main()
     bool localRouteBlockedPendingReplan = false;
     bool avoidanceSuppressedAfterBlock = false;
     float headingAtLastLocalRouteBlocked = 0.0F;
+    // Phase 13X blocker fix (deadlock repair): consecutive-collision
+    // debounce for the release condition above - see
+    // kAvoidanceResumeCollisionStallFrames's own docs.
+    int consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+
+    // Phase 13X blocker fix (deadlock repair): mirrors
+    // avoidanceSuppressedAfterBlock's own shape, one authority tier up.
+    // TableEdgeSafetyController::recoveryBlockedThisUpdate() (bounded
+    // recovery-stall escape - see that class's own docs) means Safety
+    // just released a translating recovery it could not complete, most
+    // often because an obstacle sits between the robot and this
+    // incident's fixed recovery target. Safety unconditionally outranks
+    // AutonomousAvoidance/Navigation/Fsm (see driveAuthority()), so
+    // without withholding its own re-arming for a bit, it would
+    // immediately re-claim the wheels the very next frame (cliff sensors
+    // read from an all-but-unmoved position almost certainly still report
+    // unsafe), starving avoidance/Navigation of the genuine chance to
+    // move the robot away from the stuck spot that the release was
+    // supposed to grant - recreating the same deadlock one bounded-stall
+    // cycle at a time instead of resolving it. Lifted the moment the
+    // robot's position has moved meaningfully since the block (avoidance
+    // or Navigation made real progress - Safety should resume watching
+    // from the new position), or after kSafetyResumeMaxSuppressedFrames
+    // as an unconditional last-resort valve. VirtualRobotHardware's own
+    // unconditional last-resort guards (obstacle-collision rejection,
+    // all-four-corners-off-table rejection) remain fully active
+    // throughout regardless - this only ever withholds the PROACTIVE
+    // recovery layer's own re-arming, never the hard backstop.
+    bool safetyRecoverySuppressedAfterBlock = false;
+    robot::visual::Vec3 positionAtLastSafetyBlock{};
+    int framesSuppressedSinceSafetyBlock = 0;
+
+    // Phase 13X blocker fix (deadlock repair): Return-Home-only cell
+    // blacklist (mirrors frontierBlacklist's own shape, one level more
+    // granular) - see GridPathPlanner's own `extraBlockedCells`
+    // constructor-parameter docs for the full "why." Grows only when
+    // avoidance's bounded TurnAway sweep proves (via
+    // localRouteBlockedThisUpdate()) that the specific waypoint cell
+    // Navigation was steering toward is not really passable; cleared
+    // whenever Return Home is not the active task, so a fresh Return Home
+    // request always begins with a clean slate, exactly like
+    // frontierBlacklist's own reset-on-task-change semantics.
+    // `previousNavOutput` is the one piece of state needed to know WHICH
+    // waypoint cell was being pursued at the moment a block is detected
+    // (mapNavigator.update() itself has not run yet this frame when
+    // avoidance's block is read).
+    std::vector<robot::visual::GridCoord> returnHomeBlockedCells;
+    robot::visual::WaypointNavigatorOutput previousNavOutput;
+    // Phase 13X final blocker fix ("NO OSCILLATION INVARIANT"): whole-
+    // Return-Home-session distance-to-home progress bookkeeping - see the
+    // tracking block's own docs (in main()) for the full reasoning.
+    // `bestDistanceToHomeThisSession` starts at +infinity so the very
+    // first frame of a fresh Return Home always counts as an improvement.
+    float bestDistanceToHomeThisSession = std::numeric_limits<float>::infinity();
+    int framesSinceDistanceImproved = 0;
 
     // Runtime-relative persistence path (never a source-tree path - see
     // ExecutableDirectory.hpp/kMapStorageRelativePath's own docs above).
@@ -395,6 +605,14 @@ int main()
     // - the camera holds still, and arrow keys/mouse only ever drive the
     // robot until `M` is pressed again.
     bool manualDriveMode = false;
+
+    // Phase 13X quick fix (Bug B): true from the moment KEY_ONE finds the
+    // map already logically complete (see that handler above) until a
+    // genuine mission task actually becomes active again (cleared below,
+    // once missionTask is Roam or ReturnHome) - drives the "Harita zaten
+    // tamamlandı" HUD notice. Presentation-only; never influences
+    // completionSignal/frontier/navigation logic itself.
+    bool mapAlreadyCompleteNoticeActive = false;
 
     // Reactive obstacle-avoidance enable/disable (Phase 13Q) - ON by
     // default so RobotSimulator3D demonstrates autonomous behavior
@@ -482,27 +700,90 @@ int main()
 
         if (IsKeyPressed(KEY_ONE))
         {
-            // Start Roam - edge-triggered, state-aware (see
-            // MissionControlEventSource::requestStartRoam()): queues
-            // ScenarioLoaded+StartMission from Idle, only StartMission
-            // from Ready, or nothing at all if already Moving/
-            // ReturningHome/etc. Reads stateMachine.currentState() as of
-            // the END of the previous frame's runtime.step() - the
-            // correct up-to-date snapshot, since input is handled before
-            // this frame's own step() below.
-            missionControl.requestStartRoam(stateMachine.currentState());
+            // Phase 13X quick fix (Bug B): if the CURRENT map (fresh from
+            // a persisted load, or left over from an earlier completed
+            // session) already has nothing reachable left to explore, do
+            // not begin a Roam session at all - the exploration loop's
+            // own needNewTarget check (below) would immediately re-derive
+            // that same fact on Roam's very first frame and auto-return
+            // home before the robot ever physically moves, which is
+            // exactly the reproduced "press 1, mapping stops almost
+            // immediately" incident. Uses the SAME frontierCells()/
+            // exploredCellCount() facts the exploration loop itself
+            // already relies on - never a second, different completion
+            // definition. Still transitions Idle -> Ready (via
+            // requestScenarioLoadedOnly() below) so the app remains
+            // interactive; only the doomed StartMission is withheld.
+            const bool mapAlreadyComplete =
+                explorationMap.exploredCellCount() > 0 && frontierExplorer.frontierCells().empty();
+            if (mapAlreadyComplete)
+            {
+                mapAlreadyCompleteNoticeActive = true;
+                missionControl.requestScenarioLoadedOnly(stateMachine.currentState());
+            }
+            else
+            {
+                // Start Roam - edge-triggered, state-aware (see
+                // MissionControlEventSource::requestStartRoam()): queues
+                // ScenarioLoaded+StartMission from Idle, only StartMission
+                // from Ready, or nothing at all if already Moving/
+                // ReturningHome/etc. Reads stateMachine.currentState() as
+                // of the END of the previous frame's runtime.step() - the
+                // correct up-to-date snapshot, since input is handled
+                // before this frame's own step() below.
+                mapAlreadyCompleteNoticeActive = false;
+                missionControl.requestStartRoam(stateMachine.currentState());
+            }
         }
 
         if (IsKeyPressed(KEY_TWO) || IsKeyPressed(KEY_R))
         {
-            // Return Home - `2` and `R` (preserved from Phase 13T) are
-            // deliberately the exact same call: one Return Home
-            // implementation, never two competing ones. Edge-triggered,
-            // never a direct RobotStateMachine mutation or a direct
-            // hardware.returnToBase() call - the request is only ever
-            // consumed through the real Moving/Ready + ReturnHomeRequested
-            // -> ReturningHome transition on a later runtime.step().
-            missionControl.requestReturnHome();
+            // Phase 13X quick fix (Bug A, unchanged): an EXPLICIT user
+            // Return Home command always means "autonomous control takes
+            // over now" - cancel any active Manual override immediately,
+            // right here, BEFORE the command composition below, so a
+            // currently-held arrow key/the per-frame manual-input block
+            // further down cannot re-latch it this same frame. Covers the
+            // "Manual re-enabled while already ReturningHome" gap the
+            // returningHome-edge cancel (further below) cannot reach on
+            // its own, since RobotStateMachine's ReturningHome case has no
+            // EventType::ReturnHomeRequested handler (a second request
+            // while already returning is a no-op transition either way).
+            manualDriveMode = false;
+            hardware.clearManualWheelOverride();
+
+            // Phase 13X quick fix (Bug C): `2`/`R` (preserved from Phase
+            // 13T, still the exact same one-implementation intent) is now
+            // state-aware, mirroring requestStartRoam()'s own Idle-vs-
+            // everything-else split. From Idle - e.g. Manual free-drive
+            // used directly after launch, with no mission ever started -
+            // plain requestReturnHome() is silently rejected forever
+            // (RobotStateMachine has no Idle + ReturnHomeRequested
+            // transition at all; only Ready does), leaving the robot
+            // stuck exactly as human GUI validation reproduced ("Durum:
+            // Bekliyor / Görev: YOK" after pressing 2). Composes the
+            // SAME two existing, unmodified transitions requestStartRoam()
+            // already uses for Idle (ScenarioLoaded -> Ready) with the
+            // existing Ready -> ReturningHome transition, via
+            // requestReturnHomeFromIdle() - delivered across two separate
+            // runtime.step() calls/frames (never more than one Event
+            // consumed per step()), invisible to the user as anything
+            // other than "I pressed 2 and the robot went home." From any
+            // other state (Ready/Moving/ReturningHome/
+            // WaitingForObstacleClear/...), the existing unconditional
+            // requestReturnHome() is unchanged - Ready/Moving accept it
+            // exactly as before, and ReturningHome/WaitingForObstacleClear
+            // safely no-op (RobotStateMachine rejects it there), leaving
+            // resumeState_ and the current Return Home task alone -
+            // Manual was already cleared above regardless.
+            if (stateMachine.currentState() == robot::RobotState::Idle)
+            {
+                missionControl.requestReturnHomeFromIdle();
+            }
+            else
+            {
+                missionControl.requestReturnHome();
+            }
         }
 
         if (IsKeyPressed(KEY_THREE))
@@ -620,9 +901,23 @@ int main()
         {
             const float headingChangeSinceBlock = std::fabs(robot::visual::shortestSignedHeadingErrorDegrees(
                 headingAtLastLocalRouteBlocked, world.robotPose().headingDegrees));
-            if (headingChangeSinceBlock >= kAvoidanceResumeHeadingChangeDegrees || hardware.collidedLastUpdate())
+            // Phase 13X blocker fix (deadlock repair): the collision path
+            // now requires kAvoidanceResumeCollisionStallFrames CONSECUTIVE
+            // collided frames, never merely one - see that constant's own
+            // docs for the ping-pong this closes.
+            if (hardware.collidedLastUpdate())
+            {
+                ++consecutiveCollisionsWhileAvoidanceSuppressed;
+            }
+            else
+            {
+                consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+            }
+            if (headingChangeSinceBlock >= kAvoidanceResumeHeadingChangeDegrees ||
+                consecutiveCollisionsWhileAvoidanceSuppressed >= kAvoidanceResumeCollisionStallFrames)
             {
                 avoidanceSuppressedAfterBlock = false;
+                consecutiveCollisionsWhileAvoidanceSuppressed = 0;
             }
         }
 
@@ -647,16 +942,50 @@ int main()
         {
             avoidanceSuppressedAfterBlock = true;
             headingAtLastLocalRouteBlocked = world.robotPose().headingDegrees;
+            consecutiveCollisionsWhileAvoidanceSuppressed = 0;
         }
         localRouteBlockedPendingReplan = avoidance.localRouteBlockedThisUpdate();
 
+        // Phase 13X blocker fix: lift safety-recovery suppression once the
+        // robot has genuinely moved away from where it was blocked, or the
+        // last-resort frame valve elapses - see
+        // safetyRecoverySuppressedAfterBlock's own docs above.
+        if (safetyRecoverySuppressedAfterBlock)
+        {
+            const float dxSinceBlock = world.robotPose().position.x - positionAtLastSafetyBlock.x;
+            const float dzSinceBlock = world.robotPose().position.z - positionAtLastSafetyBlock.z;
+            const float displacementSinceBlock = std::sqrt((dxSinceBlock * dxSinceBlock) + (dzSinceBlock * dzSinceBlock));
+            ++framesSuppressedSinceSafetyBlock;
+            if (displacementSinceBlock >= kSafetyResumeMinDisplacementWorldUnits ||
+                framesSuppressedSinceSafetyBlock >= kSafetyResumeMaxSuppressedFrames)
+            {
+                safetyRecoverySuppressedAfterBlock = false;
+            }
+        }
+
         // Compute this frame's cliff-sensor readings and advance the
-        // table-edge safety recovery latch (Phase 13S) - runs
-        // unconditionally every frame, exactly like avoidance's own
-        // update() above, so it stays in sync with the real robot pose
-        // regardless of manual/autonomous/FSM state.
+        // table-edge safety recovery latch (Phase 13S) - runs every frame
+        // exactly like avoidance's own update() above, so it stays in
+        // sync with the real robot pose regardless of manual/autonomous/
+        // FSM state, UNLESS Phase 13X blocker fix suppression (above) is
+        // currently withholding it - skipping the call entirely (rather
+        // than calling it with some "disabled" flag) leaves it latched at
+        // whatever state its own bounded recovery-stall escape just left
+        // it in (Inactive - see recoveryBlockedThisUpdate()'s own docs),
+        // never silently re-evaluating cliff sensors that almost
+        // certainly still read unsafe from a barely-moved position.
         const robot::visual::CliffSensorReadings cliffReadings = cliffSensor.readings();
-        tableEdgeSafety.update(cliffReadings, world.robotPose(), world.tableSurface());
+        if (!safetyRecoverySuppressedAfterBlock)
+        {
+            tableEdgeSafety.update(cliffReadings, world.robotPose(), world.tableSurface());
+        }
+
+        if (tableEdgeSafety.recoveryBlockedThisUpdate())
+        {
+            safetyRecoverySuppressedAfterBlock = true;
+            positionAtLastSafetyBlock = world.robotPose().position;
+            framesSuppressedSinceSafetyBlock = 0;
+        }
 
         // Phase 13U: this frame's user-facing task status - derived
         // fresh from RobotStateMachine's own public state, never a second
@@ -680,6 +1009,17 @@ int main()
         // Haritalama session always begins target selection clean (this
         // phase's own brief on map-reset/new-session semantics).
         const bool roaming = missionTask == robot::visual::MissionTask::Roam;
+
+        // Phase 13X quick fix (Bug B): the notice is only ever meant to
+        // cover the idle gap right after a suppressed KEY_ONE press - the
+        // moment ANY real task takes over (a genuine Roam session, or a
+        // Return Home), it is stale and must clear, regardless of how
+        // that task started.
+        if (roaming || missionTask == robot::visual::MissionTask::ReturnHome)
+        {
+            mapAlreadyCompleteNoticeActive = false;
+        }
+
         if (!roaming)
         {
             currentFrontierTarget.reset();
@@ -840,6 +1180,54 @@ int main()
         // ordering are all unchanged; Navigation still only ever outranks
         // Fsm, exactly as before.
         const bool returningHome = missionTask == robot::visual::MissionTask::ReturnHome;
+
+        // Phase 13X human-validation fix: whenever Return Home freshly
+        // becomes the active high-level task (edge-triggered - false ->
+        // true THIS frame), any stale Manual override must not be allowed
+        // to permanently outrank Navigation. Human GUI validation found
+        // that enabling Manual mode, then requesting Return Home while it
+        // was still toggled on (even with the arrow keys not currently
+        // held - manualDriveMode's per-frame block below still calls
+        // hardware.setManualWheelSpeeds(0, 0) every frame regardless,
+        // which keeps VirtualRobotHardware's manual override LATCHED,
+        // i.e. driveAuthority() stays Manual with zero wheels), left the
+        // robot sitting motionless forever even though the FSM/MissionTask
+        // both correctly showed ReturningHome/ReturnHome - a real
+        // reproduced bug (see docs/technical-decisions.md, Phase 13X
+        // human-validation fix, for the full traced 9-step reproduction).
+        // driveAuthority()'s fixed priority itself (Safety > Manual >
+        // AutonomousAvoidance > Navigation > Fsm) is completely UNCHANGED
+        // here - Manual still legitimately outranks Navigation whenever it
+        // is genuinely active; this only ever clears a STALE manual
+        // request the instant a fresh Return Home task begins, using
+        // VirtualRobotHardware's own existing clearManualWheelOverride()
+        // API (never reaching into its private override state directly).
+        // Applies identically whether Return Home was just requested by
+        // the user (`2`/`R`, via MissionControlEventSource) or
+        // automatically by ExplorationCompletionEventSource once no
+        // reachable frontier remains - both paths land here via the exact
+        // same RobotStateMachine ReturningHome transition, so no separate
+        // handling is needed for the two cases. Fires ONLY on the false ->
+        // true edge (never every frame while ReturnHome remains active),
+        // so the user may still explicitly press `M` again afterward to
+        // resume manual driving mid Return-Home - chosen over permanently
+        // rejecting Manual for the rest of the Return Home session, for
+        // minimal behavioral churn: the `M` key's existing toggle
+        // semantics (see the KEY_M block above) are otherwise completely
+        // unchanged, and this matches the codebase's own pre-existing
+        // "Manual always wins the instant it is next set" precedent (e.g.
+        // ManualInterruptionDuringReturnHomeResumesNavigationAfterward).
+        // manualDriveMode is cleared BEFORE the manual-input block further
+        // below runs this same frame (see that block's own `if
+        // (manualDriveMode)` guard), so a currently-held arrow key cannot
+        // immediately re-latch the override on this exact frame.
+        if (returningHome && !previousReturningHomeActive)
+        {
+            manualDriveMode = false;
+            hardware.clearManualWheelOverride();
+        }
+        previousReturningHomeActive = returningHome;
+
         const bool navigationEnabled = returningHome || (roaming && currentFrontierTarget.has_value());
         const robot::visual::Vec3 navigationGoal =
             returningHome ? world.basePlatform().position
@@ -859,8 +1247,115 @@ int main()
         const bool forceReplan = consumeLocalRouteBlockedReplan ||
                                   (previousAvoidanceActive && !avoidance.active()) ||
                                   (previousSafetyActive && !tableEdgeSafety.active());
-        const robot::visual::WaypointNavigatorOutput navOutput =
-            mapNavigator.update(world.robotPose(), explorationMap, navigationGoal, navigationEnabled, forceReplan);
+
+        // Phase 13X final blocker fix ("NO OSCILLATION INVARIANT"):
+        // whole-session distance-to-home progress tracking - the SECOND,
+        // WHOLE-TRAJECTORY signal (distinct from
+        // NavigationProgressTracker's own DISPLACEMENT-based anti-spin
+        // check inside WaypointNavigator, which only ever answers "has the
+        // robot moved," not "is it getting closer to the GOAL") that
+        // detects the exact oscillation signature this phase's own brief
+        // describes: distance-to-home repeatedly alternating within a
+        // band, heading kept changing, replans kept happening, yet no
+        // meaningful net progress toward home over an extended window - a
+        // traced, reproduced failure mode (see
+        // docs/technical-decisions.md, Phase 13X final blocker fix) that
+        // NEITHER localRouteBlockedThisUpdate() (TurnAway always found
+        // SOME clear heading, never exhausting its full sweep) NOR
+        // per-incident heuristics (proven, by regression against this
+        // project's own pre-existing Return Home test suite, to
+        // over-trigger on ordinary avoidance incidents that ARE part of a
+        // genuinely converging route - a temporary lateral/backward
+        // detour around an obstacle is completely normal and must not be
+        // penalized) can distinguish from ordinary, converging navigation.
+        // `bestDistanceToHomeThisSession`/`framesSinceDistanceImproved`
+        // reset only when Return Home itself starts/stops (never on an
+        // individual replan/incident) - genuinely whole-session bookkeeping.
+        if (!returningHome)
+        {
+            bestDistanceToHomeThisSession = std::numeric_limits<float>::infinity();
+            framesSinceDistanceImproved = 0;
+        }
+        else
+        {
+            const float dxHome = world.robotPose().position.x - world.basePlatform().position.x;
+            const float dzHome = world.robotPose().position.z - world.basePlatform().position.z;
+            const float distanceToHomeNow = std::sqrt((dxHome * dxHome) + (dzHome * dzHome));
+            if (distanceToHomeNow < bestDistanceToHomeThisSession - kOscillationProgressEpsilonWorldUnits)
+            {
+                bestDistanceToHomeThisSession = distanceToHomeNow;
+                framesSinceDistanceImproved = 0;
+            }
+            else
+            {
+                ++framesSinceDistanceImproved;
+            }
+        }
+
+        // Phase 13X blocker fix (deadlock repair): maintain
+        // returnHomeBlockedCells - see its own docs above. Scoped to
+        // returningHome only (frontier navigation keeps its own separate,
+        // already-validated target-level blacklist untouched).
+        //
+        // Phase 13X final blocker fix (BLOCKED-CELL REPLAN AUDIT): TWO
+        // triggers now populate this list, both proven necessary by traced
+        // reproductions (see docs/technical-decisions.md, Phase 13X final
+        // blocker fix) - never guessed in advance:
+        //   1) avoidance.localRouteBlockedThisUpdate() - a full-360-
+        //      degree-sweep-exhausted incident is already, on its own, a
+        //      complete proof the exact waypoint cell is not passable -
+        //      blacklisted unconditionally, exactly as the original
+        //      deadlock-repair fix already did.
+        //   2) The oscillation window above expiring
+        //      (framesSinceDistanceImproved reaching
+        //      kOscillationStuckWindowFrames - an edge, consumed exactly
+        //      once per window via the reset below) - the CURRENT
+        //      waypoint cell is what the route has been repeatedly
+        //      steering through this whole non-converging window, so it
+        //      is the correct target to exclude and force A* onto
+        //      genuinely different route geometry, exactly like trigger
+        //      1 above (same helper, same neighborhood/cap).
+        // Excludes a small kLocalReplanExclusionRadiusCells neighborhood
+        // (not merely the one exact cell - see that constant's own docs),
+        // bounded overall by kMaxReturnHomeBlockedCells (FIFO eviction).
+        if (!returningHome)
+        {
+            returnHomeBlockedCells.clear();
+        }
+        else if (avoidance.localRouteBlockedThisUpdate() && !previousNavOutput.route.empty() &&
+                 previousNavOutput.currentWaypointIndex < previousNavOutput.route.size())
+        {
+            int blockedCol = -1;
+            int blockedRow = -1;
+            if (explorationMap.worldToCell(previousNavOutput.route[previousNavOutput.currentWaypointIndex],
+                                            blockedCol, blockedRow))
+            {
+                addBlockedCellNeighborhood(returnHomeBlockedCells, blockedCol, blockedRow,
+                                            kLocalReplanExclusionRadiusCells, kMaxReturnHomeBlockedCells);
+            }
+        }
+        else if (framesSinceDistanceImproved >= kOscillationStuckWindowFrames && !previousNavOutput.route.empty() &&
+                 previousNavOutput.currentWaypointIndex < previousNavOutput.route.size())
+        {
+            int col = -1;
+            int row = -1;
+            if (explorationMap.worldToCell(previousNavOutput.route[previousNavOutput.currentWaypointIndex], col,
+                                            row))
+            {
+                addBlockedCellNeighborhood(returnHomeBlockedCells, col, row, kLocalReplanExclusionRadiusCells,
+                                            kMaxReturnHomeBlockedCells);
+            }
+            // Edge-consume: starts a fresh window immediately, so a
+            // route that is STILL not converging escalates again after
+            // another full window, rather than blacklisting every single
+            // frame for as long as the condition remains true.
+            framesSinceDistanceImproved = 0;
+        }
+
+        const robot::visual::WaypointNavigatorOutput navOutput = mapNavigator.update(
+            world.robotPose(), explorationMap, navigationGoal, navigationEnabled, forceReplan,
+            returningHome ? returnHomeBlockedCells : std::vector<robot::visual::GridCoord>{});
+        previousNavOutput = navOutput;
 
         // Apply drive authority (Safety > Manual > AutonomousAvoidance >
         // Navigation > Fsm - see VirtualRobotHardware::driveAuthority()).
@@ -1027,6 +1522,25 @@ int main()
         telemetry.collidedLastUpdate = hardware.collidedLastUpdate();
         telemetry.batteryPercent = hardware.batteryLevelPercent();
         telemetry.mapWasLoaded = mapWasLoadedAtStartup;
+        // Phase 13X human-validation fix: completion/coverage display
+        // telemetry - see Renderer3D.hpp's own docs on these three fields.
+        // `completionSignal.complete`/`roaming` are the exact same values
+        // already driving the frontier-selection block above (never a
+        // second, separately-derived copy), and
+        // explorationMap.exploredPercentage() is the same truthful raw
+        // getter the HARİTA panel already reads directly - this is purely
+        // a second copy for the Ayrıntılı HUD, which does not receive
+        // ExplorationMap itself.
+        // Phase 13X quick fix (Bug B): also true while
+        // mapAlreadyCompleteNoticeActive is latched (KEY_ONE found the map
+        // already complete and withheld StartMission - see that handler
+        // above) - reuses the SAME Tamamlandı/%100 display this fix
+        // already has, rather than a second notice mechanism, and never
+        // touches completionSignal itself (still exactly the real
+        // Haritalama-session completion fact - no event-source edge risk).
+        telemetry.logicalExplorationComplete = completionSignal.complete || mapAlreadyCompleteNoticeActive;
+        telemetry.explorationActive = roaming;
+        telemetry.rawExploredPercentage = explorationMap.exploredPercentage();
         telemetry.avoidanceEnabled = avoidanceEnabled;
         telemetry.avoidanceActive = avoidance.active();
         telemetry.avoidanceStateText = robot::visual::turkishText(avoidance.state());

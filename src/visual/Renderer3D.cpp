@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "robot/visual/ExecutableDirectory.hpp"
+#include "robot/visual/MapPanelStatus.hpp"
 #include "robot/visual/VisualRobot.hpp"
 
 namespace robot::visual
@@ -736,6 +737,24 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
     std::snprintf(homeNavHeadingErrorLine, sizeof(homeNavHeadingErrorLine), "Yön hatası: %.1f",
                    telemetry.homeNavigationHeadingErrorDegrees);
 
+    // Phase 13X human-validation fix: Ayrıntılı-only breakdown of the
+    // HARİTA panel's own single "Keşfedilen" number - "Erişilebilir keşif"
+    // (accessible/reachable exploration - uses the exact same
+    // displayedExploredPercentage() substitution the map panel itself
+    // uses, so it always agrees with what that panel shows) alongside
+    // "Ham keşif" (raw, always-truthful ExplorationMap::exploredPercentage(),
+    // never substituted) - lets an engineering observer see both numbers
+    // at once and understand WHY they can legitimately differ (see
+    // MapPanelStatus.hpp's own docs). Presentation-only, exactly like
+    // every other line in this panel.
+    char accessibleExploredLine[64];
+    std::snprintf(accessibleExploredLine, sizeof(accessibleExploredLine), "Erişilebilir keşif: %%%d",
+                   displayedExploredPercentage(telemetry.logicalExplorationComplete, telemetry.rawExploredPercentage));
+
+    char rawExploredLine[64];
+    std::snprintf(rawExploredLine, sizeof(rawExploredLine), "Ham keşif: %%%d",
+                   static_cast<int>(telemetry.rawExploredPercentage));
+
     const HudLine detailedLines[] = {
         {"ROBOT DURUMU - AYRINTILI", 20, kHudTitleColor},
         {stateLine, 18, kHudTextColor},
@@ -769,6 +788,8 @@ void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telem
         {homeNavTargetHeadingLine, 18, kHudTextColor},
         {homeNavHeadingErrorLine, 18, kHudTextColor},
         {returnReasonLine, 18, kHudTextColor},
+        {accessibleExploredLine, 18, kHudTextColor},
+        {rawExploredLine, 18, kHudTextColor},
         {"TAB Fareyi Yakala/Bırak   F11 Tam Ekran   SPACE Duraklat   O Engeli Aç/Kapat   Fare: kamera",
          16, kHudControlsColor},
         {"M Manuel Kontrol   Ok Tuşları Sürüş   X Manuel Durdur", 16, kHudControlsColor},
@@ -941,11 +962,38 @@ void Renderer3D::drawExplorationMapPanel(const VirtualWorld& world, const Explor
                                           const CoverageTrail& trail, const VisualTelemetry& telemetry,
                                           const std::vector<Vec3>& plannedRoute) const
 {
+    // Phase 13X human-validation fix: the displayed percentage substitutes
+    // a clean 100 once exploration is LOGICALLY complete (no reachable
+    // frontier remains), even though raw ExplorationMap::exploredPercentage()
+    // truthfully stays below 100 forever for interior/occluded cells - see
+    // MapPanelStatus.hpp's own docs. map.exploredPercentage() itself is
+    // never mutated by this - only the number drawn here changes.
     char exploredLine[48];
-    std::snprintf(exploredLine, sizeof(exploredLine), "Keşfedilen: %%%d", static_cast<int>(map.exploredPercentage()));
+    std::snprintf(exploredLine, sizeof(exploredLine), "Keşfedilen: %%%d",
+                   displayedExploredPercentage(telemetry.logicalExplorationComplete, map.exploredPercentage()));
 
+    // Phase 13X human-validation fix: four-way status (NewMap/Mapping/
+    // Loaded/Completed - see MapPanelStatus.hpp's own docs on why
+    // "Tamamlandı" must win even the instant Haritalama itself stops being
+    // the active task) replaces the old two-way Yüklendi/Oluşturuluyor
+    // choice, which could not distinguish "still mapping" from "mapping
+    // just finished" - the exact human-observed ambiguity this fix
+    // resolves. Renderer3D decides the Turkish text for this one panel
+    // line directly (matching this line's own pre-existing local pattern,
+    // unlike most other telemetry text which main3d.cpp pre-translates -
+    // see VisualTelemetry::logicalExplorationComplete's own docs).
+    const MapPanelStatus panelStatus =
+        deriveMapPanelStatus(telemetry.logicalExplorationComplete, telemetry.explorationActive, telemetry.mapWasLoaded);
+    const char* statusText = "Yeni Harita";
+    switch (panelStatus)
+    {
+        case MapPanelStatus::NewMap: statusText = "Yeni Harita"; break;
+        case MapPanelStatus::Mapping: statusText = "Haritalanıyor"; break;
+        case MapPanelStatus::Loaded: statusText = "Yüklendi"; break;
+        case MapPanelStatus::Completed: statusText = "Tamamlandı"; break;
+    }
     char statusLine[48];
-    std::snprintf(statusLine, sizeof(statusLine), "Durum: %s", telemetry.mapWasLoaded ? "Yüklendi" : "Oluşturuluyor");
+    std::snprintf(statusLine, sizeof(statusLine), "Durum: %s", statusText);
 
     const HudLine headerLines[] = {
         {"HARİTA", 20, kHudTitleColor},

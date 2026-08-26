@@ -4,21 +4,38 @@
 #include <vector>
 
 #include "robot/visual/ExplorationMap.hpp"
+#include "robot/visual/NavigationClearance.hpp"
 #include "robot/visual/RobotCollision.hpp"
 
 namespace robot::visual
 {
 
-// Phase 13X: small named planning-only extra safety margin ON TOP OF
-// RobotCollision::kRobotCollisionRadius - a global route planned right at
-// the bare collision radius would route the robot along paths a single
-// frame of sensor/localization noise could turn into a collision; this
-// margin is the same "half-diagonal plus a little" philosophy
-// kRobotCollisionRadius itself already uses, applied a second time at the
-// planning layer. Small relative to a grid cell (0.12F) - deliberately not
-// large enough to make an already-narrow real gap (e.g. between two desk
-// objects) unplannable.
-inline constexpr float kPlanningSafetyMargin = 0.05F;
+// Phase 13X final blocker fix: small named planning-only extra safety
+// margin ON TOP OF RobotCollision::kRobotCollisionRadius - a global route
+// planned right at the bare collision radius would route the robot along
+// paths a single frame of sensor/localization noise could turn into a
+// collision; this margin is the same "half-diagonal plus a little"
+// philosophy kRobotCollisionRadius itself already uses, applied a second
+// time at the planning layer.
+//
+// VALUE (Phase 13X final blocker fix): previously a bare 0.05F literal,
+// chosen independently of ForwardClearanceProbe/ReactiveObstacleAvoidance's
+// own local reactive-hazard margin (0.08F) - a real, traced defect (see
+// docs/technical-decisions.md, Phase 13X final blocker fix, and
+// NavigationClearance.hpp's own top-level docs): a globally planned
+// straight segment could sit outside GridPathPlanner's own (too-small)
+// planning clearance while still sitting INSIDE the local reactive layer's
+// hazard envelope, so the robot's own reactive avoidance kept rejecting a
+// route GridPathPlanner considered clear, replanning into a materially
+// identical route, forever. Now derived as
+// NavigationClearance::kPlanningRadius - kRobotCollisionRadius, i.e.
+// kRobotCollisionRadius + kPlanningSafetyMargin always exactly equals
+// NavigationClearance::kPlanningRadius (max(physical, local-hazard) +
+// a small additional planning-only margin) - see that header for the full
+// derivation. Still small relative to a grid cell (0.12F) - deliberately
+// not large enough to make an already-narrow real gap (e.g. between two
+// desk objects) unplannable.
+inline const float kPlanningSafetyMargin = NavigationClearance::kPlanningRadius - kRobotCollisionRadius;
 
 // One grid cell coordinate - (column, row), matching ExplorationMap's own
 // worldToCell()/cellAt() convention exactly.
@@ -119,13 +136,52 @@ public:
     // callers that need a fresh plan after the map has changed must
     // construct a new GridPathPlanner, never reuse a stale one across
     // multiple planPath() calls spanning map updates.
-    explicit GridPathPlanner(const ExplorationMap& map) noexcept;
+    //
+    // `extraBlockedCells` (Phase 13X blocker fix, deadlock repair):
+    // additional cells treated as NOT traversable, on top of whatever
+    // `map` itself already implies - never mutates `map`. Empty by default
+    // (every pre-existing caller/behavior is completely unchanged). Exists
+    // for exactly one caller-facing reason: ExplorationMap's own Occupied/
+    // Free classification is honest sensor-derived data, but it can never
+    // capture EVERY real-world obstruction a live perception+collision
+    // system encounters (e.g. geometry a 3-ray sensor array's cone simply
+    // never crosses, even though the robot's own circular body collides
+    // with it) - when ReactiveObstacleAvoidance's bounded TurnAway proves,
+    // via an actual full local sweep, that a specific cell the global
+    // route keeps proposing is not really passable, the caller (main3d.cpp)
+    // may pass that cell here so THIS replan (and only this one - never
+    // persisted inside GridPathPlanner/ExplorationMap itself) routes
+    // around it instead of deterministically recomputing the exact same
+    // doomed route from an unchanged map. This is an additional
+    // traversability CONSTRAINT applied on top of the same deterministic
+    // A* search - never a different algorithm, never a search over
+    // multiple candidate blacklists.
+    explicit GridPathPlanner(const ExplorationMap& map, const std::vector<GridCoord>& extraBlockedCells = {}) noexcept;
 
     // True if (col, row) is inside the grid, Free, and at least
     // (RobotCollision::kRobotCollisionRadius + kPlanningSafetyMargin) away
     // from every Occupied cell and every TableSurface edge - see class
     // docs above. O(1) - precomputed at construction.
     bool isTraversable(int col, int row) const noexcept;
+
+    // Phase 13X final blocker fix ("PATH SIMPLIFICATION AUDIT"): the same
+    // clearance predicate isTraversable()'s own per-cell precomputation is
+    // built from, but evaluated at an arbitrary CONTINUOUS world point
+    // rather than only at a cell's own center - i.e. "is `point` itself
+    // (not merely the grid cell it happens to fall in) at least the
+    // planning clearance away from every occupied cell's square footprint
+    // and every table edge, AND does its enclosing cell still pass
+    // isTraversable() (Free, not Unknown/Occupied, not table-edge-close,
+    // not in `extraBlockedCells`)?" simplifyPath() below uses this at many
+    // points along a candidate straight shortcut segment (not merely the
+    // Bresenham-sampled grid cells the old, pre-Phase-13X-final-fix
+    // implementation checked) so a simplified waypoint pair is proven
+    // continuously clear, not merely clear at the handful of grid cells a
+    // discrete line-walk happened to sample. Not free (O(occupied cells
+    // near `point`) per call) - only ever called from simplifyPath() at a
+    // bounded number of sub-cell sample points per segment, never from
+    // planPath()'s own per-frame-cheap A* search.
+    bool isPointClear(const Vec3& point) const noexcept;
 
     int width() const noexcept;
     int height() const noexcept;
@@ -148,6 +204,15 @@ private:
     int width_;
     int height_;
     std::vector<bool> traversable_;
+
+    // Phase 13X final blocker fix: retained (rather than only ever a
+    // constructor-local) so isPointClear() can reuse the exact same
+    // occupied-cell list/clearance/search-radius the constructor's own
+    // per-cell pass already computed - never a second, independently
+    // recomputed copy.
+    std::vector<GridCoord> occupiedCells_;
+    float clearance_ = 0.0F;
+    int inflationRadiusCells_ = 0;
 };
 
 // Deterministic greedy line-of-sight ("string pulling") simplification of

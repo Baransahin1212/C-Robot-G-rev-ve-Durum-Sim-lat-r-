@@ -41,6 +41,18 @@ bool translatingWouldNotHelp(const RobotPose& pose, const TableSurface& table, c
     return aggregateTableOverhang(projectedPose, table) >= currentOverhang;
 }
 
+// Phase 13X blocker fix: plain 2D (x/z) world-space distance between two
+// positions - used only by the new bounded recovery-stall check below
+// (kMaxRecoveryStallFrames's own docs), which needs the robot's ACTUAL
+// committed displacement between calls, never a hypothetical projection
+// (that is what translatingWouldNotHelp() above already covers).
+float distanceWorld(const Vec3& a, const Vec3& b) noexcept
+{
+    const float dx = a.x - b.x;
+    const float dz = a.z - b.z;
+    return std::sqrt((dx * dx) + (dz * dz));
+}
+
 } // namespace
 
 void TableEdgeSafetyController::beginRecovery(const RobotPose& pose, const TableSurface& table) noexcept
@@ -59,19 +71,54 @@ void TableEdgeSafetyController::beginRecovery(const RobotPose& pose, const Table
 void TableEdgeSafetyController::update(const CliffSensorReadings& readings, const RobotPose& pose,
                                         const TableSurface& table) noexcept
 {
+    recoveryBlockedThisUpdate_ = false;
+
     if (state_ == RecoveryState::Inactive)
     {
         if (readings.anyFrontCliff())
         {
             beginRecovery(pose, table);
             state_ = RecoveryState::BackingAway;
+            stallAnchorPosition_ = pose.position;
+            framesSinceStallProgress_ = 0;
         }
         else if (readings.anyRearCliff())
         {
             beginRecovery(pose, table);
             state_ = RecoveryState::MovingForwardFromRearEdge;
+            stallAnchorPosition_ = pose.position;
+            framesSinceStallProgress_ = 0;
         }
         return;
+    }
+
+    // Phase 13X blocker fix: bounded recovery-stall check - see
+    // kMaxRecoveryStallFrames's own docs. Only the three TRANSLATING
+    // states can stall this way (Turning never translates the robot's
+    // center at all, so "position frozen" is its own normal operation,
+    // not a defect). Checked BEFORE the transition switch below, using
+    // the ACTUAL pose this call was handed - if it fires, this call is
+    // done: the switch below is skipped entirely (state_ is already
+    // Inactive) and the caller sees recoveryBlockedThisUpdate() true this
+    // one time.
+    if (state_ == RecoveryState::BackingAway || state_ == RecoveryState::MovingForwardFromRearEdge ||
+        state_ == RecoveryState::AdvancingInward)
+    {
+        if (distanceWorld(pose.position, stallAnchorPosition_) > kStallProgressEpsilon)
+        {
+            stallAnchorPosition_ = pose.position;
+            framesSinceStallProgress_ = 0;
+        }
+        else
+        {
+            ++framesSinceStallProgress_;
+            if (framesSinceStallProgress_ >= kMaxRecoveryStallFrames)
+            {
+                state_ = RecoveryState::Inactive;
+                recoveryBlockedThisUpdate_ = true;
+                return;
+            }
+        }
     }
 
     // A recovery target exists for the remainder of this function (the
@@ -137,6 +184,15 @@ void TableEdgeSafetyController::update(const CliffSensorReadings& readings, cons
                 // spin in place. Only release directly if support is
                 // ALSO already fine.
                 state_ = supportSafe ? RecoveryState::Inactive : RecoveryState::AdvancingInward;
+                if (state_ == RecoveryState::AdvancingInward)
+                {
+                    // Fresh stall window for the newly-entered translating
+                    // state (Phase 13X blocker fix) - never inherits
+                    // BackingAway/MovingForwardFromRearEdge's own counter,
+                    // which may already have been close to its bound.
+                    stallAnchorPosition_ = pose.position;
+                    framesSinceStallProgress_ = 0;
+                }
             }
             // else: remain Turning - recoveryWheelSpeeds() keeps rotating
             // toward the target heading via the shortest-path direction.
@@ -186,6 +242,11 @@ bool TableEdgeSafetyController::active() const noexcept
 TableEdgeSafetyController::RecoveryState TableEdgeSafetyController::state() const noexcept
 {
     return state_;
+}
+
+bool TableEdgeSafetyController::recoveryBlockedThisUpdate() const noexcept
+{
+    return recoveryBlockedThisUpdate_;
 }
 
 WheelSpeeds TableEdgeSafetyController::recoveryWheelSpeeds() const noexcept

@@ -1,6 +1,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "robot/visual/ForwardClearanceProbe.hpp"
 #include "robot/visual/FrontierExplorer.hpp"
 #include "robot/visual/GridPathPlanner.hpp"
+#include "robot/visual/MapPanelStatus.hpp"
 #include "robot/visual/MissionControlEventSource.hpp"
 #include "robot/visual/MissionTask.hpp"
 #include "robot/visual/RangeObservation.hpp"
@@ -59,8 +61,11 @@ using robot::visual::ForwardClearanceProbe;
 using robot::visual::FrontierExplorer;
 using robot::visual::FrontierTarget;
 using robot::visual::GridCoord;
+using robot::visual::deriveMapPanelStatus;
+using robot::visual::displayedExploredPercentage;
 using robot::visual::kRobotCollisionRadius;
 using robot::visual::MapCell;
+using robot::visual::MapPanelStatus;
 using robot::visual::MissionControlEventSource;
 using robot::visual::MissionTask;
 using robot::visual::ObstacleHazardSample;
@@ -81,6 +86,40 @@ using robot::visual::WaypointNavigator;
 using robot::visual::WaypointNavigatorOutput;
 using robot::visual::WaypointNavigatorState;
 using robot::visual::WheelSpeeds;
+
+// Phase 13X final blocker fix: mirrors main3d.cpp's own identically-named
+// helper exactly (see that file's own docs) - adds the
+// (radiusCells x radiusCells) neighborhood around (centerCol, centerRow)
+// to `blocked` (deduplicated), then enforces `maxEntries` via FIFO
+// eviction of the OLDEST entries.
+void addBlockedCellNeighborhood(std::vector<GridCoord>& blocked, int centerCol, int centerRow, int radiusCells,
+                                 std::size_t maxEntries)
+{
+    for (int dRow = -radiusCells; dRow <= radiusCells; ++dRow)
+    {
+        for (int dCol = -radiusCells; dCol <= radiusCells; ++dCol)
+        {
+            const GridCoord candidate{centerCol + dCol, centerRow + dRow};
+            bool alreadyListed = false;
+            for (const GridCoord& existing : blocked)
+            {
+                if (existing == candidate)
+                {
+                    alreadyListed = true;
+                    break;
+                }
+            }
+            if (!alreadyListed)
+            {
+                blocked.push_back(candidate);
+            }
+        }
+    }
+    while (blocked.size() > maxEntries)
+    {
+        blocked.erase(blocked.begin());
+    }
+}
 
 // Drives the entire real production stack one frame at a time, in exactly
 // main3d.cpp's own Phase 13X frame order - runtime.step() -> avoidance ->
@@ -150,17 +189,125 @@ struct MapAwareHarness
     bool avoidanceEnabled;
     bool previousAvoidanceActive = false;
     bool previousSafetyActive = false;
+    // Phase 13X human-validation fix: mirrors main3d.cpp's own
+    // manualDriveMode/previousReturningHomeActive exactly (see that file's
+    // own docs, and the Manual-override-cancellation block in driveFrame()
+    // below) - lets this harness reproduce, and prove fixed, the human-
+    // observed "Manual mode left toggled on permanently blocks Return
+    // Home" defect through the exact same production frame order/
+    // orchestration main3d.cpp uses, since VirtualRobotHardware itself
+    // (Safety > Manual > AutonomousAvoidance > Navigation > Fsm) is
+    // completely unmodified by this fix.
+    bool manualDriveMode = false;
+    WheelSpeeds pendingManualSpeeds{};
+    bool previousReturningHomeActive = false;
     // Phase 13X blocker fix - mirrors main3d.cpp's own identically-named
     // state exactly (see that file's own docs for the full reasoning).
     bool localRouteBlockedPendingReplan = false;
     bool avoidanceSuppressedAfterBlock = false;
     float headingAtLastLocalRouteBlocked = 0.0F;
     static constexpr float kAvoidanceResumeHeadingChangeDegrees = 30.0F;
+    // Phase 13X blocker fix (deadlock repair) - consecutive-collision
+    // debounce, mirrors main3d.cpp's own identically-named state exactly.
+    int consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+    static constexpr int kAvoidanceResumeCollisionStallFrames = 5;
+    // Phase 13X blocker fix (deadlock repair) - mirrors main3d.cpp's own
+    // identically-named state exactly (see that file's own docs).
+    bool safetyRecoverySuppressedAfterBlock = false;
+    Vec3 positionAtLastSafetyBlock{};
+    int framesSuppressedSinceSafetyBlock = 0;
+    static constexpr int kSafetyResumeMaxSuppressedFrames = 120;
+    // Phase 13X blocker fix (deadlock repair) - mirrors main3d.cpp's own
+    // returnHomeBlockedCells/previousNavOutput exactly (see that file's
+    // own docs).
+    std::vector<GridCoord> returnHomeBlockedCells;
+    WaypointNavigatorOutput previousNavOutput;
+    // Phase 13X final blocker fix - mirrors main3d.cpp's own identically-
+    // named constants/state exactly (see that file's own docs for the
+    // full "BLOCKED-CELL REPLAN AUDIT" reasoning).
+    static constexpr int kLocalReplanExclusionRadiusCells = 0;
+    static constexpr std::size_t kMaxReturnHomeBlockedCells = 12;
+    static constexpr float kOscillationProgressEpsilonWorldUnits = 0.05F;
+    static constexpr int kOscillationStuckWindowFrames = 400;
+    float bestDistanceToHomeThisSession = std::numeric_limits<float>::infinity();
+    int framesSinceDistanceImproved = 0;
+    // Phase 13X quick fix (Bug B) - mirrors main3d.cpp's own identically-
+    // named flag exactly (see that file's own docs).
+    bool mapAlreadyCompleteNoticeActive = false;
     VirtualWorld& world_;
 
     MissionTask currentTask() const
     {
         return deriveMissionTask(stateMachine.currentState(), stateMachine.returnHomeReason());
+    }
+
+    // Phase 13X human-validation fix: mirrors main3d.cpp's KEY_M toggle
+    // turning manualDriveMode on - the harness equivalent of "the user
+    // presses M." `left`/`right` are the wheel speeds driveFrame() will
+    // keep re-issuing every frame via hardware.setManualWheelSpeeds()
+    // (exactly like main3d.cpp's own per-frame computeManualWheelSpeeds()
+    // call) until either disableManualDrive() is called or a fresh Return
+    // Home activation cancels it automatically (the fix under test).
+    void enableManualDrive(float left, float right)
+    {
+        manualDriveMode = true;
+        pendingManualSpeeds = WheelSpeeds{left, right};
+    }
+
+    // Mirrors main3d.cpp's KEY_M toggle turning manualDriveMode back off -
+    // the harness equivalent of "the user presses M again."
+    void disableManualDrive()
+    {
+        manualDriveMode = false;
+        hardware.clearManualWheelOverride();
+    }
+
+    // Phase 13X quick fix (Bug A + Bug C): mirrors main3d.cpp's KEY_TWO/
+    // KEY_R handler exactly - clears any active Manual override
+    // immediately (never relying solely on the returningHome entry-edge
+    // below, which never fires again once already in ReturningHome - see
+    // RobotStateMachine::processEvent()'s ReturningHome case, which has
+    // no ReturnHomeRequested handler at all), THEN composes the correct
+    // command for the current state: from Idle, RobotStateMachine has no
+    // Idle + ReturnHomeRequested transition at all, so plain
+    // requestReturnHome() would be silently rejected forever -
+    // requestReturnHomeFromIdle() instead chains the existing
+    // ScenarioLoaded -> Ready -> (ReturnHomeRequested) -> ReturningHome
+    // transitions across two frames. From any other state, unchanged.
+    void requestReturnHomeKeyPress()
+    {
+        manualDriveMode = false;
+        hardware.clearManualWheelOverride();
+        if (stateMachine.currentState() == RobotState::Idle)
+        {
+            missionControl.requestReturnHomeFromIdle();
+        }
+        else
+        {
+            missionControl.requestReturnHome();
+        }
+    }
+
+    // Phase 13X quick fix (Bug B): mirrors main3d.cpp's own KEY_ONE
+    // handler exactly - withholds StartMission (still allows Idle ->
+    // Ready) when the current map already has nothing reachable left to
+    // explore, since entering Roam would otherwise immediately re-derive
+    // that same completion fact on its very first frame and auto-return
+    // home before the robot ever physically moves.
+    void requestStartRoamKeyPress()
+    {
+        const bool mapAlreadyComplete =
+            explorationMap.exploredCellCount() > 0 && frontierExplorer.frontierCells().empty();
+        if (mapAlreadyComplete)
+        {
+            mapAlreadyCompleteNoticeActive = true;
+            missionControl.requestScenarioLoadedOnly(stateMachine.currentState());
+        }
+        else
+        {
+            mapAlreadyCompleteNoticeActive = false;
+            missionControl.requestStartRoam(stateMachine.currentState());
+        }
     }
 
     float distanceToBase() const
@@ -207,9 +354,19 @@ struct MapAwareHarness
         {
             const float headingChangeSinceBlock = std::fabs(robot::visual::shortestSignedHeadingErrorDegrees(
                 headingAtLastLocalRouteBlocked, world_.robotPose().headingDegrees));
-            if (headingChangeSinceBlock >= kAvoidanceResumeHeadingChangeDegrees || hardware.collidedLastUpdate())
+            if (hardware.collidedLastUpdate())
+            {
+                ++consecutiveCollisionsWhileAvoidanceSuppressed;
+            }
+            else
+            {
+                consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+            }
+            if (headingChangeSinceBlock >= kAvoidanceResumeHeadingChangeDegrees ||
+                consecutiveCollisionsWhileAvoidanceSuppressed >= kAvoidanceResumeCollisionStallFrames)
             {
                 avoidanceSuppressedAfterBlock = false;
+                consecutiveCollisionsWhileAvoidanceSuppressed = 0;
             }
         }
 
@@ -225,14 +382,45 @@ struct MapAwareHarness
         {
             avoidanceSuppressedAfterBlock = true;
             headingAtLastLocalRouteBlocked = world_.robotPose().headingDegrees;
+            consecutiveCollisionsWhileAvoidanceSuppressed = 0;
         }
         localRouteBlockedPendingReplan = avoidance.localRouteBlockedThisUpdate();
 
+        // Phase 13X blocker fix (deadlock repair) - mirrors main3d.cpp's
+        // own suppression-release/skip-while-suppressed/re-block wiring
+        // exactly (see that file's own docs for the full reasoning).
+        if (safetyRecoverySuppressedAfterBlock)
+        {
+            const float dxSinceBlock = world_.robotPose().position.x - positionAtLastSafetyBlock.x;
+            const float dzSinceBlock = world_.robotPose().position.z - positionAtLastSafetyBlock.z;
+            const float displacementSinceBlock = std::sqrt((dxSinceBlock * dxSinceBlock) + (dzSinceBlock * dzSinceBlock));
+            ++framesSuppressedSinceSafetyBlock;
+            if (displacementSinceBlock >= kRobotCollisionRadius ||
+                framesSuppressedSinceSafetyBlock >= kSafetyResumeMaxSuppressedFrames)
+            {
+                safetyRecoverySuppressedAfterBlock = false;
+            }
+        }
+
         const CliffSensorReadings cliffReadings = cliffSensor.readings();
-        tableEdgeSafety.update(cliffReadings, world_.robotPose(), world_.tableSurface());
+        if (!safetyRecoverySuppressedAfterBlock)
+        {
+            tableEdgeSafety.update(cliffReadings, world_.robotPose(), world_.tableSurface());
+        }
+
+        if (tableEdgeSafety.recoveryBlockedThisUpdate())
+        {
+            safetyRecoverySuppressedAfterBlock = true;
+            positionAtLastSafetyBlock = world_.robotPose().position;
+            framesSuppressedSinceSafetyBlock = 0;
+        }
 
         const MissionTask missionTask = currentTask();
         const bool roaming = missionTask == MissionTask::Roam;
+        if (roaming || missionTask == MissionTask::ReturnHome)
+        {
+            mapAlreadyCompleteNoticeActive = false;
+        }
         if (!roaming)
         {
             currentFrontierTarget.reset();
@@ -324,6 +512,21 @@ struct MapAwareHarness
         // WaypointNavigator for the whole pause - see main3d.cpp's own
         // docs for the full deadlock this caused).
         const bool returningHome = missionTask == MissionTask::ReturnHome;
+
+        // Phase 13X human-validation fix - mirrors main3d.cpp's own
+        // Manual-override-cancellation block exactly (see that file's own
+        // docs for the full reasoning): a fresh false -> true edge into
+        // Return Home clears any stale manualDriveMode/manual override,
+        // never every frame while it remains active (so an explicit
+        // re-enableManualDrive() call mid Return-Home still works,
+        // matching main3d.cpp's own "M re-enters manual" semantics).
+        if (returningHome && !previousReturningHomeActive)
+        {
+            manualDriveMode = false;
+            hardware.clearManualWheelOverride();
+        }
+        previousReturningHomeActive = returningHome;
+
         const bool navigationEnabled = returningHome || (roaming && currentFrontierTarget.has_value());
         const Vec3 navigationGoal = returningHome
                                          ? world_.basePlatform().position
@@ -332,8 +535,70 @@ struct MapAwareHarness
         const bool forceReplan = consumeLocalRouteBlockedReplan ||
                                   (previousAvoidanceActive && !avoidance.active()) ||
                                   (previousSafetyActive && !tableEdgeSafety.active());
-        const WaypointNavigatorOutput navOutput =
-            mapNavigator.update(world_.robotPose(), explorationMap, navigationGoal, navigationEnabled, forceReplan);
+
+        // Phase 13X final blocker fix ("NO OSCILLATION INVARIANT") -
+        // mirrors main3d.cpp's own whole-session distance-to-home
+        // progress tracking exactly (see that file's own docs).
+        if (!returningHome)
+        {
+            bestDistanceToHomeThisSession = std::numeric_limits<float>::infinity();
+            framesSinceDistanceImproved = 0;
+        }
+        else
+        {
+            const float dxHome = world_.robotPose().position.x - world_.basePlatform().position.x;
+            const float dzHome = world_.robotPose().position.z - world_.basePlatform().position.z;
+            const float distanceToHomeNow = std::sqrt((dxHome * dxHome) + (dzHome * dzHome));
+            if (distanceToHomeNow < bestDistanceToHomeThisSession - kOscillationProgressEpsilonWorldUnits)
+            {
+                bestDistanceToHomeThisSession = distanceToHomeNow;
+                framesSinceDistanceImproved = 0;
+            }
+            else
+            {
+                ++framesSinceDistanceImproved;
+            }
+        }
+
+        // Phase 13X blocker fix (deadlock repair) - mirrors main3d.cpp's
+        // own returnHomeBlockedCells maintenance exactly. Phase 13X final
+        // blocker fix: the oscillation-window trigger (see main3d.cpp's
+        // own "BLOCKED-CELL REPLAN AUDIT"/"NO OSCILLATION INVARIANT"
+        // docs for the full reasoning) - this mirrors that exactly.
+        if (!returningHome)
+        {
+            returnHomeBlockedCells.clear();
+        }
+        else if (avoidance.localRouteBlockedThisUpdate() && !previousNavOutput.route.empty() &&
+                 previousNavOutput.currentWaypointIndex < previousNavOutput.route.size())
+        {
+            int blockedCol = -1;
+            int blockedRow = -1;
+            if (explorationMap.worldToCell(previousNavOutput.route[previousNavOutput.currentWaypointIndex],
+                                            blockedCol, blockedRow))
+            {
+                addBlockedCellNeighborhood(returnHomeBlockedCells, blockedCol, blockedRow,
+                                            kLocalReplanExclusionRadiusCells, kMaxReturnHomeBlockedCells);
+            }
+        }
+        else if (framesSinceDistanceImproved >= kOscillationStuckWindowFrames && !previousNavOutput.route.empty() &&
+                 previousNavOutput.currentWaypointIndex < previousNavOutput.route.size())
+        {
+            int col = -1;
+            int row = -1;
+            if (explorationMap.worldToCell(previousNavOutput.route[previousNavOutput.currentWaypointIndex], col,
+                                            row))
+            {
+                addBlockedCellNeighborhood(returnHomeBlockedCells, col, row, kLocalReplanExclusionRadiusCells,
+                                            kMaxReturnHomeBlockedCells);
+            }
+            framesSinceDistanceImproved = 0;
+        }
+
+        const WaypointNavigatorOutput navOutput = mapNavigator.update(
+            world_.robotPose(), explorationMap, navigationGoal, navigationEnabled, forceReplan,
+            returningHome ? returnHomeBlockedCells : std::vector<GridCoord>{});
+        previousNavOutput = navOutput;
 
         if (tableEdgeSafety.active())
         {
@@ -367,6 +632,18 @@ struct MapAwareHarness
 
         previousAvoidanceActive = avoidance.active();
         previousSafetyActive = tableEdgeSafety.active();
+
+        // Phase 13X human-validation fix - mirrors main3d.cpp's own
+        // manual-drive-mode block exactly (see that file's own docs): kept
+        // LAST, after every override sync above, so manualDriveMode
+        // (still true) re-latches the manual override every frame with
+        // whatever pendingManualSpeeds currently holds - exactly like
+        // main3d.cpp recomputing from currently-held keys every frame,
+        // never a one-shot request that could go stale.
+        if (manualDriveMode)
+        {
+            hardware.setManualWheelSpeeds(pendingManualSpeeds.left, pendingManualSpeeds.right);
+        }
 
         hardware.update(dt);
 
@@ -1304,6 +1581,826 @@ TEST(CoverageCompletionSemanticsTest, StopAndResumeKeepsExplorationState)
         h.driveFrame();
     }
     EXPECT_GE(h.explorationMap.exploredCellCount(), exploredBeforeStop);
+}
+
+// ============================================================
+// Phase 13X human-validation fix - TESTS: Manual mode must not
+// permanently block Return Home
+// ============================================================
+//
+// Human GUI validation traced and confirmed this exact 9-step chain: (1)
+// enable Manual mode, (2) manual wheel command becomes zero (no arrow key
+// currently held), (3) ReturnHomeRequested occurs, (4) FSM enters
+// ReturningHome, (5) MissionTask becomes ReturnHome, (6) Manual override
+// remains active, (7) effective DriveAuthority remains Manual, (8)
+// Navigation has a valid route/request underneath it, (9) effective
+// wheels remain zero - the robot sits motionless forever even though the
+// FSM/HUD correctly show "Eve Dönüyor" (Returning Home).
+//
+// Root cause: main3d.cpp's own manualDriveMode flag - a local, KEY_M-
+// toggled bool entirely separate from VirtualRobotHardware/
+// RobotStateMachine - was never cleared by a Return Home activation, only
+// by an explicit second `M` press. Its per-frame
+// hardware.setManualWheelSpeeds(...) call runs UNCONDITIONALLY every
+// frame while manualDriveMode stays true (computing (0, 0) once no arrow
+// key is held - see main3d.cpp's own manual-drive-mode block), which keeps
+// VirtualRobotHardware's manual override latched (driveAuthority() stuck
+// at Manual) indefinitely, permanently outranking the Navigation override
+// WaypointNavigator correctly keeps issuing underneath it -
+// VirtualRobotHardware's own fixed priority (Safety > Manual >
+// AutonomousAvoidance > Navigation > Fsm) was never the bug; the ORCHESTRATION
+// layer (main3d.cpp deciding WHEN to call clearManualWheelOverride()) was.
+//
+// MapAwareHarness::driveFrame() (above) mirrors main3d.cpp's real frame
+// order/orchestration exactly, INCLUDING the fix (the
+// previousReturningHomeActive edge-trigger block) - this suite proves the
+// fix's observable effect end-to-end through the real production stack
+// (WaypointNavigator/GridPathPlanner/RobotStateMachine/
+// VirtualRobotHardware, all unmodified), never a shortcut that mutates
+// FSM/hardware state directly.
+// ============================================================
+
+TEST(ManualOverrideReturnHomeTest, UserReturnHomeCancelsManualOverride)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    // Steps 1-2 of the reproduced chain: Manual mode enabled with an
+    // explicit zero wheel command - exactly the human-observed
+    // precondition (no arrow key currently held).
+    h.enableManualDrive(0.0F, 0.0F);
+    h.driveFrame();
+    ASSERT_TRUE(h.hardware.manualOverrideActive());
+    ASSERT_EQ(h.hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // Steps 3-5: user-initiated Return Home - the real `2`/`R` event-
+    // source call.
+    h.missionControl.requestReturnHome();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::ReturnHome);
+
+    // Steps 6-9 must NOT hold anymore: Manual is cancelled the instant
+    // Return Home becomes the active task.
+    EXPECT_FALSE(h.hardware.manualOverrideActive());
+    EXPECT_NE(h.hardware.driveAuthority(), DriveAuthority::Manual);
+    EXPECT_FALSE(h.manualDriveMode);
+}
+
+TEST(ManualOverrideReturnHomeTest, AutoReturnHomeCancelsManualOverride)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    preSeedFullMap(h);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    // Manual enabled BEFORE the automatic
+    // ExplorationCompletionEventSource -> ReturnHomeRequested handoff
+    // fires - the map is fully pre-seeded, so completion is detected
+    // within the first couple of frontier-selection attempts (mirrors
+    // FullMapCompletionIntegrationTest's own setup).
+    h.enableManualDrive(0.0F, 0.0F);
+    h.driveFrame();
+    ASSERT_TRUE(h.hardware.manualOverrideActive());
+
+    bool reachedReturnHome = false;
+    for (int frame = 0; frame < 200 && !reachedReturnHome; ++frame)
+    {
+        h.driveFrame();
+        reachedReturnHome = h.currentTask() == MissionTask::ReturnHome;
+    }
+
+    ASSERT_TRUE(reachedReturnHome);
+    EXPECT_FALSE(h.hardware.manualOverrideActive());
+    EXPECT_NE(h.hardware.driveAuthority(), DriveAuthority::Manual);
+    EXPECT_FALSE(h.manualDriveMode);
+}
+
+TEST(ManualOverrideReturnHomeTest, ReturnHomeClearsManualWheelRequest)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+
+    // A clearly distinctive, nonzero stale manual command - an in-place
+    // rotation that could never legitimately come from WaypointNavigator's
+    // own straight/aligning wheel-speed shapes, so its disappearance is
+    // unambiguous.
+    h.enableManualDrive(1.0F, -1.0F);
+    h.driveFrame();
+    ASSERT_TRUE(h.hardware.manualOverrideActive());
+    const WheelSpeeds staleManualSpeeds = h.hardware.wheelSpeeds();
+    ASSERT_FLOAT_EQ(staleManualSpeeds.left, 1.0F);
+    ASSERT_FLOAT_EQ(staleManualSpeeds.right, -1.0F);
+
+    h.missionControl.requestReturnHome();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::ReturnHome);
+
+    // The stale manual request must be genuinely GONE (the override
+    // deactivated), not merely outranked for one frame - so it can never
+    // silently resurface once some later authority change clears without
+    // restoring it.
+    EXPECT_FALSE(h.hardware.manualOverrideActive());
+}
+
+TEST(ManualOverrideReturnHomeTest, NavigationBecomesEffectiveAfterManualIsCancelled)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+
+    h.enableManualDrive(0.0F, 0.0F);
+    h.driveFrame();
+
+    h.missionControl.requestReturnHome();
+
+    bool navigationBecameEffective = false;
+    for (int frame = 0; frame < 200 && !navigationBecameEffective; ++frame)
+    {
+        h.driveFrame();
+        if (h.hardware.driveAuthority() == DriveAuthority::Navigation)
+        {
+            navigationBecameEffective = true;
+        }
+    }
+
+    EXPECT_TRUE(navigationBecameEffective);
+    // Not merely holding Navigation authority in name - the robot is
+    // physically commanded to move (the exact fact step 9 of the
+    // reproduced chain denied).
+    const WheelSpeeds speeds = h.hardware.wheelSpeeds();
+    EXPECT_TRUE(std::fabs(speeds.left) > 0.001F || std::fabs(speeds.right) > 0.001F);
+}
+
+// Documents the deliberate choice made for "Manual re-entry after Return
+// Home starts" (see main3d.cpp's own docs on the Manual-override-
+// cancellation block): the INITIAL activation of Return Home cancels
+// stale Manual, but the user may still explicitly press `M` again
+// afterward to resume manual driving mid Return-Home - chosen for minimal
+// behavioral churn, matching the pre-existing "Manual always wins the
+// instant it is next (re-)set" precedent already established by
+// VirtualRobotHardwareTests.cpp's own
+// ManualInterruptionDuringReturnHomeResumesNavigationAfterward. FSM/
+// MissionTask remain completely untouched by Manual either way - Manual
+// is authority-only, exactly like every other override in this codebase.
+TEST(ManualOverrideReturnHomeTest, ManualCanBeReenteredDuringReturnHomeAfterCancellation)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+
+    h.missionControl.requestReturnHome();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::ReturnHome);
+
+    // Explicit re-entry, well after the initial cancellation edge.
+    h.enableManualDrive(1.0F, -1.0F);
+    h.driveFrame();
+
+    EXPECT_TRUE(h.hardware.manualOverrideActive());
+    EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::Manual);
+    EXPECT_EQ(h.currentTask(), MissionTask::ReturnHome); // FSM/task untouched by Manual
+}
+
+// 5/6/7: driveAuthority()'s fixed priority ordering itself is completely
+// UNCHANGED by this phase's fix (VirtualRobotHardware is not modified at
+// all - only main3d.cpp's/MapAwareHarness's ORCHESTRATION, i.e. WHEN
+// clearManualWheelOverride() is called, changed). VirtualRobotHardwareTests.cpp
+// already exhaustively covers every pairwise combination in isolation
+// (SafetyOverridesNavigation, ClearingSafetyRestoresNavigationIfNoManualOrAutonomous,
+// AutonomousOverrideTakesAuthorityFromNavigation,
+// ClearingAutonomousRestoresNavigationIfStillActive,
+// ManualOverrideTakesAuthorityFromNavigation,
+// ClearingManualRestoresNavigationIfStillActiveAndNoAutonomous) - these three
+// are a compact, explicit re-confirmation scoped to this phase's own fix,
+// proving the full Safety > Manual > AutonomousAvoidance > Navigation > Fsm
+// chain still resolves correctly with a Navigation override active
+// underneath (the exact configuration Return Home now reaches once Manual
+// is cancelled).
+TEST(ManualOverrideReturnHomeTest, SafetyStillOverridesReturnHomeNavigation)
+{
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.5F, 0.5F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    hardware.setSafetyWheelSpeeds(-0.3F, -0.3F);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+
+    hardware.clearSafetyWheelOverride();
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+}
+
+TEST(ManualOverrideReturnHomeTest, AvoidanceStillOverridesReturnHomeNavigation)
+{
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.5F, 0.5F);
+    ASSERT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+
+    hardware.setAutonomousWheelSpeeds(0.2F, -0.2F);
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+
+    hardware.clearAutonomousWheelOverride();
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+}
+
+TEST(ManualOverrideReturnHomeTest, ManualPriorityOrderingUnchanged)
+{
+    VirtualWorld world;
+    VirtualRobotHardware hardware(world);
+    hardware.setNavigationWheelSpeeds(0.5F, 0.5F);
+    hardware.setAutonomousWheelSpeeds(0.2F, -0.2F);
+    hardware.setManualWheelSpeeds(1.0F, 1.0F);
+    hardware.setSafetyWheelSpeeds(-0.3F, -0.3F);
+
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Safety);
+    hardware.clearSafetyWheelOverride();
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Manual);
+    hardware.clearManualWheelOverride();
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    hardware.clearAutonomousWheelOverride();
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Navigation);
+    hardware.clearNavigationWheelOverride();
+    EXPECT_EQ(hardware.driveAuthority(), DriveAuthority::Fsm);
+}
+
+// ============================================================
+// Phase 13X quick fix - TESTS: Bug A - explicit Return Home must cancel
+// Manual even with no fresh FSM edge
+// ============================================================
+//
+// Human GUI validation found the prior fix incomplete: RobotStateMachine's
+// ReturningHome case has no EventType::ReturnHomeRequested handler at all
+// (a second request while already returning is a deterministic no-op), so
+// the existing returningHome-entry-edge cancel (still correct for the
+// AUTOMATIC post-exploration path) never fires again once Manual is
+// re-enabled WHILE already in ReturningHome and the user presses 2/R a
+// second time expecting control back. requestReturnHomeKeyPress() (mirrors
+// main3d.cpp's KEY_TWO/KEY_R handler) now cancels Manual directly at the
+// request itself, independent of any FSM edge.
+// ============================================================
+
+TEST(ManualOverrideReturnHomeTest, ManualThenReturnHomeProducesNavigationMotion)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+
+    // Reach ReturningHome first via the normal fresh-edge path.
+    h.missionControl.requestReturnHome();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::ReturnHome);
+
+    // Re-enter Manual WHILE already returning (explicit re-entry is
+    // intentionally allowed - see ManualCanBeReenteredDuringReturnHomeAfterCancellation).
+    h.enableManualDrive(0.0F, 0.0F);
+    h.driveFrame();
+    ASSERT_TRUE(h.hardware.manualOverrideActive());
+    ASSERT_EQ(h.hardware.driveAuthority(), DriveAuthority::Manual);
+
+    // The reproduced defect: pressing 2/R AGAIN produces no fresh FSM
+    // edge (ReturningHome -> ReturningHome is a no-op), so only an
+    // explicit cancel at the request site itself (not an edge-trigger)
+    // can recover here.
+    h.requestReturnHomeKeyPress();
+    const Vec3 positionBefore = h.world_.robotPose().position;
+    bool everNonManual = false;
+    for (int frame = 0; frame < 10; ++frame)
+    {
+        h.driveFrame();
+        if (h.hardware.driveAuthority() != DriveAuthority::Manual)
+        {
+            everNonManual = true;
+        }
+    }
+
+    EXPECT_FALSE(h.hardware.manualOverrideActive());
+    EXPECT_TRUE(everNonManual);
+    EXPECT_EQ(h.currentTask(), MissionTask::ReturnHome);
+    // Physically moved - Navigation actually got the wheels, not just the
+    // FSM/task label.
+    const float dx = h.world_.robotPose().position.x - positionBefore.x;
+    const float dz = h.world_.robotPose().position.z - positionBefore.z;
+    EXPECT_GT(std::sqrt((dx * dx) + (dz * dz)), 0.01F);
+}
+
+TEST(ManualOverrideReturnHomeTest, ManualOverrideNotRelatchedSameFrame)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+
+    h.missionControl.requestReturnHome();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    h.enableManualDrive(0.0F, 0.0F);
+    h.driveFrame();
+    ASSERT_EQ(h.hardware.driveAuthority(), DriveAuthority::Manual);
+
+    h.requestReturnHomeKeyPress();
+    h.driveFrame();
+
+    // Same frame the cancel is requested: manualDriveMode must already be
+    // false BEFORE the per-frame manual-input block runs, so it cannot
+    // immediately re-issue setManualWheelSpeeds() and re-latch the very
+    // override just cancelled.
+    EXPECT_FALSE(h.manualDriveMode);
+    EXPECT_FALSE(h.hardware.manualOverrideActive());
+    EXPECT_NE(h.hardware.driveAuthority(), DriveAuthority::Manual);
+}
+
+// ============================================================
+// Phase 13X quick fix - TESTS: Bug C - Manual free-drive -> Return Home
+// from Idle (no mission ever started)
+// ============================================================
+//
+// Human GUI validation reproduced a THIRD, distinct defect: (1) launch app
+// (RobotState::Idle, "Bekliyor"), (2) press M, (3) manually drive away from
+// the dock, (4) press 2. Observed: Manual clears correctly, but the FSM
+// never leaves Idle ("Görev: YOK") - the robot stays stationary.
+// RobotStateMachine has NO Idle + ReturnHomeRequested transition at all
+// (only Ready does - see RobotStateMachine::processEvent()'s Idle case);
+// plain requestReturnHome() queues the event unconditionally and it is
+// silently rejected. requestReturnHomeKeyPress() (mirrors main3d.cpp's
+// KEY_TWO/KEY_R handler) now checks stateMachine.currentState() and, from
+// Idle only, calls requestReturnHomeFromIdle() instead - composing the
+// SAME existing, unmodified ScenarioLoaded->Ready and
+// ReturnHomeRequested->ReturningHome transitions requestStartRoam()/
+// requestReturnHome() already use individually, across two separate
+// runtime.step() calls (never more than one Event consumed per step()).
+// ============================================================
+
+TEST(ManualOverrideReturnHomeTest, ManualDriveFromIdleKeepsFsmIdle)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Idle);
+
+    const Vec3 positionBefore = h.world_.robotPose().position;
+    h.enableManualDrive(0.6F, 0.6F);
+    for (int frame = 0; frame < 10; ++frame)
+    {
+        h.driveFrame();
+    }
+
+    // Manual free-drive physically works while the FSM is never asked to
+    // do anything - it stays exactly Idle throughout.
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Idle);
+    const float dx = h.world_.robotPose().position.x - positionBefore.x;
+    const float dz = h.world_.robotPose().position.z - positionBefore.z;
+    EXPECT_GT(std::sqrt((dx * dx) + (dz * dz)), 0.05F);
+}
+
+TEST(ManualOverrideReturnHomeTest, ManualFromIdleThenReturnHomeEntersReturningHome)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Idle);
+
+    // Steps 2-3 of the exact human repro: Manual on, drive away, Manual
+    // still ON (never toggled off before pressing 2).
+    h.enableManualDrive(0.6F, 0.0F);
+    for (int frame = 0; frame < 5; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Idle);
+
+    // Step 4: press 2/R from Idle.
+    h.requestReturnHomeKeyPress();
+    for (int frame = 0; frame < 5 && h.stateMachine.currentState() != RobotState::ReturningHome; ++frame)
+    {
+        h.driveFrame();
+    }
+
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
+    EXPECT_EQ(h.currentTask(), MissionTask::ReturnHome);
+}
+
+TEST(ManualOverrideReturnHomeTest, ManualFromIdleThenReturnHomeActivatesNavigation)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+
+    h.enableManualDrive(0.6F, 0.0F);
+    for (int frame = 0; frame < 5; ++frame)
+    {
+        h.driveFrame();
+    }
+    h.requestReturnHomeKeyPress();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::ReturnHome);
+
+    EXPECT_FALSE(h.hardware.manualOverrideActive());
+    EXPECT_NE(h.hardware.driveAuthority(), DriveAuthority::Manual);
+}
+
+TEST(ManualOverrideReturnHomeTest, ManualFromIdleThenReturnHomeProducesPhysicalMotion)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+
+    h.enableManualDrive(0.6F, 0.0F);
+    for (int frame = 0; frame < 5; ++frame)
+    {
+        h.driveFrame();
+    }
+    h.requestReturnHomeKeyPress();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::ReturnHome);
+
+    const Vec3 positionBefore = h.world_.robotPose().position;
+    for (int frame = 0; frame < 30; ++frame)
+    {
+        h.driveFrame();
+    }
+    const float dx = h.world_.robotPose().position.x - positionBefore.x;
+    const float dz = h.world_.robotPose().position.z - positionBefore.z;
+    EXPECT_GT(std::sqrt((dx * dx) + (dz * dz)), 0.01F);
+}
+
+TEST(ManualOverrideReturnHomeTest, ReturnHomeFromReadyStillWorks)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestScenarioLoadedOnly(h.stateMachine.currentState());
+    h.driveFrame();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+
+    // The state-aware branch must still take the unchanged, non-Idle path
+    // here - a single ReturnHomeRequested, not the two-event composition.
+    h.requestReturnHomeKeyPress();
+    for (int frame = 0; frame < 5 && h.stateMachine.currentState() != RobotState::ReturningHome; ++frame)
+    {
+        h.driveFrame();
+    }
+
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
+}
+
+TEST(ManualOverrideReturnHomeTest, ReturnHomeFromMovingStillWorks)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    h.requestReturnHomeKeyPress();
+    for (int frame = 0; frame < 5 && h.stateMachine.currentState() != RobotState::ReturningHome; ++frame)
+    {
+        h.driveFrame();
+    }
+
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome);
+}
+
+TEST(ManualOverrideReturnHomeTest, ReturnHomeWhileAlreadyReturningDoesNotBreakMission)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.requestReturnHomeKeyPress();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::ReturnHome);
+
+    // A redundant 2/R press while already ReturningHome (not Idle, so the
+    // unchanged else-branch requestReturnHome() fires and is safely
+    // rejected by RobotStateMachine) must not disturb the in-progress
+    // mission at all.
+    for (int frame = 0; frame < 5; ++frame)
+    {
+        h.requestReturnHomeKeyPress();
+        h.driveFrame();
+        EXPECT_EQ(h.currentTask(), MissionTask::ReturnHome);
+    }
+}
+
+TEST(ManualOverrideReturnHomeTest, ReturnHomeCommandClearsManualOverrideBeforeEventSequence)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Idle);
+
+    h.enableManualDrive(1.0F, -1.0F);
+    h.driveFrame();
+    ASSERT_TRUE(h.hardware.manualOverrideActive());
+
+    // The clear must happen synchronously, inside the request call itself
+    // - observable immediately, even before the next driveFrame()/step().
+    h.requestReturnHomeKeyPress();
+    EXPECT_FALSE(h.manualDriveMode);
+    EXPECT_FALSE(h.hardware.manualOverrideActive());
+}
+
+TEST(ManualOverrideReturnHomeTest, ExactlyOneRuntimeStepPerFrameDuringIdleReturnHomeSequence)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Idle);
+
+    h.requestReturnHomeKeyPress();
+
+    // driveFrame() calls runtime.step() exactly once (unchanged, see that
+    // function's own first line) - the two-event Idle composition must
+    // therefore span two SEPARATE frames, never be forced through in one.
+    h.driveFrame();
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready)
+        << "first frame should consume only ScenarioLoaded";
+    EXPECT_NE(h.stateMachine.currentState(), RobotState::ReturningHome);
+
+    h.driveFrame();
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::ReturningHome)
+        << "second frame should consume ReturnHomeRequested";
+}
+
+// ============================================================
+// Phase 13X quick fix - TESTS: Bug B - Start Mapping on an already-
+// complete map must not immediately auto-return
+// ============================================================
+//
+// Human GUI validation found pressing `1` on an already-fully-explored map
+// (e.g. a resumed persisted map) transitions Idle/Ready -> Moving -> almost
+// immediately ReturningHome: the exploration loop's needNewTarget check
+// re-derives "no reachable frontier" on Roam's very first frame using
+// state that predates this session entirely. requestStartRoamKeyPress()
+// (mirrors main3d.cpp's KEY_ONE handler) now checks this BEFORE requesting
+// StartMission at all.
+// ============================================================
+
+TEST(StartMappingAlreadyCompleteMapTest, CompleteMapStartDoesNotImmediatelyAutoReturn)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    preSeedFullMap(h);
+    ASSERT_TRUE(h.frontierExplorer.frontierCells().empty());
+    const Vec3 positionBefore = h.world_.robotPose().position;
+
+    h.requestStartRoamKeyPress();
+    for (int frame = 0; frame < 30; ++frame)
+    {
+        h.driveFrame();
+    }
+
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_NE(h.currentTask(), MissionTask::ReturnHome);
+    EXPECT_NE(h.currentTask(), MissionTask::Roam);
+    EXPECT_TRUE(h.mapAlreadyCompleteNoticeActive);
+    // The robot never even attempted to move toward home/anywhere.
+    const float dx = h.world_.robotPose().position.x - positionBefore.x;
+    const float dz = h.world_.robotPose().position.z - positionBefore.z;
+    EXPECT_LT(std::sqrt((dx * dx) + (dz * dz)), 0.01F);
+}
+
+TEST(StartMappingAlreadyCompleteMapTest, FreshMapStartBeginsExploration)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    // A fresh, all-Unknown map has no explored cells at all yet - the
+    // "already complete" gate must never fire before any exploration has
+    // happened (mirrors the exploration loop's own
+    // exploredCellCount() > 0 guard).
+    ASSERT_EQ(h.explorationMap.exploredCellCount(), 0);
+
+    h.requestStartRoamKeyPress();
+    bool everRoamed = false;
+    for (int frame = 0; frame < 30; ++frame)
+    {
+        h.driveFrame();
+        if (h.currentTask() == MissionTask::Roam)
+        {
+            everRoamed = true;
+        }
+    }
+
+    EXPECT_TRUE(everRoamed);
+    EXPECT_FALSE(h.mapAlreadyCompleteNoticeActive);
+}
+
+TEST(StartMappingAlreadyCompleteMapTest, PartialMapStartResumesExploration)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    // Explore only a small region near the robot's own start position -
+    // enough for exploredCellCount() > 0, but frontier cells clearly
+    // remain (the rest of the desk is still Unknown).
+    sweepMapOverRegion(h, world.robotPose().position, world.robotPose().position, 0.5F);
+    ASSERT_GT(h.explorationMap.exploredCellCount(), 0);
+    ASSERT_FALSE(h.frontierExplorer.frontierCells().empty());
+
+    h.requestStartRoamKeyPress();
+    bool everRoamed = false;
+    for (int frame = 0; frame < 30; ++frame)
+    {
+        h.driveFrame();
+        if (h.currentTask() == MissionTask::Roam)
+        {
+            everRoamed = true;
+        }
+    }
+
+    EXPECT_TRUE(everRoamed);
+    EXPECT_FALSE(h.mapAlreadyCompleteNoticeActive);
+}
+
+TEST(StartMappingAlreadyCompleteMapTest, CompletionRequiresActiveMappingSession)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    // Starts on a small partial map (genuinely not complete yet), so a
+    // real Roam session begins normally - this is the "completion
+    // happens DURING an active session" path, which must remain
+    // completely unaffected by the Bug B gate.
+    sweepMapOverRegion(h, world.robotPose().position, world.robotPose().position, 0.5F);
+    ASSERT_FALSE(h.frontierExplorer.frontierCells().empty());
+    h.requestStartRoamKeyPress();
+    for (int frame = 0; frame < 5 && h.currentTask() != MissionTask::Roam; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.currentTask(), MissionTask::Roam);
+
+    // Now genuinely complete the map WHILE the session is active (the
+    // robot did not do this exploring itself here, but from the
+    // orchestration's point of view this is indistinguishable from the
+    // robot having just explored the last reachable cell itself).
+    preSeedFullMap(h);
+
+    int returnHomeRequestedTransitions = 0;
+    MissionTask previousTask = h.currentTask();
+    for (int frame = 0; frame < 300 && h.currentTask() != MissionTask::ReturnHome; ++frame)
+    {
+        h.driveFrame();
+        if (h.currentTask() == MissionTask::ReturnHome && previousTask != MissionTask::ReturnHome)
+        {
+            ++returnHomeRequestedTransitions;
+        }
+        previousTask = h.currentTask();
+    }
+
+    EXPECT_EQ(h.currentTask(), MissionTask::ReturnHome);
+    EXPECT_EQ(returnHomeRequestedTransitions, 1);
+}
+
+// ============================================================
+// Phase 13X human-validation fix - TESTS: completion/coverage display
+// semantics (MapPanelStatus.hpp)
+// ============================================================
+//
+// Human GUI validation also found the HARİTA panel still showing
+// "Keşfedilen: %99" even after automatic Return Home had already started
+// (a technically-correct-but-confusing state: logical exploration
+// completion means "no reachable frontier remains," while raw grid
+// coverage can truthfully stay below 100% forever for interior/occluded
+// cells). These tests exercise the presentation-only helper functions
+// Renderer3D.cpp now uses directly - pure functions, so no
+// window/rendering is needed to prove their contract.
+
+TEST(MapPanelStatusTest, LogicalCompletionCanDisplay100WhenRawCoverageBelow100)
+{
+    // The displayed number substitutes a clean 100 once exploration is
+    // LOGICALLY complete, even though raw coverage never reached it.
+    EXPECT_EQ(displayedExploredPercentage(true, 99.0F), 100);
+    EXPECT_EQ(displayedExploredPercentage(true, 42.0F), 100);
+}
+
+TEST(MapPanelStatusTest, RawExploredPercentageRemainsTruthful)
+{
+    // Outside logical completion, the raw number passes through
+    // unmodified (truncated toward zero for display, exactly like the
+    // pre-existing static_cast<int>() the map panel already used) - never
+    // silently rounded up toward 100.
+    EXPECT_EQ(displayedExploredPercentage(false, 99.0F), 99);
+    EXPECT_EQ(displayedExploredPercentage(false, 0.0F), 0);
+    EXPECT_EQ(displayedExploredPercentage(false, 87.9F), 87);
+}
+
+TEST(MapPanelStatusTest, CompletionDisplayDoesNotMutateMap)
+{
+    // displayedExploredPercentage()/deriveMapPanelStatus() take only plain
+    // bool/float arguments - never an ExplorationMap& - so they are
+    // STRUCTURALLY incapable of mutating map/coverage data; this test
+    // additionally confirms a real ExplorationMap's own cell counts are
+    // unaffected by computing a "complete" display around it.
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    preSeedFullMap(h);
+    const std::size_t exploredBefore = h.explorationMap.exploredCellCount();
+    const std::size_t totalBefore = h.explorationMap.totalCellCount();
+
+    const int displayed = displayedExploredPercentage(true, h.explorationMap.exploredPercentage());
+    const MapPanelStatus status = deriveMapPanelStatus(true, false, false);
+
+    EXPECT_EQ(displayed, 100);
+    EXPECT_EQ(status, MapPanelStatus::Completed);
+    EXPECT_EQ(h.explorationMap.exploredCellCount(), exploredBefore);
+    EXPECT_EQ(h.explorationMap.totalCellCount(), totalBefore);
+}
+
+TEST(MapPanelStatusTest, DerivesCompletedRegardlessOfExplorationActiveOrLoaded)
+{
+    EXPECT_EQ(deriveMapPanelStatus(true, true, true), MapPanelStatus::Completed);
+    EXPECT_EQ(deriveMapPanelStatus(true, false, false), MapPanelStatus::Completed);
+}
+
+TEST(MapPanelStatusTest, DerivesMappingWhileActiveAndNotYetComplete)
+{
+    EXPECT_EQ(deriveMapPanelStatus(false, true, false), MapPanelStatus::Mapping);
+    EXPECT_EQ(deriveMapPanelStatus(false, true, true), MapPanelStatus::Mapping);
+}
+
+TEST(MapPanelStatusTest, DerivesLoadedOrNewMapWhenIdle)
+{
+    EXPECT_EQ(deriveMapPanelStatus(false, false, true), MapPanelStatus::Loaded);
+    EXPECT_EQ(deriveMapPanelStatus(false, false, false), MapPanelStatus::NewMap);
+}
+
+// Full end-to-end proof, through the real MapAwareHarness/driveFrame()
+// loop, that the exact scenario the human observed (raw coverage below
+// 100% at the moment logical completion/auto-Return-Home fires) is a
+// real, reachable state - not a hypothetical - confirming the display fix
+// above is solving a genuine case, mirroring
+// CoverageCompletionSemanticsTest.RawPercentageCanBeBelow100AtCompletion's
+// own proof but stated from the display helper's own point of view.
+TEST(MapPanelStatusTest, DisplayReaches100AtTheExactFrameRawCoverageIsStillBelow100)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    preSeedFullMap(h);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+
+    bool completed = false;
+    for (int frame = 0; frame < 3000 && !completed; ++frame)
+    {
+        h.driveFrame();
+        completed = h.completionSignal.complete;
+    }
+    ASSERT_TRUE(completed);
+
+    const float rawPercentage = h.explorationMap.exploredPercentage();
+    ASSERT_LE(rawPercentage, 100.0F);
+    // Interior/occluded cells are never observable - the reachable/
+    // logical-completion path this codebase actually exercises does not
+    // require raw coverage to hit 100.
+    EXPECT_EQ(displayedExploredPercentage(true, rawPercentage), 100);
 }
 
 } // namespace

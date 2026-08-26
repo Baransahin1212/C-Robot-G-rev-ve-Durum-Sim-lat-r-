@@ -144,6 +144,65 @@ public:
     // far enough to function as path planning.
     static constexpr float kSupportCheckLookaheadDistance = 0.05F;
 
+    // Phase 13X blocker fix (deadlock repair): `translatingWouldNotHelp()`
+    // (bugfix #3, above) only ever reasons about TABLE geometry - it has
+    // no knowledge of solid obstacles (by design; see this class's own
+    // top-level docs on the deliberate separation from
+    // ReactiveObstacleAvoidance/RobotCollision). If a translating state's
+    // (BackingAway/MovingForwardFromRearEdge/AdvancingInward) commanded
+    // motion is being externally vetoed every frame - in practice, by
+    // VirtualRobotHardware's independent obstacle-collision guard, e.g. a
+    // desk object sitting between the robot and this incident's fixed
+    // recovery target heading - the bugfix #3 probe cannot see that,
+    // since it only ever evaluates a HYPOTHETICAL projected pose against
+    // table bounds, never the ACTUAL pose update the collision guard just
+    // rejected. Without a bound, the state can hold Safety's own always-
+    // highest drive authority forever, commanding the same doomed
+    // translation every single call - starving AutonomousAvoidance and
+    // Navigation of the wheels indefinitely, since Safety unconditionally
+    // outranks both regardless of which of ITS OWN sub-states is engaged
+    // (see docs/technical-decisions.md, Phase 13X blocker fix, "safety
+    // recovery stall").
+    //
+    // kMaxRecoveryStallFrames bounds this the same way
+    // ReactiveObstacleAvoidance::kMaximumTurnAwaySweepDegrees bounds
+    // TurnAway: if the robot's ACTUAL position (never a hypothetical
+    // projection) has not moved more than kStallProgressEpsilon for this
+    // many CONSECUTIVE update() calls while in a translating state, update()
+    // releases straight to Inactive and reports
+    // recoveryBlockedThisUpdate() true for exactly that one call - a one-
+    // frame edge signal, mirroring
+    // ReactiveObstacleAvoidance::localRouteBlockedThisUpdate() exactly
+    // (see that class's own docs). This never weakens the actual safety
+    // guarantee: VirtualRobotHardware's own unconditional last-resort
+    // guards (obstacle-collision rejection, all-four-corners-off-table
+    // rejection) remain fully active regardless of this controller's
+    // active()/Inactive state, exactly as they already do for every other
+    // drive authority (Manual/AutonomousAvoidance/Navigation/Fsm) - this
+    // bound only ever gives up on the PROACTIVE, comfortable-margin
+    // recovery maneuver once it is PROVABLY not making progress, never on
+    // the hard backstop. 15 frames (0.75s of simulated time at this
+    // project's ~0.05s/frame convention) is small enough not to leave the
+    // robot pinned for long, large enough that a single transient frame
+    // (e.g. one collision-rejected step immediately followed by real
+    // progress) is never mistaken for a genuine stall, and comfortably
+    // clear of TableEdgeSafetyControllerTests.cpp's own
+    // TurningTransitionsToAdvancingInwardWhenHeadingSafeButCornerStillEdge
+    // (which deliberately calls update() 50 times with a fixed pose to
+    // exercise the pure decision-transition logic in isolation from
+    // physical integration - never itself a real stall).
+    static constexpr int kMaxRecoveryStallFrames = 60;
+
+    // Minimum positional change, in world units, between consecutive
+    // update() calls for a translating state to be considered "making
+    // progress" (see kMaxRecoveryStallFrames above) - well below either
+    // translating speed's smallest plausible per-frame step
+    // (kRecoveryInwardSpeed * a typical ~0.05s frame is 0.03F), so any
+    // frame with a genuinely committed translation resets the stall
+    // counter, while floating-point noise on an actually-frozen position
+    // never falsely resets it.
+    static constexpr float kStallProgressEpsilon = 0.005F;
+
     // Advances the recovery state machine by one frame/step, given this
     // frame's real cliff-sensor readings and the robot's current pose/
     // table geometry (needed to compute and track the recovery target
@@ -194,6 +253,16 @@ public:
     //   AdvancingInward            -> Inactive (once heading is (still)
     //                                  safe AND the support margin is now
     //                                  satisfied)
+    //   BackingAway/
+    //   MovingForwardFromRearEdge/
+    //   AdvancingInward            -> Inactive (Phase 13X blocker fix:
+    //                                  bounded recovery-stall escape - see
+    //                                  kMaxRecoveryStallFrames's own docs.
+    //                                  Reports recoveryBlockedThisUpdate()
+    //                                  true for exactly this one call,
+    //                                  same one-frame-edge shape as
+    //                                  ReactiveObstacleAvoidance's own
+    //                                  localRouteBlockedThisUpdate())
     //
     // BUGFIX #3 CONTEXT (human manual validation, Phase 13W after the
     // robot/table rescale): BackingAway/MovingForwardFromRearEdge/
@@ -248,6 +317,20 @@ public:
 
     RecoveryState state() const noexcept;
 
+    // Phase 13X blocker fix: true for exactly the one update() call on
+    // which a translating state's bounded stall (kMaxRecoveryStallFrames)
+    // was exhausted without the robot's actual position ever making
+    // progress - see that constant's own docs. On that same call, this
+    // class has already released itself to Inactive. Mirrors
+    // ReactiveObstacleAvoidance::localRouteBlockedThisUpdate() exactly -
+    // callers (main3d.cpp) should react on this exact frame the same way:
+    // force the global navigation layer to replan from the robot's
+    // CURRENT pose, and briefly suppress this controller's own re-arming
+    // until the robot's position has genuinely changed (see
+    // docs/technical-decisions.md, Phase 13X blocker fix, "safety
+    // recovery stall").
+    bool recoveryBlockedThisUpdate() const noexcept;
+
     // Deterministic wheel speeds for the CURRENT state - {0, 0} while
     // Inactive (never applied by a correctly-written caller, which
     // should check active() first, but always a safe, deterministic
@@ -286,6 +369,12 @@ private:
     RecoveryState state_ = RecoveryState::Inactive;
     float targetRecoveryHeadingDegrees_ = 0.0F;
     float currentHeadingErrorDegrees_ = 0.0F;
+
+    // Phase 13X blocker fix: bounded recovery-stall bookkeeping - see
+    // kMaxRecoveryStallFrames's own docs.
+    Vec3 stallAnchorPosition_{};
+    int framesSinceStallProgress_ = 0;
+    bool recoveryBlockedThisUpdate_ = false;
 };
 
 // Visual-only, not part of any FSM/RobotState convention - mirrors

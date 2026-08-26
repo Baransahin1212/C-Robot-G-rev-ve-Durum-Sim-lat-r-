@@ -24,66 +24,111 @@ float distanceWorld(const Vec3& a, const Vec3& b) noexcept
     return std::sqrt((dx * dx) + (dz * dz));
 }
 
-// Bresenham-style integer line walk between two grid cells (inclusive of
-// both endpoints) - shared by the goal-snapping search's "is this cell
-// visible" style checks and simplifyPath()'s own line-of-sight test.
-std::vector<GridCoord> walkLine(GridCoord from, GridCoord to)
+// Phase 13X final blocker fix ("PATH SIMPLIFICATION AUDIT" / geometry-
+// contract unification): distance from `point` to the SQUARE FOOTPRINT of
+// one occupied grid cell (center `cellCenter`, half-width `halfCell` -
+// i.e. the same [center - halfCell, center + halfCell] extent every cell
+// in this grid actually covers), not merely to that cell's own center
+// point. Uses the identical clamp-to-box technique
+// RobotCollision.cpp's own collidesWithObstacle() already uses for the
+// real robot-vs-obstacle check (same "closest point on an axis-aligned
+// box" primitive, deliberately reused rather than re-derived) - this is
+// what makes GridPathPlanner's own clearance test geometry-compatible
+// with the reactive layer's exact rectangular Minkowski-sum-style AABB
+// expansion (ForwardClearanceProbe.cpp's segmentIntersectsExpandedAabb())
+// instead of the old point-distance-between-cell-centers test, which
+// systematically UNDER-counted how close a route came to a real obstacle
+// near a DIAGONAL corner (a rectangular obstacle's corner protrudes
+// further into a diagonal approach than a circle centered on the nearest
+// occupied cell's own center point ever could) - see
+// NavigationClearance.hpp and docs/technical-decisions.md (Phase 13X
+// final blocker fix) for the full traced reproduction this closes.
+float distanceToCellFootprint(const Vec3& point, const Vec3& cellCenter, float halfCell) noexcept
 {
-    std::vector<GridCoord> cells;
-    int x0 = from.col;
-    int y0 = from.row;
-    const int x1 = to.col;
-    const int y1 = to.row;
-    const int dx = std::abs(x1 - x0);
-    const int dy = -std::abs(y1 - y0);
-    const int sx = (x0 < x1) ? 1 : -1;
-    const int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-    while (true)
+    const float minX = cellCenter.x - halfCell;
+    const float maxX = cellCenter.x + halfCell;
+    const float minZ = cellCenter.z - halfCell;
+    const float maxZ = cellCenter.z + halfCell;
+
+    const float closestX = std::clamp(point.x, minX, maxX);
+    const float closestZ = std::clamp(point.z, minZ, maxZ);
+
+    const float dx = point.x - closestX;
+    const float dz = point.z - closestZ;
+    return std::sqrt((dx * dx) + (dz * dz));
+}
+
+// Phase 13X final blocker fix: the ONE traversability predicate both the
+// per-cell A* grid (GridPathPlanner's own constructor, below) and
+// simplifyPath()'s continuous line-of-sight validation (further down this
+// file) now share - "is `point` at least `clearance` away from every
+// occupied cell's own square footprint (distanceToCellFootprint(), not a
+// bare center-to-center distance) AND at least `clearance` inside every
+// table-surface edge?" Previously simplifyPath() only ever asked "is each
+// Bresenham-SAMPLED grid cell traversable," which is a discrete
+// approximation of the continuous straight segment a simplified waypoint
+// pair actually drives - fine when the sampled cells happen to track the
+// true line closely, but never proven to hold at every point of the
+// segment. This function takes a plain world point so it can be called
+// both once per grid cell (construction) and many times per simplified
+// segment (simplifyPath(), at a sub-cell sampling step - see that
+// function's own docs) - never two independently-drifting
+// implementations of "close enough to be unsafe."
+bool pointClearsInflatedGeometry(const Vec3& point, const TableSurface& bounds,
+                                  const std::vector<GridCoord>& occupiedCells, const ExplorationMap& map,
+                                  float clearance, int inflationRadiusCells) noexcept
+{
+    if ((point.x - bounds.minX < clearance) || (bounds.maxX - point.x < clearance) ||
+        (point.z - bounds.minZ < clearance) || (bounds.maxZ - point.z < clearance))
     {
-        cells.push_back(GridCoord{x0, y0});
-        if (x0 == x1 && y0 == y1)
+        return false;
+    }
+
+    int pointCol = -1;
+    int pointRow = -1;
+    const bool inGrid = map.worldToCell(point, pointCol, pointRow);
+    const float halfCell = map.cellSize() / 2.0F;
+
+    for (const GridCoord& occ : occupiedCells)
+    {
+        if (inGrid && (std::abs(occ.col - pointCol) > inflationRadiusCells ||
+                       std::abs(occ.row - pointRow) > inflationRadiusCells))
         {
-            break;
+            continue;
         }
-        const int e2 = 2 * err;
-        if (e2 >= dy)
+        const Vec3 occCenter = map.cellToWorld(occ.col, occ.row);
+        if (distanceToCellFootprint(point, occCenter, halfCell) < clearance)
         {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
+            return false;
         }
     }
-    return cells;
+    return true;
 }
+
 } // namespace
 
-GridPathPlanner::GridPathPlanner(const ExplorationMap& map) noexcept
+GridPathPlanner::GridPathPlanner(const ExplorationMap& map, const std::vector<GridCoord>& extraBlockedCells) noexcept
     : map_(map)
     , width_(map.width())
     , height_(map.height())
     , traversable_(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_), false)
 {
-    const float clearance = kRobotCollisionRadius + kPlanningSafetyMargin;
+    clearance_ = kRobotCollisionRadius + kPlanningSafetyMargin;
     const TableSurface& bounds = map.bounds();
     const float cellSize = map.cellSize();
-    const int inflationRadiusCells = static_cast<int>(std::ceil(clearance / cellSize)) + 1;
+    inflationRadiusCells_ = static_cast<int>(std::ceil(clearance_ / cellSize)) + 1;
 
     // Collect Occupied cells once - reused for every cell's inflation
-    // check below, rather than re-scanning ExplorationMap::cells() per
+    // check below (and by isPointClear() later - see this class's own
+    // member docs), rather than re-scanning ExplorationMap::cells() per
     // candidate.
-    std::vector<GridCoord> occupiedCells;
     for (int row = 0; row < height_; ++row)
     {
         for (int col = 0; col < width_; ++col)
         {
             if (map.cellAt(col, row) == MapCell::Occupied)
             {
-                occupiedCells.push_back(GridCoord{col, row});
+                occupiedCells_.push_back(GridCoord{col, row});
             }
         }
     }
@@ -102,32 +147,29 @@ GridPathPlanner::GridPathPlanner(const ExplorationMap& map) noexcept
 
             const Vec3 center = map.cellToWorld(col, row);
 
-            // Table-edge planning margin.
-            bool safe = (center.x - bounds.minX >= clearance) && (bounds.maxX - center.x >= clearance) &&
-                        (center.z - bounds.minZ >= clearance) && (bounds.maxZ - center.z >= clearance);
-
-            // Occupied-cell inflation - only check nearby occupied cells
-            // (bounded by inflationRadiusCells), not the whole list, for
-            // every candidate.
-            if (safe)
-            {
-                for (const GridCoord& occ : occupiedCells)
-                {
-                    if (std::abs(occ.col - col) > inflationRadiusCells || std::abs(occ.row - row) > inflationRadiusCells)
-                    {
-                        continue;
-                    }
-                    const Vec3 occCenter = map.cellToWorld(occ.col, occ.row);
-                    if (distanceWorld(center, occCenter) < clearance)
-                    {
-                        safe = false;
-                        break;
-                    }
-                }
-            }
-
-            traversable_[index] = safe;
+            // Phase 13X final blocker fix: shared predicate (table-edge
+            // margin + box-aware, not center-to-center, occupied-cell
+            // inflation) - see pointClearsInflatedGeometry()'s own docs
+            // above for why this replaced the old bare
+            // distanceWorld(center, occCenter) < clearance check.
+            traversable_[index] =
+                pointClearsInflatedGeometry(center, bounds, occupiedCells_, map, clearance_, inflationRadiusCells_);
         }
+    }
+
+    // Phase 13X blocker fix (deadlock repair): applied AFTER the map-
+    // derived pass above, so an extra-blocked cell always overrides
+    // whatever the map alone would have said - see this constructor's own
+    // parameter docs (GridPathPlanner.hpp) for why this list exists.
+    for (const GridCoord& blocked : extraBlockedCells)
+    {
+        if (blocked.col < 0 || blocked.col >= width_ || blocked.row < 0 || blocked.row >= height_)
+        {
+            continue;
+        }
+        const std::size_t index = (static_cast<std::size_t>(blocked.row) * static_cast<std::size_t>(width_)) +
+                                   static_cast<std::size_t>(blocked.col);
+        traversable_[index] = false;
     }
 }
 
@@ -139,6 +181,30 @@ bool GridPathPlanner::isTraversable(int col, int row) const noexcept
     }
     return traversable_[(static_cast<std::size_t>(row) * static_cast<std::size_t>(width_)) +
                          static_cast<std::size_t>(col)];
+}
+
+bool GridPathPlanner::isPointClear(const Vec3& point) const noexcept
+{
+    int col = -1;
+    int row = -1;
+    if (!map_.worldToCell(point, col, row))
+    {
+        return false;
+    }
+    // Enclosing cell must itself already pass isTraversable() - folds in
+    // Free/Unknown/Occupied, table-edge-at-the-cell-center, and (Phase 13X
+    // blocker fix) extraBlockedCells in one call, exactly like every other
+    // caller of isTraversable() - never a second, separately-maintained
+    // copy of that logic here.
+    if (!isTraversable(col, row))
+    {
+        return false;
+    }
+    // Then prove the exact continuous point (not merely its enclosing
+    // cell's own center) is itself far enough from every occupied cell's
+    // square footprint and every table edge - see
+    // pointClearsInflatedGeometry()'s own docs above.
+    return pointClearsInflatedGeometry(point, map_.bounds(), occupiedCells_, map_, clearance_, inflationRadiusCells_);
 }
 
 int GridPathPlanner::width() const noexcept
@@ -388,11 +454,41 @@ PathPlanResult GridPathPlanner::planPath(const Vec3& startWorld, const Vec3& goa
 
 namespace
 {
-bool lineOfSightTraversable(const GridPathPlanner& planner, GridCoord a, GridCoord b)
+// Phase 13X final blocker fix ("PATH SIMPLIFICATION AUDIT" - see
+// docs/technical-decisions.md for the full traced reproduction this
+// closes): CONTINUOUS straight-segment validity check between two grid
+// cells' world-space centers, replacing the old Bresenham-integer-line-
+// walk-then-isTraversable()-per-visited-cell approach. The old approach
+// only ever proved the handful of grid cells a discrete integer line-walk
+// happened to step through were traversable at THEIR OWN cell centers -
+// never that the actual continuous straight line the robot would drive
+// stays clear of the inflated geometry between those sampled cell
+// centers, which is exactly how a diagonal shortcut could graze
+// perilously close to (or, per the reactive layer's own rectangular
+// hazard geometry, effectively inside) an obstacle's real corner despite
+// every individually-sampled grid cell reporting traversable=true.
+//
+// Samples GridPathPlanner::isPointClear() (isTraversable() of the
+// enclosing cell, AND continuous box-aware distance from every occupied
+// cell's real footprint - see that method's own docs) at a fixed sub-cell
+// step small enough that no two consecutive samples can ever straddle a
+// full grid cell in either axis, so a real cell-sized safety margin gap
+// can never be skipped over between samples.
+constexpr float kLineOfSightSampleStep = ExplorationMap::kCellSizeWorldUnits / 4.0F;
+
+bool lineOfSightTraversable(const GridPathPlanner& planner, const ExplorationMap& map, GridCoord a, GridCoord b)
 {
-    for (const GridCoord& cell : walkLine(a, b))
+    const Vec3 from = map.cellToWorld(a.col, a.row);
+    const Vec3 to = map.cellToWorld(b.col, b.row);
+    const float dx = to.x - from.x;
+    const float dz = to.z - from.z;
+    const float length = std::sqrt((dx * dx) + (dz * dz));
+    const int steps = std::max(1, static_cast<int>(std::ceil(length / kLineOfSightSampleStep)));
+    for (int step = 0; step <= steps; ++step)
     {
-        if (!planner.isTraversable(cell.col, cell.row))
+        const float t = static_cast<float>(step) / static_cast<float>(steps);
+        const Vec3 sample{from.x + (dx * t), 0.0F, from.z + (dz * t)};
+        if (!planner.isPointClear(sample))
         {
             return false;
         }
@@ -422,7 +518,7 @@ std::vector<Vec3> simplifyPath(const ExplorationMap& map, const GridPathPlanner&
         std::size_t farthest = anchor + 1;
         for (std::size_t candidate = cellPath.size() - 1; candidate > anchor + 1; --candidate)
         {
-            if (lineOfSightTraversable(planner, cellPath[anchor], cellPath[candidate]))
+            if (lineOfSightTraversable(planner, map, cellPath[anchor], cellPath[candidate]))
             {
                 farthest = candidate;
                 break;

@@ -24,7 +24,8 @@ float distanceWorld(const Vec3& a, const Vec3& b) noexcept
 } // namespace
 
 WaypointNavigatorOutput WaypointNavigator::update(const RobotPose& pose, const ExplorationMap& map,
-                                                    const Vec3& goalWorld, bool enabled, bool forceReplan) noexcept
+                                                    const Vec3& goalWorld, bool enabled, bool forceReplan,
+                                                    const std::vector<GridCoord>& extraBlockedCells) noexcept
 {
     if (!enabled)
     {
@@ -55,7 +56,7 @@ WaypointNavigatorOutput WaypointNavigator::update(const RobotPose& pose, const E
 
     if (needsReplan)
     {
-        planRoute(pose, map, goalWorld);
+        planRoute(pose, map, goalWorld, extraBlockedCells);
         lastGoal_ = goalWorld;
         hasLastGoal_ = true;
         progressTracker_.reset();
@@ -117,9 +118,10 @@ const std::vector<Vec3>& WaypointNavigator::currentRoute() const noexcept
     return route_;
 }
 
-void WaypointNavigator::planRoute(const RobotPose& pose, const ExplorationMap& map, const Vec3& goalWorld)
+void WaypointNavigator::planRoute(const RobotPose& pose, const ExplorationMap& map, const Vec3& goalWorld,
+                                   const std::vector<GridCoord>& extraBlockedCells)
 {
-    const GridPathPlanner planner(map);
+    const GridPathPlanner planner(map, extraBlockedCells);
     const PathPlanResult result = planner.planPath(pose.position, goalWorld);
 
     localSteering_.reset();

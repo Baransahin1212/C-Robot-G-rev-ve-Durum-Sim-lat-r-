@@ -670,3 +670,103 @@ TEST(TableEdgeSafetyControllerTest, RecoveryMakesSupportMarginMonotonicallySafer
     ASSERT_TRUE(resolved);
     EXPECT_LE(aggregateTableOverhang(pose, kTable), 1.0e-4F);
 }
+
+// ============================================================
+// Phase 13X blocker fix (deadlock repair) - bounded recovery-stall escape
+// ============================================================
+// Root cause this closes: translatingWouldNotHelp() (bugfix #3, above)
+// only ever reasons about TABLE geometry - it cannot see that a
+// translating state's commanded motion is being externally vetoed every
+// frame by VirtualRobotHardware's independent obstacle-collision guard
+// (e.g. a desk object sitting between the robot and this incident's fixed
+// recovery target). Without a bound, Safety's own always-highest drive
+// authority could hold a doomed translating state forever, starving
+// AutonomousAvoidance/Navigation of the wheels indefinitely. See
+// kMaxRecoveryStallFrames's own docs (TableEdgeSafetyController.hpp) for
+// the full reasoning.
+
+// --- StallEscape 1: FrozenPositionEventuallyReleasesAndReportsBlocked ---
+TEST(TableEdgeSafetyControllerTest, FrozenPositionDuringAdvancingInwardEventuallyReleasesAndReportsBlocked)
+{
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{0.0F, 0.125F, 5.80F}, 0.0F};
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+    ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::BackingAway);
+
+    pose.position.z = 5.75F;
+    controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+    ASSERT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Turning);
+
+    // Same setup as TurningTransitionsToAdvancingInwardWhenHeadingSafeButCornerStillEdge:
+    // heading already at the target, but a sensor permanently reports an
+    // edge, so Turning hands off to AdvancingInward - which this test then
+    // holds at a COMPLETELY FIXED pose (simulating every proposed forward
+    // step being rejected by an external obstacle-collision guard, never
+    // integrated into `pose` here) for far longer than
+    // kMaxRecoveryStallFrames.
+    pose.headingDegrees = 180.0F;
+    const CliffSensorReadings stuckReadings{false, false, true, false}; // rearLeft only
+
+    bool everBlocked = false;
+    int firedAtIteration = -1;
+    // Stops the INSTANT the bound fires - readings still (deliberately,
+    // per this test's own setup) report a persistent cliff, so a real
+    // caller's next update() would legitimately re-trigger a brand new
+    // incident (Inactive -> MovingForwardFromRearEdge) immediately
+    // afterward; this test's own subject is the release ITSELF, not what
+    // happens several calls later.
+    for (int i = 0; i < TableEdgeSafetyController::kMaxRecoveryStallFrames + 20 && !everBlocked; ++i)
+    {
+        controller.update(stuckReadings, pose, kTable);
+        if (controller.recoveryBlockedThisUpdate())
+        {
+            everBlocked = true;
+            firedAtIteration = i;
+        }
+    }
+
+    // Hard requirement: a translating state pinned at an unmoving pose
+    // must eventually give up - never spin/hold Safety authority forever.
+    ASSERT_TRUE(everBlocked);
+    // Never fires before the bound is actually reached - the stall must
+    // be PROVEN over the full window, never guessed early.
+    EXPECT_GE(firedAtIteration, TableEdgeSafetyController::kMaxRecoveryStallFrames - 1);
+    EXPECT_EQ(controller.state(), TableEdgeSafetyController::RecoveryState::Inactive);
+    EXPECT_FALSE(controller.active());
+}
+
+// --- StallEscape 2: GenuineProgressNeverTriggersTheBound ---
+TEST(TableEdgeSafetyControllerTest, GenuineTranslatingProgressNeverTriggersTheStallBound)
+{
+    // Regression guard for the existing, validated RightEdgeRecoversInward
+    // -style closed-loop tests: a normally-recovering robot (position
+    // genuinely advancing every step via real DifferentialDrive
+    // integration) must never spuriously hit the new bounded-stall escape.
+    TableEdgeSafetyController controller;
+    RobotPose pose{Vec3{6.05F, 0.125F, 1.5F}, 15.0F};
+    ASSERT_TRUE(computeCliffSensorReadings(pose, kTable).anyCliff());
+
+    DifferentialDrive drive;
+    constexpr float dt = 0.05F;
+    bool everBlocked = false;
+    bool resolved = false;
+    for (int step = 0; step < 400; ++step)
+    {
+        controller.update(computeCliffSensorReadings(pose, kTable), pose, kTable);
+        if (controller.recoveryBlockedThisUpdate())
+        {
+            everBlocked = true;
+        }
+        if (!controller.active())
+        {
+            resolved = true;
+            break;
+        }
+        const WheelSpeeds speeds = controller.recoveryWheelSpeeds();
+        drive.setWheelSpeeds(speeds.left, speeds.right);
+        drive.update(pose, dt);
+    }
+
+    ASSERT_TRUE(resolved) << "recovery never resolved within the normal closed-loop budget";
+    EXPECT_FALSE(everBlocked);
+}

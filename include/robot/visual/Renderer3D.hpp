@@ -272,6 +272,42 @@ struct VisualTelemetry
     // whether the map is read-only afterward - it never is).
     bool mapWasLoaded = false;
 
+    // Phase 13X human-validation fix: main3d.cpp's own
+    // ExplorationCompletionSignal::complete - true once autonomous
+    // Haritalama has logically completed (no reachable frontier remains -
+    // see ExplorationCompletionEventSource.hpp), independent of whether
+    // raw grid coverage (rawExploredPercentage below) happens to have
+    // reached 100 - it usually has not, and never needs to (unreachable/
+    // unobservable cells, e.g. directly beneath desk objects). Drives the
+    // HARİTA panel's "Tamamlandı" status and its %100 displayed coverage
+    // line (see MapPanelStatus.hpp's deriveMapPanelStatus()/
+    // displayedExploredPercentage() - Renderer3D calls those directly,
+    // exactly like it already switches on MapCell::Free/Occupied/Unknown
+    // inline for cell coloring, rather than main3d.cpp pre-deciding a
+    // Turkish string for this one case). Presentation-only: never causes
+    // any map/coverage data to be mutated - see docs/technical-decisions.md
+    // (Phase 13X human-validation fix, "completion display").
+    bool logicalExplorationComplete = false;
+
+    // Phase 13X human-validation fix: true while Haritalama
+    // (MissionTask::Roam) is the actively running task this frame -
+    // main3d.cpp's own `roaming` local, duplicated here purely so the
+    // HARİTA panel can distinguish "Haritalanıyor" (mapping in progress)
+    // from "Yüklendi"/"Yeni Harita"/"Tamamlandı" (see MapPanelStatus.hpp).
+    bool explorationActive = false;
+
+    // Phase 13X human-validation fix: ExplorationMap::exploredPercentage(),
+    // already read once by main3d.cpp - truthful raw coverage, duplicated
+    // here only so the Ayrıntılı HUD (drawHud(), which does not receive
+    // ExplorationMap itself, unlike drawExplorationMapPanel()) can show it
+    // as "Ham keşif" alongside the logical "Erişilebilir keşif: %100" line
+    // once complete. The HARİTA panel still reads
+    // ExplorationMap::exploredPercentage() directly from its own `map`
+    // parameter for its primary display - this is purely a second,
+    // convenience copy for the other panel. Never itself mutated by any
+    // completion/display logic - see logicalExplorationComplete above.
+    float rawExploredPercentage = 0.0F;
+
     // Phase 13X: the current frontier exploration target, if Haritalama
     // currently holds one - already-computed by main3d.cpp's
     // FrontierExplorer::selectTarget() (Renderer3D never selects a

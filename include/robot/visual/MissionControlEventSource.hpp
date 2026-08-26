@@ -56,12 +56,43 @@ public:
     // not a growing queue.
     void requestStartRoam(RobotState currentState);
 
+    // Phase 13X quick fix (Bug B): same Idle->Ready state-mapping
+    // requestStartRoam() uses, but only ever queues ScenarioLoaded - never
+    // StartMission. Used when the caller (main3d.cpp's KEY_ONE handler)
+    // has already determined the current map is logically complete (no
+    // reachable frontier, some cells already explored - e.g. a resumed
+    // persisted map) and a genuine Roam session must not begin: entering
+    // Moving immediately re-derives that same completion fact on the
+    // session's very first frame and auto-returns home before the robot
+    // ever moves - see docs/technical-decisions.md, Phase 13X quick fix,
+    // "start-mapping stops immediately." From Ready or any other state
+    // this is a pure no-op - there is nothing left to queue.
+    void requestScenarioLoadedOnly(RobotState currentState);
+
     // Requests Return Home - queues ReturnHomeRequested exactly once,
     // regardless of current state (the FSM itself already correctly
     // accepts or rejects it - see RobotStateMachine::processEvent()'s
     // Moving/Ready cases). Shared by both `2` and `R` in main3d.cpp; a
     // request already pending and not yet delivered is not duplicated.
+    // NOT valid from Idle - RobotStateMachine has no Idle +
+    // ReturnHomeRequested transition at all (by design: Ready is the only
+    // "no mission running" state that accepts it) - see
+    // requestReturnHomeFromIdle() below for that case.
     void requestReturnHome();
+
+    // Phase 13X quick fix: composes the existing, unmodified
+    // Idle-ScenarioLoaded->Ready and Ready-ReturnHomeRequested->
+    // ReturningHome transitions into the single user-facing "2/R = Eve
+    // Dön" command even when no mission was ever started (e.g. Manual
+    // free-drive directly from launch) - mirrors requestStartRoam()'s own
+    // Idle branch shape exactly (queue ScenarioLoaded, then
+    // ReturnHomeRequested, delivered across two separate pollEvent()
+    // calls/frames - RobotRuntime::step() only ever consumes one Event
+    // per call). Zero RobotStateMachine changes: both transitions already
+    // existed and are unchanged. A sequence already in flight (either
+    // event still pending) is never re-queued on top of itself, mirroring
+    // requestStartRoam()'s own dedup guard.
+    void requestReturnHomeFromIdle();
 
     // Requests the current task be cancelled - queues StopTaskRequested
     // exactly once, regardless of current state, for the same reason as

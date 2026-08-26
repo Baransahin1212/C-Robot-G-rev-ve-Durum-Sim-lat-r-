@@ -33,9 +33,27 @@ void MissionControlEventSource::requestStartRoam(RobotState currentState)
     }
 }
 
+void MissionControlEventSource::requestScenarioLoadedOnly(RobotState currentState)
+{
+    if (currentState == RobotState::Idle)
+    {
+        requestSingle(EventType::ScenarioLoaded);
+    }
+}
+
 void MissionControlEventSource::requestReturnHome()
 {
     requestSingle(EventType::ReturnHomeRequested);
+}
+
+void MissionControlEventSource::requestReturnHomeFromIdle()
+{
+    if (alreadyQueued(EventType::ScenarioLoaded) || alreadyQueued(EventType::ReturnHomeRequested))
+    {
+        return;
+    }
+    pendingEvents_.push_back(EventType::ScenarioLoaded);
+    pendingEvents_.push_back(EventType::ReturnHomeRequested);
 }
 
 void MissionControlEventSource::requestStopTask()
