@@ -16,6 +16,8 @@
 #include "robot/visual/CoverageTrail.hpp"
 #include "robot/visual/DockApproachArrivalEventSource.hpp"
 #include "robot/visual/DockApproachController.hpp"
+#include "robot/visual/DockCaptureRegion.hpp"
+#include "robot/visual/DockChargingContacts.hpp"
 #include "robot/visual/DockLaneObstacleFilter.hpp"
 #include "robot/visual/ExecutableDirectory.hpp"
 #include "robot/visual/ExplorationCompletionEventSource.hpp"
@@ -355,32 +357,37 @@ int main()
     // 13X, and HomeZoneMonitor's own earlier precedent for a component
     // staying compiled/tested after its production wiring changes).
     //
-    // Phase 13X final-approach fix: for Return Home specifically,
-    // WaypointNavigator's own goal is now computeDockApproachPoint() (see
+    // Phase 13X final-approach fix, extended by Phase 13Y's precision
+    // reverse docking: for Return Home specifically, WaypointNavigator's
+    // own goal is now computeDockStagingPoint() (see
     // DockApproachController.hpp) - a point comfortably in front of the
     // dock, never the literal dock/base position itself. Global A*
     // planning is deliberately NOT responsible for precision docking (see
     // that header's own class docs for the full "why" - human GUI
-    // validation found the literal-goal final segment fully exposed to
-    // ReactiveObstacleAvoidance, which correctly treats the dock's own
-    // rear housing as a hazard and produced an erratic, unreliable final
-    // approach). DockApproachController is Stage 2 - the small, dedicated
-    // "align then drive the last short validated stretch" controller that
-    // takes over once WaypointNavigator reports Arrived at the approach
-    // point (see the Return Home orchestration block, below in this
-    // function, for exactly how the two stages hand off wheel authority).
+    // validation found Phase 13X's own literal-goal final segment fully
+    // exposed to ReactiveObstacleAvoidance, and separately, the human
+    // product requirement is now realistic reverse parking with physical
+    // charging-contact alignment, never a nose-first drive-through).
+    // DockApproachController is Stage 2 - the small, dedicated "rotate so
+    // the rear faces the dock, then reverse the last short validated
+    // stretch until both charging contacts mate" controller that takes
+    // over once WaypointNavigator reports Arrived at the staging point
+    // (see the Return Home orchestration block, below in this function,
+    // for exactly how the two stages hand off wheel authority).
     // WaypointArrivalEventSource (still fully compiled/tested, matching
     // HomeNavigator/HomeArrivalEventSource's own precedent) is
     // DELIBERATELY not wired into this file's event chain any more - its
     // own Arrived-edge would now fire the instant WaypointNavigator merely
-    // reaches the approach point, which must NEVER by itself end a Return
+    // reaches the staging point, which must NEVER by itself end a Return
     // Home mission (it is Stage 1 finishing, not the robot actually being
-    // home). DockApproachArrivalEventSource (below) is the new, correct
+    // docked). DockApproachArrivalEventSource (below) is the new, correct
     // HomeReached source: edge-triggered on DockApproachController's OWN
-    // Arrived state, which only ever becomes true once the robot has
-    // physically entered HomeNavigator::kHomeArrivalRadius of the LITERAL
-    // base position - the existing HomeReached/Ready semantics are
-    // completely unchanged, just now driven by the right controller.
+    // Docked state, which only ever becomes true once both rear charging
+    // contacts are physically aligned with the dock's own pins AND
+    // heading is correct (see DockChargingContacts.hpp/
+    // DockApproachController.hpp) - the existing HomeReached/Ready
+    // semantics are completely unchanged, just now driven by the right
+    // controller and a stricter, more physically real arrival condition.
     // Haritalama's own frontier-arrival bookkeeping never depended on
     // WaypointArrivalEventSource's Event either - it already reads
     // mapNavigator.state() directly (see the frontier-selection block
@@ -508,6 +515,20 @@ int main()
     bool previousAvoidanceActive = false;
     bool previousSafetyActive = false;
 
+    // Phase 13Y dock-capture LATCH fix (real-GUI-traced) - mirrors
+    // `dockNeedsStage1ReplanPending`'s own one-frame sticky-read shape
+    // exactly. `dockCapturedPending` is set at the END of each frame from
+    // that frame's own fresh `dockOutput.captured` (see that field's own
+    // docs); `previousDockCapturedSticky` remembers what the STICKY read
+    // was the previous time it was computed, purely so the
+    // NotCaptured->Captured EDGE (not just the level) can be detected at
+    // the top of the frame, before runtime.step() - see the dock-hazard-
+    // suppression block's own docs for why the edge specifically is
+    // needed (releasing a stale dock-attributable avoidance incident
+    // exactly once, not every frame capture remains true).
+    bool dockCapturedPending = false;
+    bool previousDockCapturedSticky = false;
+
     // Phase 13X human-validation fix: edge-detection for "Return Home just
     // became the active task" (missionTask freshly reading
     // MissionTask::ReturnHome this frame, false -> true) - see the
@@ -526,6 +547,14 @@ int main()
     // immediately re-arm before Navigation's replanned command gets a
     // genuine chance to actually turn the robot.
     bool localRouteBlockedPendingReplan = false;
+    // Phase 13Y: mirrors localRouteBlockedPendingReplan's own one-frame
+    // sticky-capture shape exactly - see
+    // DockApproachOutput::needsStage1Replan's own docs for why this exists
+    // (DockApproachController proved the robot is not precisely enough
+    // positioned for pure-rotation AlignForReverse, and needs Stage 1's
+    // full 2D steering to genuinely re-drive rather than idling on a stale
+    // "Arrived").
+    bool dockNeedsStage1ReplanPending = false;
     bool avoidanceSuppressedAfterBlock = false;
     float headingAtLastLocalRouteBlocked = 0.0F;
     // Phase 13X blocker fix (deadlock repair): consecutive-collision
@@ -843,34 +872,59 @@ int main()
                 (hudMode == robot::visual::HudMode::Full) ? robot::visual::HudMode::Compact : robot::visual::HudMode::Full;
         }
 
-        // Phase 13X final-approach fix ("FINAL APPROACH HAZARD CONTRACT"):
-        // read as the STICKY state left by the END of the PREVIOUS frame's
-        // own dockApproach.update() call (below, after navOutput) - the
-        // same one-frame-lag sticky-read convention
-        // consumeLocalRouteBlockedReplan already established for this
-        // file, needed here specifically because dockLaneFilter must be
-        // armed/disarmed BEFORE runtime.step() below, but this frame's own
-        // fresh DockApproachController state is not known until later in
-        // the frame. While DockApproachController itself is actively
-        // Aligning/FinalApproach/Arrived, it is driving (or correctly
-        // parked in) a validated, known-safe straight lane it derived
-        // analytically (isDockApproachGeometryValid() - see
-        // DockApproachController.hpp) that deliberately passes close to
-        // the dock's own rear housing - a REAL, permanent obstacle the
-        // robot must enter near, not avoid. dockLaneFilter withholds only
-        // the ObstacleDetected EVENT from ever reaching RobotStateMachine
-        // for these frames (see DockLaneObstacleFilter.hpp's own docs for
-        // the exact deadlock this closes - WaitingForObstacleClear has no
-        // path back out for a robot that is correctly never going to move
-        // away from what it detected) - obstacle SENSING itself
+        // Phase 13X final-approach fix ("FINAL APPROACH HAZARD CONTRACT"),
+        // extended for Phase 13Y's precision reverse docking and then again
+        // for the dock-capture LATCH fix (real-GUI-traced): read as the
+        // STICKY state left by the END of the PREVIOUS frame's own
+        // dockApproach.update() call (below, after navOutput) - the same
+        // one-frame-lag sticky-read convention consumeLocalRouteBlockedReplan
+        // already established for this file, needed here specifically
+        // because dockLaneFilter must be armed/disarmed BEFORE
+        // runtime.step() below, but this frame's own fresh
+        // DockApproachController state is not known until later in the
+        // frame.
+        //
+        // Driven directly off DockApproachOutput::captured (the session
+        // LATCH - see that field's own docs) rather than re-deriving
+        // eligibility every frame: a real GUI trace proved the raw entry
+        // predicate (DockCaptureRegion::isDockCaptureEligible()) can
+        // legitimately flicker false again mid-maneuver (this project's
+        // real desk layout has a genuine ambiguous region where a desk
+        // object briefly becomes numerically nearer than the dock housing),
+        // even while the robot is still physically deep inside the
+        // validated docking lane - re-deriving eligibility here would
+        // re-introduce exactly that flicker into suppression too, exposing
+        // the FSM-pause/avoidance-trigger gate again mid-session. Once a
+        // session is captured, this stays true for the WHOLE session
+        // (never re-earned frame to frame) - it only ever goes false again
+        // when the controller itself releases the session (Docked/Failed/
+        // enabled=false via `returningHome` ending), never from a momentary
+        // hazard-attribution flicker. While DockApproachController owns a
+        // captured session, it is driving (or correctly parked in) a
+        // validated, known-safe reverse-docking lane it derived
+        // analytically (isDockStagingGeometryValid()) that deliberately
+        // passes close to the dock's own rear housing and charging pins - a
+        // REAL, permanent obstacle/contact geometry the robot must enter
+        // near and touch, not avoid. dockLaneFilter withholds only the
+        // ObstacleDetected EVENT from ever reaching RobotStateMachine for
+        // these frames (see DockLaneObstacleFilter.hpp's own docs for the
+        // exact deadlock this closes - WaitingForObstacleClear has no path
+        // back out for a robot that is correctly never going to move away
+        // from what it detected) - obstacle SENSING itself
         // (hardware.obstacleDetected()), ReactiveObstacleAvoidance, and
         // Safety are all completely unaffected, and this is the smallest
         // dock-specific exception the contract needs, never a global
         // suppression.
-        const bool dockApproachActive = dockApproach.state() == robot::visual::DockApproachState::Aligning ||
-                                         dockApproach.state() == robot::visual::DockApproachState::FinalApproach ||
-                                         dockApproach.state() == robot::visual::DockApproachState::Arrived;
-        dockLaneFilter.setSuppressed(dockApproachActive);
+        const bool dockCapturedSticky = dockCapturedPending;
+        // Edge (NotCaptured -> Captured), settled one frame further behind
+        // `dockCapturedSticky` itself - see the avoidance-release block
+        // below (right before avoidance.update()) for why this exact edge,
+        // not merely the level, is what a stale pre-capture avoidance
+        // incident needs to release on.
+        const bool dockCaptureJustEnteredSticky = dockCapturedSticky && !previousDockCapturedSticky;
+        previousDockCapturedSticky = dockCapturedSticky;
+        const bool dockHazardSuppressionActive = dockCapturedSticky;
+        dockLaneFilter.setSuppressed(dockHazardSuppressionActive);
 
         // Exactly one RobotRuntime::step() per rendered frame - the render
         // loop itself is the scheduler (see RobotRuntime's own docs). If
@@ -893,6 +947,9 @@ int main()
         // block's own docs for the full "map update before replan"
         // reasoning.
         const bool consumeLocalRouteBlockedReplan = localRouteBlockedPendingReplan;
+        // Phase 13Y: same sticky-read shape, one frame lag - see
+        // dockNeedsStage1ReplanPending's own docs above.
+        const bool consumeDockNeedsStage1Replan = dockNeedsStage1ReplanPending;
 
         // Compute this frame's forward BODY-clearance telemetry (Phase
         // 13R) - independent of, and complementary to, the point-ray
@@ -988,18 +1045,50 @@ int main()
             }
         }
 
-        // `dockApproachActive` (sticky, captured at the top of this frame
-        // before runtime.step() - see that capture's own docs) also gates
-        // the ordinary obstacle-triggered avoidance TRIGGER here: never
-        // avoidance.update() itself, never Safety, never any other frame/
-        // task - ReactiveObstacleAvoidance remains fully unmodified and
-        // fully active for every other lane/task/obstacle in the scene.
-        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock && !dockApproachActive &&
+        // `dockHazardSuppressionActive` (sticky, captured at the top of
+        // this frame before runtime.step() - see that capture's own docs)
+        // also gates the ordinary obstacle-triggered avoidance TRIGGER
+        // here: never avoidance.update() itself, never Safety, never any
+        // other frame/task - ReactiveObstacleAvoidance remains fully
+        // unmodified and fully active for every other lane/task/obstacle in
+        // the scene.
+        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock &&
+                                       !dockHazardSuppressionActive &&
                                        stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
                                        hardware.obstacleDetected();
         const robot::visual::ObstacleHazardSample avoidanceHazard{
             obstacleRays.frontLeftDistance, obstacleRays.frontCenterDistance, obstacleRays.frontRightDistance};
-        avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear, world.robotPose(),
+
+        // Phase 13Y stale dock-attributable avoidance release (real-GUI-
+        // traced): the exact frame a docking session transitions
+        // NotCaptured -> Captured (`dockCaptureJustEnteredSticky`, computed
+        // above before runtime.step()), an avoidance incident that started
+        // BEFORE capture (triggered by the dock housing itself, back when
+        // suppression did not yet cover this pose) can still be active() -
+        // ReactiveObstacleAvoidance's own `triggerAvoidance` going false
+        // does NOT release an already-in-progress incident (see that
+        // class's own docs: "the latch, once started, is driven by
+        // forwardCorridorClear and displacement alone"), so simply
+        // suppressing NEW triggers (dockHazardSuppressionActive above) is
+        // not sufficient on its own - a real GUI trace proved this exact
+        // stale incident kept AutonomousAvoidance authority ahead of
+        // Navigation for the first ~25 capture frames. Since capture only
+        // EVER became true on a frame DockCaptureRegion::isDockCaptureEligible()
+        // held (radius + physical safety + hazard-attribution + no
+        // unrelated obstacle nearer - see that function's own docs), this
+        // edge already PROVES the current incident (if any) is dock-
+        // attributable; only Safety is re-checked live here, since it can
+        // change independently and must always win regardless. One frame
+        // of `enabled=false` is ReactiveObstacleAvoidance's own documented
+        // way to force Inactive immediately (see update()'s own docs) -
+        // this never resets an unrelated incident (dockCaptureJustEnteredSticky
+        // can only be true when the entry predicate held, which itself
+        // requires dock attribution), never changes DriveAuthority
+        // ordering, and never disables avoidance beyond this single frame.
+        const bool dockAttributableAvoidanceReleaseThisFrame =
+            dockCaptureJustEnteredSticky && avoidance.active() && !tableEdgeSafety.active();
+        const bool avoidanceEnabledThisFrame = avoidanceEnabled && !dockAttributableAvoidanceReleaseThisFrame;
+        avoidance.update(avoidanceEnabledThisFrame, triggerAvoidance, forwardCorridorClear, world.robotPose(),
                           avoidanceHazard);
 
         // Phase 13X blocker fix: capture the block signal immediately
@@ -1302,14 +1391,14 @@ int main()
         previousReturningHomeActive = returningHome;
 
         const bool navigationEnabled = returningHome || (roaming && currentFrontierTarget.has_value());
-        // Phase 13X final-approach fix: Return Home's global-route goal is
-        // the dock APPROACH point, never the literal base position - see
+        // Phase 13Y: Return Home's global-route goal is the dock STAGING
+        // point, never the literal base position - see
         // DockApproachController.hpp's own class docs, and this file's own
         // WaypointNavigator/DockApproachController declaration comments
         // above, for the full two-stage "why."
         const robot::visual::Vec3 navigationGoal =
             returningHome
-                ? robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface())
+                ? robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface())
                 : (currentFrontierTarget.has_value() ? currentFrontierTarget->worldPosition
                                                        : robot::visual::Vec3{});
         // Phase 13X blocker fix: `consumeLocalRouteBlockedReplan` (captured
@@ -1325,7 +1414,8 @@ int main()
         // mechanism here.
         const bool forceReplan = consumeLocalRouteBlockedReplan ||
                                   (previousAvoidanceActive && !avoidance.active()) ||
-                                  (previousSafetyActive && !tableEdgeSafety.active());
+                                  (previousSafetyActive && !tableEdgeSafety.active()) ||
+                                  consumeDockNeedsStage1Replan;
 
         // Phase 13X final blocker fix ("NO OSCILLATION INVARIANT"):
         // whole-session distance-to-home progress tracking - the SECOND,
@@ -1353,6 +1443,24 @@ int main()
         if (!returningHome)
         {
             bestDistanceToHomeThisSession = std::numeric_limits<float>::infinity();
+            framesSinceDistanceImproved = 0;
+        }
+        // Phase 13Y: once Stage 1 has reported Arrived (handed off to
+        // DockApproachController) - or is Failed/Inactive - it is no
+        // longer the thing driving toward the goal, so "distance to base
+        // center not improving" is expected and meaningless here, never a
+        // stuck symptom Stage 1 itself needs to react to. Without this
+        // guard, Stage 2's own legitimate slow/rotational precision
+        // maneuvering (AlignForReverse's in-place turning, the staging-
+        // point creep, brief ReverseApproach/AlignForReverse cycling) reads
+        // as "stuck" by this whole-session distance metric, repeatedly
+        // blacklisting the very staging-point cell Stage 2 needs the next
+        // time something legitimately forces a Stage 1 replan (e.g. a
+        // large-displacement re-entry) - corrupting that replan into
+        // snapping to a much worse, obstacle-adjacent cell (a real,
+        // integration-test-traced defect this guard closes).
+        else if (previousNavOutput.state != robot::visual::WaypointNavigatorState::Following)
+        {
             framesSinceDistanceImproved = 0;
         }
         else
@@ -1436,18 +1544,37 @@ int main()
             returningHome ? returnHomeBlockedCells : std::vector<robot::visual::GridCoord>{});
         previousNavOutput = navOutput;
 
-        // Phase 13X final-approach fix: Stage 2 - only ever enabled while
-        // Return Home is the active task; `arrivedAtApproachPoint` is
-        // Stage 1's own Arrived report (WaypointNavigator's goal is
-        // computeDockApproachPoint(), never the literal base position - see
-        // this file's own docs above) - DockApproachController never
-        // recomputes that fact itself, so it can never disagree with Stage
-        // 1 about whether the global route finished. See this class's own
-        // header docs for the full NavigatingToApproach -> Aligning ->
-        // FinalApproach -> Arrived state machine.
-        const robot::visual::DockApproachOutput dockOutput =
-            dockApproach.update(world.robotPose(), world.basePlatform(), world.tableSurface(), returningHome,
-                                 returningHome && navOutput.state == robot::visual::WaypointNavigatorState::Arrived);
+        // Phase 13Y: Stage 2 - only ever enabled while Return Home is the
+        // active task; `arrivedAtStagingPoint` is Stage 1's own Arrived
+        // report (WaypointNavigator's goal is computeDockStagingPoint(),
+        // never the literal base position - see this file's own docs
+        // above) OR'd with this frame's own FRESH (post-runtime.step(),
+        // unlike the sticky `dockCaptureEligibleSticky` gate above)
+        // DockCaptureRegion::isDockCaptureEligible() check - see
+        // DockApproachController::kDockStagingCaptureRadius's own docs for
+        // why relying on WaypointNavigatorState::Arrived exclusively is not
+        // robust (a real GUI trace proved ReactiveObstacleAvoidance can
+        // repeatedly win DriveAuthority over Navigation right next to the
+        // dock and leave WaypointNavigator Failed or perpetually
+        // Following). DockApproachController never recomputes either fact
+        // itself, so it can never disagree with the caller about whether
+        // the handoff happened. See this class's own header docs for the
+        // full NavigateToStagingPoint -> AlignForReverse -> ReverseApproach
+        // -> Docked precision reverse-docking state machine.
+        const bool dockCaptureEligibleFresh =
+            returningHome && robot::visual::isDockCaptureEligible(world.robotPose(), world.basePlatform(),
+                                                                    world.tableSurface(), world.obstacles(),
+                                                                    !cliffReadings.anyCliff());
+        const robot::visual::DockApproachOutput dockOutput = dockApproach.update(
+            world.robotPose(), world.basePlatform(), world.tableSurface(), returningHome,
+            returningHome && (navOutput.state == robot::visual::WaypointNavigatorState::Arrived ||
+                               dockCaptureEligibleFresh));
+        // Captured for NEXT frame's consumeDockNeedsStage1Replan sticky
+        // read (see that capture's own docs, top of this frame).
+        dockNeedsStage1ReplanPending = dockOutput.needsStage1Replan;
+        // Captured for NEXT frame's dockCapturedSticky/dockCaptureJustEnteredSticky
+        // sticky reads (see those capture's own docs, top of this frame).
+        dockCapturedPending = dockOutput.captured;
 
         // Apply drive authority (Safety > Manual > AutonomousAvoidance >
         // Navigation > Fsm - see VirtualRobotHardware::driveAuthority()).
@@ -1691,15 +1818,15 @@ int main()
         // actually returning home - during frontier exploration the
         // planned-route polyline (passed to renderFrame() below) is the
         // correct visualization instead, never this straight-line guide.
-        // Phase 13X final-approach fix: once Stage 2 has anything
-        // meaningful to show (Aligning/FinalApproach/Arrived), its own
-        // state text replaces WaypointNavigator's - otherwise the HUD would
+        // Phase 13Y: once Stage 2 has anything meaningful to show
+        // (AlignForReverse/ReverseApproach/Docked), its own state text
+        // replaces WaypointNavigator's - otherwise the HUD would
         // misleadingly keep reading "Ulaşıldı" (Arrived) for the entire
-        // docking maneuver, the instant Stage 1 merely reaches the
-        // approach point.
+        // reverse-docking maneuver, the instant Stage 1 merely reaches the
+        // staging point.
         telemetry.homeNavigationStateText =
             (returningHome && dockOutput.state != robot::visual::DockApproachState::Inactive &&
-             dockOutput.state != robot::visual::DockApproachState::NavigatingToApproach)
+             dockOutput.state != robot::visual::DockApproachState::NavigateToStagingPoint)
                 ? robot::visual::turkishText(dockOutput.state)
                 : robot::visual::turkishText(navOutput.state);
         telemetry.homeNavigationGuideVisible = returningHome && navigationDriving;

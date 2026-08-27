@@ -142,20 +142,26 @@ constexpr std::string_view turkishText(WaypointNavigatorState value) noexcept
     return "Bilinmiyor";
 }
 
-// Phase 13X final-approach fix: Stage 2 precision-docking state - shown on
-// the HUD in place of WaypointNavigatorState's own text once Stage 1 hands
-// off (see main3d.cpp's own telemetry assembly), so the HUD never
-// misleadingly reads "Ulaşıldı" (Arrived) while the robot is still visibly
-// aligning/driving the last short stretch into the dock.
+// Phase 13X final-approach fix, extended by Phase 13Y's precision reverse
+// docking: Stage 2 docking-phase state - shown on the HUD in place of
+// WaypointNavigatorState's own text once Stage 1 hands off (see
+// main3d.cpp's own telemetry assembly), so the HUD never misleadingly
+// reads "Ulaşıldı" (Arrived) while the robot is still visibly aligning/
+// reversing the last short stretch into the dock. Phase 13Y brief's own
+// suggested Ayrıntılı-HUD phase labels (Yaklaşıyor/Hizalanıyor/Geri Park
+// Ediyor/Park Edildi) - "Temas" (contact) is not a separate state in this
+// controller's own state machine (contact alignment IS the Docked
+// transition condition, never a distinct intermediate state), so it is
+// not a separate HUD value here.
 constexpr std::string_view turkishText(DockApproachState value) noexcept
 {
     switch (value)
     {
         case DockApproachState::Inactive: return "Kapalı";
-        case DockApproachState::NavigatingToApproach: return "Rota İzleniyor";
-        case DockApproachState::Aligning: return "Yöneliyor";
-        case DockApproachState::FinalApproach: return "Yanaşıyor";
-        case DockApproachState::Arrived: return "Eve Ulaştı";
+        case DockApproachState::NavigateToStagingPoint: return "Yaklaşıyor";
+        case DockApproachState::AlignForReverse: return "Hizalanıyor";
+        case DockApproachState::ReverseApproach: return "Geri Park Ediyor";
+        case DockApproachState::Docked: return "Park Edildi";
         case DockApproachState::Failed: return "Yanaşma Başarısız";
     }
     return "Bilinmiyor";

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "robot/visual/DockChargingContacts.hpp"
 #include "robot/visual/ExecutableDirectory.hpp"
 #include "robot/visual/MapPanelStatus.hpp"
 #include "robot/visual/VisualRobot.hpp"
@@ -572,14 +573,17 @@ void Renderer3D::drawChargingDock(const VirtualWorld& world) const
     DrawCube(Vector3{base.position.x + armInsetX, armCenterY, armCenterZ}, kArmWidth, kArmHeight, kArmDepth,
               kDockGuideArmColor);
 
-    constexpr float kPadSize = 0.07F;
-    constexpr float kPadHeight = 0.01F;
-    const float padCenterZ = base.position.z - (base.size.z / 2.0F) * 0.3F;
-    const float padCenterY = base.position.y + (base.size.y / 2.0F) + (kPadHeight / 2.0F);
-    DrawCube(Vector3{base.position.x - (base.size.x * 0.2F), padCenterY, padCenterZ}, kPadSize, kPadHeight, kPadSize,
-              kDockContactPadColor);
-    DrawCube(Vector3{base.position.x + (base.size.x * 0.2F), padCenterY, padCenterZ}, kPadSize, kPadHeight, kPadSize,
-              kDockContactPadColor);
+    // Phase 13Y: the two dock-side charging pins, drawn at their REAL
+    // computed positions (computeDockChargingContacts() -
+    // DockChargingContacts.hpp) - never a separately-eyeballed visual
+    // guess, exactly like the housing draw above. This is the SAME
+    // geometry DockApproachController's own contact-alignment check uses,
+    // so what the user sees lining up is exactly what "Docked" actually
+    // requires. Small round metallic/gold pins (Phase 13Y brief), never
+    // oversized.
+    const DockChargingContactPair dockContacts = computeDockChargingContacts(base, world.tableSurface());
+    DrawSphere(toRaylibVector3(dockContacts.left.position), dockContacts.left.radius, kDockContactPadColor);
+    DrawSphere(toRaylibVector3(dockContacts.right.position), dockContacts.right.radius, kDockContactPadColor);
 }
 
 void Renderer3D::drawHud(const VirtualWorld& world, const VisualTelemetry& telemetry) const

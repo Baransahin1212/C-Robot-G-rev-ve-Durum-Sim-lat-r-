@@ -390,6 +390,8 @@ FetchContent_MakeAvailable(raylib)
 add_library(robot_visual_world STATIC
     src/visual/VirtualWorld.cpp
     src/visual/ExecutableDirectory.cpp
+    src/visual/DockChargingContacts.cpp
+    src/visual/DockCaptureRegion.cpp
 )
 
 target_link_libraries(robot_visual_world PUBLIC

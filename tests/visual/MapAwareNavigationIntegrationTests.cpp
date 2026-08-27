@@ -16,6 +16,7 @@
 #include "robot/visual/CoverageTrail.hpp"
 #include "robot/visual/DockApproachArrivalEventSource.hpp"
 #include "robot/visual/DockApproachController.hpp"
+#include "robot/visual/DockCaptureRegion.hpp"
 #include "robot/visual/DockLaneObstacleFilter.hpp"
 #include "robot/visual/ExplorationCompletionEventSource.hpp"
 #include "robot/visual/ExplorationMap.hpp"
@@ -58,7 +59,8 @@ using robot::visual::DockApproachController;
 using robot::visual::DockApproachOutput;
 using robot::visual::DockApproachState;
 using robot::visual::DockLaneObstacleFilter;
-using robot::visual::computeDockApproachPoint;
+using robot::visual::computeDockStagingPoint;
+using robot::visual::isDockCaptureEligible;
 using robot::visual::DriveAuthority;
 using robot::visual::ExplorationCompletion;
 using robot::visual::ExplorationCompletionEventSource;
@@ -200,6 +202,10 @@ struct MapAwareHarness
     bool avoidanceEnabled;
     bool previousAvoidanceActive = false;
     bool previousSafetyActive = false;
+    // Phase 13Y dock-capture LATCH fix - mirrors main3d.cpp's own
+    // identically-named state exactly (see that file's own docs).
+    bool dockCapturedPending = false;
+    bool previousDockCapturedSticky = false;
     // Phase 13X human-validation fix: mirrors main3d.cpp's own
     // manualDriveMode/previousReturningHomeActive exactly (see that file's
     // own docs, and the Manual-override-cancellation block in driveFrame()
@@ -215,6 +221,9 @@ struct MapAwareHarness
     // Phase 13X blocker fix - mirrors main3d.cpp's own identically-named
     // state exactly (see that file's own docs for the full reasoning).
     bool localRouteBlockedPendingReplan = false;
+    // Phase 13Y - mirrors main3d.cpp's own identically-named state exactly
+    // (see DockApproachOutput::needsStage1Replan's own docs).
+    bool dockNeedsStage1ReplanPending = false;
     bool avoidanceSuppressedAfterBlock = false;
     float headingAtLastLocalRouteBlocked = 0.0F;
     static constexpr float kAvoidanceResumeHeadingChangeDegrees = 30.0F;
@@ -343,13 +352,15 @@ struct MapAwareHarness
 
     void driveFrame(float dt = 0.05F)
     {
-        // Phase 13X final-approach fix - mirrors main3d.cpp's own sticky
-        // dockApproachActive capture/dockLaneFilter arming exactly (see
+        // Phase 13X final-approach fix, extended for Phase 13Y's dock-
+        // capture LATCH fix - mirrors main3d.cpp's own sticky
+        // dockCapturedSticky capture/dockLaneFilter arming exactly (see
         // that file's own docs), needed BEFORE runtime.step() below.
-        const bool dockApproachActive = dockApproach.state() == DockApproachState::Aligning ||
-                                         dockApproach.state() == DockApproachState::FinalApproach ||
-                                         dockApproach.state() == DockApproachState::Arrived;
-        dockLaneFilter.setSuppressed(dockApproachActive);
+        const bool dockCapturedSticky = dockCapturedPending;
+        const bool dockCaptureJustEnteredSticky = dockCapturedSticky && !previousDockCapturedSticky;
+        previousDockCapturedSticky = dockCapturedSticky;
+        const bool dockHazardSuppressionActive = dockCapturedSticky;
+        dockLaneFilter.setSuppressed(dockHazardSuppressionActive);
 
         runtime.step();
 
@@ -357,6 +368,8 @@ struct MapAwareHarness
         // of the PREVIOUS frame - see main3d.cpp's own identical capture
         // for the full "map update before replan" reasoning.
         const bool consumeLocalRouteBlockedReplan = localRouteBlockedPendingReplan;
+        // Phase 13Y - mirrors main3d.cpp's own identical sticky-read.
+        const bool consumeDockNeedsStage1Replan = dockNeedsStage1ReplanPending;
 
         const bool forwardCorridorClear = clearanceProbe.isForwardCorridorClear();
         const auto obstacleRays = obstacleSensorArray.readings();
@@ -390,15 +403,22 @@ struct MapAwareHarness
             }
         }
 
-        // `dockApproachActive` was already captured at the top of this
-        // call, before runtime.step() - reused here for the same reason
-        // main3d.cpp reuses its own sticky capture.
-        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock && !dockApproachActive &&
+        // `dockHazardSuppressionActive` was already captured at the top of
+        // this call, before runtime.step() - reused here for the same
+        // reason main3d.cpp reuses its own sticky capture.
+        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock &&
+                                       !dockHazardSuppressionActive &&
                                        stateMachine.currentState() == RobotState::WaitingForObstacleClear &&
                                        hardware.obstacleDetected();
         const ObstacleHazardSample avoidanceHazard{obstacleRays.frontLeftDistance, obstacleRays.frontCenterDistance,
                                                      obstacleRays.frontRightDistance};
-        avoidance.update(avoidanceEnabled, triggerAvoidance, forwardCorridorClear, world_.robotPose(),
+        // Phase 13Y stale dock-attributable avoidance release - mirrors
+        // main3d.cpp's own identical release exactly (see that file's own
+        // docs).
+        const bool dockAttributableAvoidanceReleaseThisFrame =
+            dockCaptureJustEnteredSticky && avoidance.active() && !tableEdgeSafety.active();
+        const bool avoidanceEnabledThisFrame = avoidanceEnabled && !dockAttributableAvoidanceReleaseThisFrame;
+        avoidance.update(avoidanceEnabledThisFrame, triggerAvoidance, forwardCorridorClear, world_.robotPose(),
                           avoidanceHazard);
 
         if (avoidance.localRouteBlockedThisUpdate())
@@ -551,16 +571,17 @@ struct MapAwareHarness
         previousReturningHomeActive = returningHome;
 
         const bool navigationEnabled = returningHome || (roaming && currentFrontierTarget.has_value());
-        // Phase 13X final-approach fix - mirrors main3d.cpp's own goal
-        // change exactly: Stage 1 routes to the dock APPROACH point, never
-        // the literal base position.
+        // Phase 13Y - mirrors main3d.cpp's own goal change exactly: Stage 1
+        // routes to the dock STAGING point, never the literal base
+        // position.
         const Vec3 navigationGoal =
             returningHome
-                ? computeDockApproachPoint(world_.basePlatform(), world_.tableSurface())
+                ? computeDockStagingPoint(world_.basePlatform(), world_.tableSurface())
                 : (currentFrontierTarget.has_value() ? currentFrontierTarget->worldPosition : Vec3{});
         const bool forceReplan = consumeLocalRouteBlockedReplan ||
                                   (previousAvoidanceActive && !avoidance.active()) ||
-                                  (previousSafetyActive && !tableEdgeSafety.active());
+                                  (previousSafetyActive && !tableEdgeSafety.active()) ||
+                                  consumeDockNeedsStage1Replan;
 
         // Phase 13X final blocker fix ("NO OSCILLATION INVARIANT") -
         // mirrors main3d.cpp's own whole-session distance-to-home
@@ -568,6 +589,14 @@ struct MapAwareHarness
         if (!returningHome)
         {
             bestDistanceToHomeThisSession = std::numeric_limits<float>::infinity();
+            framesSinceDistanceImproved = 0;
+        }
+        // Phase 13Y - mirrors main3d.cpp's own identical guard exactly (see
+        // that file's own docs): once Stage 1 has reported Arrived (or is
+        // Failed/Inactive), it is no longer driving toward the goal, so "no
+        // distance improvement" is expected, never a stuck symptom.
+        else if (previousNavOutput.state != WaypointNavigatorState::Following)
+        {
             framesSinceDistanceImproved = 0;
         }
         else
@@ -628,10 +657,17 @@ struct MapAwareHarness
 
         // Phase 13X final-approach fix - mirrors main3d.cpp's own Stage-2
         // wiring exactly (see that file's own docs).
-        const DockApproachOutput dockOutput =
-            dockApproach.update(world_.robotPose(), world_.basePlatform(), world_.tableSurface(), returningHome,
-                                 returningHome && navOutput.state == WaypointNavigatorState::Arrived);
+        // Phase 13Y dock-capture handoff fix - mirrors main3d.cpp's own
+        // identical widening exactly (see that file's own docs).
+        const bool dockCaptureEligibleFresh =
+            returningHome && isDockCaptureEligible(world_.robotPose(), world_.basePlatform(), world_.tableSurface(),
+                                                    world_.obstacles(), !cliffReadings.anyCliff());
+        const DockApproachOutput dockOutput = dockApproach.update(
+            world_.robotPose(), world_.basePlatform(), world_.tableSurface(), returningHome,
+            returningHome && (navOutput.state == WaypointNavigatorState::Arrived || dockCaptureEligibleFresh));
         previousDockOutput = dockOutput;
+        dockNeedsStage1ReplanPending = dockOutput.needsStage1Replan;
+        dockCapturedPending = dockOutput.captured;
 
         if (tableEdgeSafety.active())
         {
@@ -2056,15 +2092,15 @@ TEST(ManualOverrideReturnHomeTest, ManualRealGuiTracePoseReturnsAndDocks)
     EXPECT_LT(h.distanceToBase(), robot::visual::HomeNavigator::kHomeArrivalRadius);
 }
 
-// --- 5: ReturnHomePlansToApproachPoint ---
-// Global A* (Stage 1/WaypointNavigator) must target computeDockApproachPoint(),
+// --- 5: ReturnHomePlansToStagingPoint ---
+// Global A* (Stage 1/WaypointNavigator) must target computeDockStagingPoint(),
 // never the literal dock position - proven here by checking the distance
 // to home at the exact moment Stage 1 FIRST reports Arrived: if it had
 // routed straight to the literal dock, that distance would be near zero;
-// routed to the approach point, it is comfortably outside HomeNavigator's
+// routed to the staging point, it is comfortably outside HomeNavigator's
 // own arrival radius, with DockApproachController (Stage 2) only just
-// starting its own Aligning/FinalApproach maneuver from there.
-TEST(ManualOverrideReturnHomeTest, ReturnHomePlansToApproachPoint)
+// starting its own AlignForReverse/ReverseApproach maneuver from there.
+TEST(ManualOverrideReturnHomeTest, ReturnHomePlansToStagingPoint)
 {
     VirtualWorld world;
     world.setRobotPosition(Vec3{0.6F, world.robotPose().position.y, 0.6F});
@@ -2086,11 +2122,11 @@ TEST(ManualOverrideReturnHomeTest, ReturnHomePlansToApproachPoint)
     EXPECT_GT(h.distanceToBase(), robot::visual::HomeNavigator::kHomeArrivalRadius);
 }
 
-// --- 10: FinalApproachDoesNotTeleport ---
-// Every FinalApproach frame must move the robot by no more than what
-// kFinalApproachSpeed's own DifferentialDrive integration over one frame
+// --- 10: ReverseApproachDoesNotTeleport ---
+// Every ReverseApproach frame must move the robot by no more than what
+// kReverseDockSpeed's own DifferentialDrive integration over one frame
 // allows - proves physical wheel-driven motion, never a direct pose set.
-TEST(ManualOverrideReturnHomeTest, FinalApproachDoesNotTeleport)
+TEST(ManualOverrideReturnHomeTest, ReverseApproachDoesNotTeleport)
 {
     VirtualWorld world;
     world.setRobotPosition(Vec3{0.6F, world.robotPose().position.y, 0.6F});
@@ -2103,38 +2139,41 @@ TEST(ManualOverrideReturnHomeTest, FinalApproachDoesNotTeleport)
     h.missionControl.requestReturnHome();
 
     Vec3 previousPosition = world.robotPose().position;
-    bool everInFinalApproach = false;
-    // Generous per-frame bound: forward speed times dt, plus a margin for
-    // the frame FinalApproach begins (which may follow an Aligning turn).
-    const float maxPerFrameDisplacement = DockApproachController::kFinalApproachSpeed * 0.05F * 1.5F;
+    bool everInReverseApproach = false;
+    // Generous per-frame bound: reverse speed times dt, plus a margin for
+    // the frame ReverseApproach begins (which may follow an AlignForReverse
+    // turn).
+    const float maxPerFrameDisplacement = DockApproachController::kReverseDockSpeed * 0.05F * 1.5F;
     for (int frame = 0; frame < 2000 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
     {
         h.driveFrame();
-        if (h.dockApproach.state() == DockApproachState::FinalApproach)
+        if (h.dockApproach.state() == DockApproachState::ReverseApproach)
         {
-            everInFinalApproach = true;
+            everInReverseApproach = true;
             const float dx = world.robotPose().position.x - previousPosition.x;
             const float dz = world.robotPose().position.z - previousPosition.z;
             const float displacement = std::sqrt((dx * dx) + (dz * dz));
             EXPECT_LT(displacement, maxPerFrameDisplacement)
-                << "frame=" << frame << " jumped further than one frame of FinalApproach driving allows";
+                << "frame=" << frame << " jumped further than one frame of ReverseApproach driving allows";
         }
         previousPosition = world.robotPose().position;
     }
-    EXPECT_TRUE(everInFinalApproach);
+    EXPECT_TRUE(everInReverseApproach);
 }
 
-// --- 11: FinalApproachPhysicallyReachesHome ---
-// Isolated Stage-2 proof: starting already at the approach point (Stage 1
-// trivially satisfied), DockApproachController alone drives the robot the
-// rest of the way home.
-TEST(ManualOverrideReturnHomeTest, FinalApproachPhysicallyReachesHome)
+// --- 11: ReverseApproachPhysicallyReachesDock ---
+// Isolated Stage-2 proof: starting already at the staging point, facing
+// the reverse-docking heading (Stage 1 trivially satisfied),
+// DockApproachController alone drives the robot backward the rest of the
+// way to a real physical dock.
+TEST(ManualOverrideReturnHomeTest, ReverseApproachPhysicallyReachesDock)
 {
     VirtualWorld world;
-    const Vec3 approach =
-        robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface());
-    world.setRobotPosition(Vec3{approach.x, world.robotPose().position.y, approach.z});
-    world.setRobotHeading(0.0F);
+    const Vec3 staging = robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    const float reverseHeading =
+        robot::visual::computeDockReverseHeadingDegrees(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    world.setRobotHeading(reverseHeading);
     MapAwareHarness h(world);
     sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
     h.missionControl.requestStartRoam(h.stateMachine.currentState());
@@ -2155,10 +2194,11 @@ TEST(ManualOverrideReturnHomeTest, FinalApproachPhysicallyReachesHome)
 TEST(ManualOverrideReturnHomeTest, HomeReachedTransitionsToReady)
 {
     VirtualWorld world;
-    const Vec3 approach =
-        robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface());
-    world.setRobotPosition(Vec3{approach.x, world.robotPose().position.y, approach.z});
-    world.setRobotHeading(0.0F);
+    const Vec3 staging = robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    const float reverseHeading =
+        robot::visual::computeDockReverseHeadingDegrees(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    world.setRobotHeading(reverseHeading);
     MapAwareHarness h(world);
     sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
     h.missionControl.requestStartRoam(h.stateMachine.currentState());
@@ -2183,18 +2223,19 @@ TEST(ManualOverrideReturnHomeTest, HomeReachedTransitionsToReady)
     EXPECT_EQ(returningHomeToReadyTransitions, 1);
 }
 
-// --- 15: SafetyStillOverridesDockApproach ---
+// --- 15: SafetyStillOverridesReverseDocking ---
 // Safety > Manual > AutonomousAvoidance > Navigation > Fsm is completely
-// unchanged by this fix - Dock approach uses Navigation authority, so
+// unchanged by this fix - reverse docking uses Navigation authority, so
 // Safety must still unconditionally win the instant it activates, even
 // mid-docking.
-TEST(ManualOverrideReturnHomeTest, SafetyStillOverridesDockApproach)
+TEST(ManualOverrideReturnHomeTest, SafetyOverridesReverseDocking)
 {
     VirtualWorld world;
-    const Vec3 approach =
-        robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface());
-    world.setRobotPosition(Vec3{approach.x, world.robotPose().position.y, approach.z});
-    world.setRobotHeading(0.0F);
+    const Vec3 staging = robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    const float reverseHeading =
+        robot::visual::computeDockReverseHeadingDegrees(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    world.setRobotHeading(reverseHeading);
     MapAwareHarness h(world);
     sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
     h.missionControl.requestStartRoam(h.stateMachine.currentState());
@@ -2206,8 +2247,8 @@ TEST(ManualOverrideReturnHomeTest, SafetyStillOverridesDockApproach)
     for (int frame = 0; frame < 200 && !everDocking; ++frame)
     {
         h.driveFrame();
-        everDocking =
-            h.dockApproach.state() == DockApproachState::Aligning || h.dockApproach.state() == DockApproachState::FinalApproach;
+        everDocking = h.dockApproach.state() == DockApproachState::AlignForReverse ||
+                      h.dockApproach.state() == DockApproachState::ReverseApproach;
     }
     ASSERT_TRUE(everDocking);
 
@@ -2218,6 +2259,618 @@ TEST(ManualOverrideReturnHomeTest, SafetyStillOverridesDockApproach)
     h.driveFrame();
 
     EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::Safety);
+
+    // After recovery, docking resumes appropriately (never stuck). Phase
+    // 13Y's reverse-parking maneuver (rotate-then-slow-reverse, deliberately
+    // named slower than the old forward final approach - see
+    // DockApproachController::kReverseDockSpeed's own docs) takes
+    // meaningfully longer than the old drive-straight-in approach did, and
+    // this test displaces the robot to the table's own far corner - a
+    // deliberately worst-case Safety recovery distance - so the budget is
+    // generous (empirically needs ~3500 frames for this exact scenario;
+    // 6000 leaves comfortable margin without masking a genuine hang).
+    for (int frame = 0; frame < 6000 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+    }
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+}
+
+// ============================================================
+// Phase 13Y dock-capture handoff fix (real-GUI-traced) - see
+// DockCaptureRegion.hpp's own docs and DockApproachController::
+// kDockStagingCaptureRadius's own docs for the full "why."
+// ============================================================
+
+namespace
+{
+// A point on the dock's own reverse-docking corridor, between the staging
+// point and the dock itself, close enough to the housing to be unambiguous
+// (see DockApproachControllerTests.cpp's own
+// NearestHazardAttributedToDockWhenClosestObstacleIsHousing for why the
+// LITERAL staging point itself is not used here - this project's real desk
+// layout puts the mouse desk object numerically closer to that exact
+// coordinate than the housing is), but still comfortably inside
+// DockApproachController::kDockStagingCaptureRadius of the staging point.
+Vec3 dockCaptureCorridorPoint(const robot::visual::BasePlatform& base, const TableSurface& tableSurface)
+{
+    const Vec3 staging = robot::visual::computeDockStagingPoint(base, tableSurface);
+    return Vec3{(staging.x + base.position.x) / 2.0F, staging.y, (staging.z + base.position.z) / 2.0F};
+}
+} // namespace
+
+// --- CaptureHandoff 1: FailedNavigatorInsideDockCaptureCanHandOff ---
+TEST(DockCaptureHandoffTest, FailedNavigatorInsideDockCaptureCanHandOff)
+{
+    VirtualWorld world;
+    const Vec3 corridorPoint = dockCaptureCorridorPoint(world.basePlatform(), world.tableSurface());
+    const float reverseHeading =
+        robot::visual::computeDockReverseHeadingDegrees(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{corridorPoint.x, world.robotPose().position.y, corridorPoint.z});
+    world.setRobotHeading(reverseHeading);
+    MapAwareHarness h(world);
+    // Deliberately NOT sweeping the map - WaypointNavigator has nothing
+    // traversable to plan a global route through, so it reliably ends up
+    // Failed rather than ever reporting Arrived - exactly the real-trace
+    // condition (avoidance repeatedly winning DriveAuthority) this fix
+    // needs to recover from.
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool sawFailed = false;
+    bool tookOwnership = false;
+    for (int frame = 0; frame < 50; ++frame)
+    {
+        h.driveFrame();
+        sawFailed = sawFailed || h.mapNavigator.state() == WaypointNavigatorState::Failed;
+        tookOwnership = tookOwnership || h.previousDockOutput.driving;
+    }
+    EXPECT_TRUE(sawFailed) << "test setup did not actually reproduce a Failed WaypointNavigator";
+    EXPECT_TRUE(tookOwnership) << "DockApproachController never took ownership despite a valid dock-capture pose";
+}
+
+// --- CaptureHandoff 2: FailedNavigatorOutsideDockCaptureDoesNotHandOff ---
+TEST(DockCaptureHandoffTest, FailedNavigatorOutsideDockCaptureDoesNotHandOff)
+{
+    VirtualWorld world;
+    // Far from the dock - the default VirtualWorld start pose sits only
+    // ~1.0 world unit from the dock (deliberately close, per VirtualWorld.
+    // cpp's own kRobotStartZ docs - well INSIDE kDockStagingCaptureRadius),
+    // so this test explicitly displaces to the opposite corner of the
+    // table instead. Failed here must NOT hand off, since nothing has
+    // proven this pose is anywhere near a validated docking lane.
+    const TableSurface& table = world.tableSurface();
+    world.setRobotPosition(Vec3{table.minX + 0.5F, world.robotPose().position.y, table.maxZ - 0.5F});
+    MapAwareHarness h(world);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool sawFailed = false;
+    bool everDrove = false;
+    bool everLeftNavigateToStagingPoint = false;
+    for (int frame = 0; frame < 50; ++frame)
+    {
+        h.driveFrame();
+        sawFailed = sawFailed || h.mapNavigator.state() == WaypointNavigatorState::Failed;
+        everDrove = everDrove || h.previousDockOutput.driving;
+        everLeftNavigateToStagingPoint =
+            everLeftNavigateToStagingPoint || (h.dockApproach.state() != DockApproachState::Inactive &&
+                                                h.dockApproach.state() != DockApproachState::NavigateToStagingPoint);
+    }
+    EXPECT_TRUE(sawFailed) << "test setup did not actually reproduce a Failed WaypointNavigator";
+    EXPECT_FALSE(everDrove) << "DockApproachController drove despite the robot being far outside dock capture";
+    EXPECT_FALSE(everLeftNavigateToStagingPoint);
+}
+
+// --- CaptureHandoff 3: SafetyStillOverridesDockCapture ---
+TEST(DockCaptureHandoffTest, SafetyStillOverridesDockCapture)
+{
+    VirtualWorld world;
+    const Vec3 corridorPoint = dockCaptureCorridorPoint(world.basePlatform(), world.tableSurface());
+    // Offset laterally beyond DockApproachController::
+    // kReverseLateralErrorToleranceWorldUnits (so NavigateToStagingPoint's
+    // own precision creep - see that state's own docs - genuinely has work
+    // to do for at least this first frame, rather than transitioning
+    // straight to AlignForReverse) but still comfortably inside
+    // kDockStagingCaptureRadius.
+    const Vec3 offsetCorridorPoint{corridorPoint.x + 0.15F, corridorPoint.y, corridorPoint.z};
+    world.setRobotPosition(offsetCorridorPoint);
+    world.setRobotHeading(0.0F);
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    // One frame is enough for dock capture eligibility itself (a pure,
+    // per-frame geometric check - see isDockCaptureEligible()'s own docs)
+    // to already be active, well before AlignForReverse.
+    h.driveFrame();
+    ASSERT_EQ(h.dockApproach.state(), DockApproachState::NavigateToStagingPoint);
+    ASSERT_TRUE(h.previousDockOutput.driving) << "precision creep never engaged - test setup invalid";
+
+    // Force the robot to the very edge of the table WHILE still only in the
+    // dock-capture (not yet AlignForReverse) phase - a real Safety
+    // condition, unrelated to the dock lane itself, must still win even
+    // this early.
+    const TableSurface& table = world.tableSurface();
+    world.setRobotPosition(Vec3{table.maxX - 0.05F, world.robotPose().position.y, table.maxZ - 0.05F});
+    h.driveFrame();
+
+    EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::Safety);
+}
+
+// --- CaptureHandoff 4: RealFrame62PoseCompletesReverseDocking ---
+// A real, GUI-traced production pose (see this phase's own investigation
+// docs) where the robot sat right next to the dock, WaypointNavigator
+// unable to cleanly report Arrived (ReactiveObstacleAvoidance repeatedly
+// won DriveAuthority over Navigation from the dock housing's own,
+// previously-unsuppressed hazard), and DockApproachController never took
+// over - RobotState stuck ReturningHome/Kontrol: Normal (Fsm authority)
+// with zero wheels, indefinitely. This is the end-to-end proof the fix
+// above closes that exact defect.
+TEST(DockCaptureHandoffTest, RealFrame62PoseCompletesReverseDocking)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+    preSeedFullMap(h);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    world.setRobotPosition(Vec3{1.5655F, world.robotPose().position.y, -1.0852F});
+    world.setRobotHeading(251.64F);
+
+    bool everAutonomousAvoidance = false;
+    bool everMoved = false;
+    Vec3 previousPosition = world.robotPose().position;
+    for (int frame = 0; frame < 200 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+        everAutonomousAvoidance = everAutonomousAvoidance || h.avoidance.active();
+        const float dx = world.robotPose().position.x - previousPosition.x;
+        const float dz = world.robotPose().position.z - previousPosition.z;
+        everMoved = everMoved || std::sqrt((dx * dx) + (dz * dz)) > 0.001F;
+        previousPosition = world.robotPose().position;
+        EXPECT_FALSE(h.anyCollision()) << "frame=" << frame;
+    }
+
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_TRUE(everMoved);
+    // The dock housing itself must never win DriveAuthority away from
+    // Navigation during a validated dock-capture approach - see
+    // DockCaptureRegion.hpp's own docs. (An unrelated obstacle still could,
+    // in principle - none exists on this exact real trajectory.)
+    EXPECT_FALSE(everAutonomousAvoidance);
+}
+
+// --- CaptureHandoff 5: RealFrame97PoseCapturedSessionCompletesReverseDocking ---
+// A second real, GUI-traced production pose (see this phase's own
+// investigation docs) where a PREVIOUSLY captured docking session lost
+// ownership: DockCaptureRegion::isDockCaptureEligible() flickered false
+// again mid-maneuver (this project's real desk layout has a genuine
+// ambiguous region where the mouse desk object briefly becomes numerically
+// nearer than the dock housing), and because entry eligibility was being
+// re-checked every frame as an ownership kill switch, the controller fell
+// all the way back to NavigateToStagingPoint waiting on a signal that was
+// never coming again - RobotState stuck ReturningHome, `Kontrol: Normal`
+// (DriveAuthority::Fsm) with zero wheels, indefinitely, even though the
+// robot was CLOSER to the exact staging point than when it was first
+// captured. This is the end-to-end proof the session LATCH
+// (DockApproachOutput::captured) closes that exact defect: entry is
+// granted once (WaypointNavigatorState::Arrived or isDockCaptureEligible()),
+// and continuation is then this controller's own job, never re-derived
+// from the caller's per-frame entry snapshot.
+TEST(DockCaptureHandoffTest, RealFrame97PoseCapturedSessionCompletesReverseDocking)
+{
+    VirtualWorld world;
+    world.setRobotPosition(Vec3{1.3833F, world.robotPose().position.y, -0.9142F});
+    world.setRobotHeading(320.28F);
+    MapAwareHarness h(world);
+    // Deliberately NOT sweeping the map - WaypointNavigator reliably ends
+    // up Failed, matching the real trace's own "WaypointNavigator already
+    // Failed" - proves the LATCHED session survives regardless of Stage 1's
+    // own state.
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everCaptured = false;
+    // A single-frame Fsm/zero-wheels blip is expected and harmless (e.g.
+    // the exact frame kReentryDistanceMultiplier's own big-displacement
+    // fallback or kMaxReverseFallbackStreak's own stuck-cycle escape
+    // releases the latch, one frame before a fresh, re-validated entry
+    // re-captures it - both self-heal within a frame or two). The real-
+    // traced frame-97 defect this test targets is a PERMANENT stall, never
+    // recovering - so only a long RUN of consecutive Fsm frames counts.
+    int consecutiveFsmFrames = 0;
+    constexpr int kMaxToleratedConsecutiveFsmFrames = 10;
+    for (int frame = 0; frame < 400 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+        everCaptured = everCaptured || h.dockCapturedPending;
+        if (everCaptured && h.dockApproach.state() != DockApproachState::Docked)
+        {
+            consecutiveFsmFrames =
+                (h.hardware.driveAuthority() == DriveAuthority::Fsm) ? (consecutiveFsmFrames + 1) : 0;
+            ASSERT_LE(consecutiveFsmFrames, kMaxToleratedConsecutiveFsmFrames)
+                << "frame=" << frame
+                << " stuck at Fsm/\"Normal\" authority with zero wheels for too many consecutive frames - the "
+                   "exact real-traced frame-97 defect";
+        }
+    }
+
+    ASSERT_TRUE(everCaptured);
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+}
+
+// ============================================================
+// Phase 13Y capture-session LIFECYCLE tests (real-GUI-traced)
+// ============================================================
+
+// --- CaptureLifecycle 1: CaptureBecomesLatchedAfterValidEntry ---
+TEST(DockCaptureLifecycleTest, CaptureBecomesLatchedAfterValidEntry)
+{
+    VirtualWorld world;
+    const Vec3 staging =
+        robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    EXPECT_FALSE(h.dockCapturedPending);
+    bool everCaptured = false;
+    for (int frame = 0; frame < 30; ++frame)
+    {
+        h.driveFrame();
+        everCaptured = everCaptured || h.dockCapturedPending;
+    }
+    EXPECT_TRUE(everCaptured);
+}
+
+// --- CaptureLifecycle 2: CaptureDoesNotDropWhenEntryPredicateLaterBecomesFalse ---
+// Mirrors the real frame-97 trace directly at the DockApproachController
+// level (never through the full obstacle-sensing pipeline): once captured,
+// an `arrivedAtStagingPoint` input that goes back to false must not un-latch
+// DockApproachOutput::captured or block further progress.
+TEST(DockCaptureLifecycleTest, CaptureDoesNotDropWhenEntryPredicateLaterBecomesFalse)
+{
+    VirtualWorld world;
+    const auto& base = world.basePlatform();
+    const TableSurface& table = world.tableSurface();
+    const Vec3 staging = computeDockStagingPoint(base, table);
+
+    DockApproachController controller;
+    const DockApproachOutput entered = controller.update(poseAt(staging), base, table, true, true);
+    ASSERT_TRUE(entered.captured);
+
+    // Entry predicate now false, exactly like a real isDockCaptureEligible()
+    // flicker - captured must remain latched and the controller must keep
+    // progressing (still driving, never silently dropping to zero wheels).
+    const DockApproachOutput afterFlicker = controller.update(poseAt(staging), base, table, true, false);
+    EXPECT_TRUE(afterFlicker.captured);
+    EXPECT_TRUE(afterFlicker.driving);
+}
+
+// --- CaptureLifecycle 3: CaptureReleasesOnDocked ---
+TEST(DockCaptureLifecycleTest, CaptureReleasesOnDocked)
+{
+    VirtualWorld world;
+    const Vec3 staging =
+        robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everCaptured = false;
+    for (int frame = 0; frame < 400 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+        everCaptured = everCaptured || h.dockCapturedPending;
+    }
+    ASSERT_TRUE(everCaptured);
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    // Return Home has exited (Ready) - the session must have released.
+    EXPECT_FALSE(h.dockCapturedPending);
+}
+
+// --- CaptureLifecycle 4: CaptureReleasesWhenReturnHomeTaskExits ---
+TEST(DockCaptureLifecycleTest, CaptureReleasesWhenReturnHomeTaskExits)
+{
+    VirtualWorld world;
+    const Vec3 staging =
+        robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everCaptured = false;
+    for (int frame = 0; frame < 10 && !everCaptured; ++frame)
+    {
+        h.driveFrame();
+        everCaptured = h.dockCapturedPending;
+    }
+    ASSERT_TRUE(everCaptured);
+
+    // Explicit Stop Task mid-session - mirrors main3d.cpp's own Stop Task
+    // handling (RobotStateMachine leaves ReturningHome for Ready).
+    h.missionControl.requestStopTask();
+    h.driveFrame();
+
+    EXPECT_FALSE(h.dockCapturedPending);
+    EXPECT_EQ(h.dockApproach.state(), DockApproachState::Inactive);
+}
+
+// --- CaptureLifecycle 5: FailedWaypointNavigatorDoesNotCancelLatchedDockCapture ---
+// Already the core subject of RealFrame62/97PoseCompletesReverseDocking
+// above - this is the narrowest, most direct proof: a controller captured
+// once, then fed a Failed Stage-1 report every subsequent frame, must keep
+// its latch and keep driving.
+TEST(DockCaptureLifecycleTest, FailedWaypointNavigatorDoesNotCancelLatchedDockCapture)
+{
+    VirtualWorld world;
+    const auto& base = world.basePlatform();
+    const TableSurface& table = world.tableSurface();
+    const Vec3 staging = computeDockStagingPoint(base, table);
+
+    DockApproachController controller;
+    const DockApproachOutput entered = controller.update(poseAt(staging), base, table, true, true);
+    ASSERT_TRUE(entered.captured);
+
+    // `arrivedAtStagingPoint=false` for every remaining call - exactly what
+    // the caller passes once WaypointNavigatorState::Arrived stops being
+    // true AND isDockCaptureEligible() also happens to read false that
+    // frame (a Failed/flickering Stage 1, mirrored at this controller's own
+    // input boundary).
+    for (int i = 0; i < 10; ++i)
+    {
+        const DockApproachOutput output = controller.update(poseAt(staging), base, table, true, false);
+        EXPECT_TRUE(output.captured) << "iteration=" << i;
+    }
+}
+
+// --- CaptureLifecycle 6: RawEligibilityFalseBeforeCaptureDoesNotStartDocking ---
+TEST(DockCaptureLifecycleTest, RawEligibilityFalseBeforeCaptureDoesNotStartDocking)
+{
+    VirtualWorld world;
+    const auto& base = world.basePlatform();
+    const TableSurface& table = world.tableSurface();
+    const Vec3 staging = computeDockStagingPoint(base, table);
+
+    DockApproachController controller;
+    // Never once told entry is granted.
+    for (int i = 0; i < 10; ++i)
+    {
+        const DockApproachOutput output = controller.update(poseAt(staging), base, table, true, false);
+        EXPECT_FALSE(output.captured) << "iteration=" << i;
+        EXPECT_FALSE(output.driving) << "iteration=" << i;
+        EXPECT_EQ(output.state, DockApproachState::NavigateToStagingPoint) << "iteration=" << i;
+    }
+}
+
+// --- CaptureLifecycle 7: SafetyStillOverridesLatchedDocking ---
+// Mirrors ManualOverrideReturnHomeTest.SafetyOverridesReverseDocking, but
+// specifically proves this holds once the session is a LATCHED capture
+// (not merely DockApproachController's own AlignForReverse/ReverseApproach
+// states).
+TEST(DockCaptureLifecycleTest, SafetyStillOverridesLatchedDocking)
+{
+    VirtualWorld world;
+    const Vec3 staging =
+        robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everCaptured = false;
+    for (int frame = 0; frame < 30 && !everCaptured; ++frame)
+    {
+        h.driveFrame();
+        everCaptured = h.dockCapturedPending;
+    }
+    ASSERT_TRUE(everCaptured);
+
+    const TableSurface& table = world.tableSurface();
+    world.setRobotPosition(Vec3{table.maxX - 0.05F, world.robotPose().position.y, table.maxZ - 0.05F});
+    h.driveFrame();
+
+    // Safety wins DriveAuthority regardless of the LATCHED session
+    // underneath - unchanged priority ordering (Safety > Manual >
+    // AutonomousAvoidance > Navigation > Fsm), never touched by this
+    // phase. (This exact displacement - the table's own far corner - is
+    // also large enough to exceed kReentryDistanceMultiplier's own
+    // big-displacement threshold, so the latch itself legitimately
+    // releases and re-earns entry afterward - that reentry mechanism
+    // being exercised here too, not merely Safety, is expected and
+    // correct, not asserted against.)
+    EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::Safety);
+}
+
+// --- CaptureLifecycle 8 / AvoidanceLatch 2:
+// UnrelatedObstacleStillOverridesViaAvoidance ---
+// An unrelated obstacle placed directly in the robot's path to the STAGING
+// POINT (well before any dock-capture geometry is relevant) must still
+// trigger ordinary ReactiveObstacleAvoidance - dock-capture suppression
+// never reaches this far.
+TEST(DockCaptureLifecycleTest, UnrelatedObstacleStillOverridesViaAvoidance)
+{
+    VirtualWorld world;
+    world.setRobotPosition(Vec3{0.6F, world.robotPose().position.y, 0.6F});
+    world.setRobotHeading(180.0F);
+    MapAwareHarness h(world);
+    // Repositions the existing Mouse obstacle (index 2 - Monitor, Keyboard,
+    // Mouse, then the dock housing, matching VirtualWorld.cpp's own
+    // construction order) directly between the far-away start pose and the
+    // dock - well outside DockApproachController::kDockStagingCaptureRadius
+    // of the staging point, so it can only ever be attributed to itself,
+    // never the dock. Mirrors VirtualDistanceSensorTests.cpp's own
+    // established "reposition an existing obstacle" pattern rather than
+    // inventing a second, disconnected obstacle representation just for
+    // this test.
+    ASSERT_TRUE(world.setObstaclePosition(2, Vec3{0.6F, world.robotPose().position.y, -0.3F}));
+    ASSERT_TRUE(world.setObstacleSize(2, Vec3{0.3F, 0.3F, 0.3F}));
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everAvoidanceActive = false;
+    for (int frame = 0; frame < 300 && !everAvoidanceActive; ++frame)
+    {
+        h.driveFrame();
+        everAvoidanceActive = h.avoidance.active();
+    }
+    EXPECT_TRUE(everAvoidanceActive) << "an unrelated obstacle failed to ever trigger ordinary avoidance";
+}
+
+// ============================================================
+// Phase 13Y stale dock-attributable avoidance RELEASE tests
+// (real-GUI-traced)
+// ============================================================
+
+// --- AvoidanceLatch 1: DockAttributedActiveAvoidanceClearsOnCaptureEntry ---
+TEST(DockAvoidanceLatchTest, DockAttributedActiveAvoidanceClearsOnCaptureEntry)
+{
+    VirtualWorld world;
+    const Vec3 staging =
+        robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everCaptured = false;
+    bool avoidanceActiveAtCaptureEntry = false;
+    for (int frame = 0; frame < 30 && !everCaptured; ++frame)
+    {
+        avoidanceActiveAtCaptureEntry = h.avoidance.active();
+        h.driveFrame();
+        everCaptured = h.dockCapturedPending;
+    }
+    ASSERT_TRUE(everCaptured);
+    // Whether or not avoidance happened to be active going in, it must
+    // never remain active once captured - see main3d.cpp's own
+    // dockAttributableAvoidanceReleaseThisFrame docs.
+    (void)avoidanceActiveAtCaptureEntry;
+    EXPECT_FALSE(h.avoidance.active());
+}
+
+// --- AvoidanceLatch 3: DockAvoidanceDoesNotRetriggerInsideValidatedDockLane ---
+TEST(DockAvoidanceLatchTest, DockAvoidanceDoesNotRetriggerInsideValidatedDockLane)
+{
+    VirtualWorld world;
+    const Vec3 staging =
+        robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everAvoidanceActiveOnceCaptured = false;
+    for (int frame = 0; frame < 400 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+        if (h.dockCapturedPending)
+        {
+            everAvoidanceActiveOnceCaptured = everAvoidanceActiveOnceCaptured || h.avoidance.active();
+        }
+    }
+    EXPECT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_FALSE(everAvoidanceActiveOnceCaptured);
+}
+
+// --- AvoidanceLatch 4: LeavingDockingSessionRestoresNormalAvoidanceBehavior ---
+TEST(DockAvoidanceLatchTest, LeavingDockingSessionRestoresNormalAvoidanceBehavior)
+{
+    VirtualWorld world;
+    const Vec3 staging =
+        robot::visual::computeDockStagingPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{staging.x, world.robotPose().position.y, staging.z});
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    // Complete the docking session first.
+    for (int frame = 0; frame < 400 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+    }
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    ASSERT_FALSE(h.dockCapturedPending);
+
+    // Docking parks the robot directly against the dock housing, so
+    // hardware.obstacleDetected() reads continuously true right through to
+    // Ready - HardwareEventSource only ever raises ObstacleDetected on a
+    // RISING edge (see that class's own docs), so a scenario must let
+    // detection genuinely settle back to false at least once before
+    // introducing a new hazard, or the new hazard would never re-trigger
+    // the event either (an artifact of teleporting the robot directly
+    // between two always-detected positions in a test - never a real
+    // production sequence, where the robot always physically drives
+    // through open space first). Relocating somewhere obstacle-free and
+    // running one frame does exactly that.
+    world.setRobotPosition(Vec3{0.0F, world.robotPose().position.y, 1.8F});
+    world.setRobotHeading(0.0F);
+    h.driveFrame();
+    ASSERT_FALSE(h.hardware.obstacleDetected());
+
+    // Manually place the robot at the exact pose/heading
+    // UnrelatedObstacleStillOverridesViaAvoidance's own docs already prove
+    // reliably drives straight into the (repositioned) Mouse obstacle -
+    // deterministic, rather than depending on whichever direction Roam's
+    // own frontier selection happens to pick next. Proves ordinary
+    // avoidance triggers exactly as if no docking session had ever
+    // happened - the session having fully released (asserted above) is
+    // what is actually under test, not FrontierExplorer's own target
+    // choice.
+    world.setRobotPosition(Vec3{0.6F, world.robotPose().position.y, 0.6F});
+    world.setRobotHeading(180.0F);
+    ASSERT_TRUE(world.setObstaclePosition(2, Vec3{0.6F, world.robotPose().position.y, -0.3F}));
+    ASSERT_TRUE(world.setObstacleSize(2, Vec3{0.3F, 0.3F, 0.3F}));
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.requestStartRoamKeyPress();
+
+    bool everAvoidanceActive = false;
+    for (int frame = 0; frame < 300 && !everAvoidanceActive; ++frame)
+    {
+        h.driveFrame();
+        everAvoidanceActive = h.avoidance.active();
+    }
+    EXPECT_TRUE(everAvoidanceActive)
+        << "avoidance never triggered again after leaving a completed docking session";
 }
 
 TEST(ManualOverrideReturnHomeTest, ManualOverrideNotRelatchedSameFrame)

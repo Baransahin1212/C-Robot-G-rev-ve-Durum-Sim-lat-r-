@@ -10,15 +10,15 @@ DockApproachArrivalEventSource::DockApproachArrivalEventSource(const DockApproac
 
 std::optional<Event> DockApproachArrivalEventSource::pollEvent()
 {
-    const bool arrivedNow = controller_.state() == DockApproachState::Arrived;
+    const bool dockedNow = controller_.state() == DockApproachState::Docked;
 
     std::optional<Event> result;
-    if (arrivedNow && !wasArrived_)
+    if (dockedNow && !wasArrived_)
     {
         result = Event{EventType::HomeReached, 0, std::nullopt};
     }
 
-    wasArrived_ = arrivedNow;
+    wasArrived_ = dockedNow;
     return result;
 }
 
