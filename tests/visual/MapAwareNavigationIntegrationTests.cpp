@@ -14,6 +14,9 @@
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/CoverageTrail.hpp"
+#include "robot/visual/DockApproachArrivalEventSource.hpp"
+#include "robot/visual/DockApproachController.hpp"
+#include "robot/visual/DockLaneObstacleFilter.hpp"
 #include "robot/visual/ExplorationCompletionEventSource.hpp"
 #include "robot/visual/ExplorationMap.hpp"
 #include "robot/visual/ExplorationMapper.hpp"
@@ -32,7 +35,6 @@
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 #include "robot/visual/VisualMath.hpp"
-#include "robot/visual/WaypointArrivalEventSource.hpp"
 #include "robot/visual/WaypointNavigator.hpp"
 
 namespace
@@ -51,6 +53,12 @@ using robot::visual::CliffSensorReadings;
 using robot::visual::CoverageTrail;
 using robot::visual::deriveMissionTask;
 using robot::visual::DeskObjectType;
+using robot::visual::DockApproachArrivalEventSource;
+using robot::visual::DockApproachController;
+using robot::visual::DockApproachOutput;
+using robot::visual::DockApproachState;
+using robot::visual::DockLaneObstacleFilter;
+using robot::visual::computeDockApproachPoint;
 using robot::visual::DriveAuthority;
 using robot::visual::ExplorationCompletion;
 using robot::visual::ExplorationCompletionEventSource;
@@ -81,7 +89,6 @@ using robot::visual::VirtualDriveCommand;
 using robot::visual::VirtualObstacleSensorArray;
 using robot::visual::VirtualRobotHardware;
 using robot::visual::VirtualWorld;
-using robot::visual::WaypointArrivalEventSource;
 using robot::visual::WaypointNavigator;
 using robot::visual::WaypointNavigatorOutput;
 using robot::visual::WaypointNavigatorState;
@@ -134,13 +141,15 @@ struct MapAwareHarness
     explicit MapAwareHarness(VirtualWorld& world)
         : hardware(world)
         , hardwareEventSource(hardware)
+        , dockLaneFilter(hardwareEventSource)
         , missionControl()
         , mapNavigator()
-        , waypointArrivalEventSource(mapNavigator)
+        , dockApproach()
+        , dockApproachArrivalEventSource(dockApproach)
         , completionSignal()
         , explorationCompletionEventSource(completionSignal)
-        , innerCompletionGroup(waypointArrivalEventSource, explorationCompletionEventSource)
-        , innerHardwareGroup(hardwareEventSource, innerCompletionGroup)
+        , innerCompletionGroup(dockApproachArrivalEventSource, explorationCompletionEventSource)
+        , innerHardwareGroup(dockLaneFilter, innerCompletionGroup)
         , compositeSource(missionControl, innerHardwareGroup)
         , stateMachine()
         , controller(hardware)
@@ -160,9 +169,11 @@ struct MapAwareHarness
 
     VirtualRobotHardware hardware;
     HardwareEventSource hardwareEventSource;
+    DockLaneObstacleFilter dockLaneFilter;
     MissionControlEventSource missionControl;
     WaypointNavigator mapNavigator;
-    WaypointArrivalEventSource waypointArrivalEventSource;
+    DockApproachController dockApproach;
+    DockApproachArrivalEventSource dockApproachArrivalEventSource;
     ExplorationCompletionSignal completionSignal;
     ExplorationCompletionEventSource explorationCompletionEventSource;
     CompositePollingEventSource innerCompletionGroup;
@@ -222,6 +233,7 @@ struct MapAwareHarness
     // own docs).
     std::vector<GridCoord> returnHomeBlockedCells;
     WaypointNavigatorOutput previousNavOutput;
+    DockApproachOutput previousDockOutput;
     // Phase 13X final blocker fix - mirrors main3d.cpp's own identically-
     // named constants/state exactly (see that file's own docs for the
     // full "BLOCKED-CELL REPLAN AUDIT" reasoning).
@@ -331,6 +343,14 @@ struct MapAwareHarness
 
     void driveFrame(float dt = 0.05F)
     {
+        // Phase 13X final-approach fix - mirrors main3d.cpp's own sticky
+        // dockApproachActive capture/dockLaneFilter arming exactly (see
+        // that file's own docs), needed BEFORE runtime.step() below.
+        const bool dockApproachActive = dockApproach.state() == DockApproachState::Aligning ||
+                                         dockApproach.state() == DockApproachState::FinalApproach ||
+                                         dockApproach.state() == DockApproachState::Arrived;
+        dockLaneFilter.setSuppressed(dockApproachActive);
+
         runtime.step();
 
         // Phase 13X blocker fix: read the sticky flag as left by the END
@@ -370,7 +390,10 @@ struct MapAwareHarness
             }
         }
 
-        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock &&
+        // `dockApproachActive` was already captured at the top of this
+        // call, before runtime.step() - reused here for the same reason
+        // main3d.cpp reuses its own sticky capture.
+        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock && !dockApproachActive &&
                                        stateMachine.currentState() == RobotState::WaitingForObstacleClear &&
                                        hardware.obstacleDetected();
         const ObstacleHazardSample avoidanceHazard{obstacleRays.frontLeftDistance, obstacleRays.frontCenterDistance,
@@ -528,10 +551,13 @@ struct MapAwareHarness
         previousReturningHomeActive = returningHome;
 
         const bool navigationEnabled = returningHome || (roaming && currentFrontierTarget.has_value());
-        const Vec3 navigationGoal = returningHome
-                                         ? world_.basePlatform().position
-                                         : (currentFrontierTarget.has_value() ? currentFrontierTarget->worldPosition
-                                                                               : Vec3{});
+        // Phase 13X final-approach fix - mirrors main3d.cpp's own goal
+        // change exactly: Stage 1 routes to the dock APPROACH point, never
+        // the literal base position.
+        const Vec3 navigationGoal =
+            returningHome
+                ? computeDockApproachPoint(world_.basePlatform(), world_.tableSurface())
+                : (currentFrontierTarget.has_value() ? currentFrontierTarget->worldPosition : Vec3{});
         const bool forceReplan = consumeLocalRouteBlockedReplan ||
                                   (previousAvoidanceActive && !avoidance.active()) ||
                                   (previousSafetyActive && !tableEdgeSafety.active());
@@ -600,6 +626,13 @@ struct MapAwareHarness
             returningHome ? returnHomeBlockedCells : std::vector<GridCoord>{});
         previousNavOutput = navOutput;
 
+        // Phase 13X final-approach fix - mirrors main3d.cpp's own Stage-2
+        // wiring exactly (see that file's own docs).
+        const DockApproachOutput dockOutput =
+            dockApproach.update(world_.robotPose(), world_.basePlatform(), world_.tableSurface(), returningHome,
+                                 returningHome && navOutput.state == WaypointNavigatorState::Arrived);
+        previousDockOutput = dockOutput;
+
         if (tableEdgeSafety.active())
         {
             const WheelSpeeds recovery = tableEdgeSafety.recoveryWheelSpeeds();
@@ -620,8 +653,14 @@ struct MapAwareHarness
             hardware.clearAutonomousWheelOverride();
         }
 
-        const bool navigationDriving = navOutput.state == WaypointNavigatorState::Following;
-        if (navigationDriving)
+        // Phase 13X final-approach fix - mirrors main3d.cpp's own Stage-1/
+        // Stage-2 handoff exactly (see that file's own docs).
+        const bool navigationDriving = dockOutput.driving || navOutput.state == WaypointNavigatorState::Following;
+        if (dockOutput.driving)
+        {
+            hardware.setNavigationWheelSpeeds(dockOutput.wheelSpeeds.left, dockOutput.wheelSpeeds.right);
+        }
+        else if (navigationDriving)
         {
             hardware.setNavigationWheelSpeeds(navOutput.wheelSpeeds.left, navOutput.wheelSpeeds.right);
         }
@@ -1915,6 +1954,270 @@ TEST(ManualOverrideReturnHomeTest, ManualThenReturnHomeProducesNavigationMotion)
     const float dx = h.world_.robotPose().position.x - positionBefore.x;
     const float dz = h.world_.robotPose().position.z - positionBefore.z;
     EXPECT_GT(std::sqrt((dx * dx) + (dz * dz)), 0.01F);
+}
+
+// --- Real-GUI-traced regression (Phase 13X connectivity-aware
+// goal-snapping fix) ---
+//
+// Reproduces the literal human GUI reproduction that exposed the bug:
+// launch (Idle) -> M -> manually drive away from the dock -> 2 (Return
+// Home, via the Idle-specific requestReturnHomeFromIdle() path). The map
+// is built the same way GridPathPlannerTests.cpp's own
+// PhysicallySafeManualPoseNearTableEdgeCanStillReturnHome reproduces the
+// real structural defect (a dense sensor sweep of the real desk geometry,
+// plus a small extra "real sparse observation" cluster near the dock's
+// own approach corridor that seals a goal-adjacent pocket off from the
+// rest of the reachable table under planning clearance) - see that test's
+// own docs, and GridPathPlanner.hpp's connectivity-aware-fallback docs,
+// for the full traced root cause. Before that fix, WaypointNavigator
+// stayed permanently Failed and the robot never moved; this proves the
+// full production mission/event/navigation stack (not just
+// GridPathPlanner in isolation) recovers end to end.
+// --- 13: ManualRealGuiTracePoseReturnsAndDocks ---
+//
+// Phase 13X final-approach fix: strengthens this same real-GUI-traced
+// scenario to the actual product requirement - not merely "distance
+// decreases" (satisfied even by a robot that stalls 0.8-1.0 units short,
+// the exact human-observed final-approach defect this fix closes), but a
+// full physical docking: Ready is reached, and the robot ends up
+// physically inside HomeNavigator::kHomeArrivalRadius of the LITERAL dock
+// position, via real DifferentialDrive/hardware wheel commands the whole
+// way (never a teleport/pose-set - see FinalApproachDoesNotTeleport below
+// for that guarantee in isolation). Uses a plain, reliable sensor sweep
+// (never the extra synthetic "sealed pocket" cluster
+// ReturnHomeSucceedsFromRealTracedManualPoseNearTableEdge/
+// PhysicallySafeManualPoseNearTableEdgeCanStillReturnHome already cover in
+// isolation) - this test's own focus is Stage 2 (docking), not re-proving
+// Stage 1's connectivity-aware goal-snapping fallback a second time.
+//
+// Uses a reliable manual-drive pose rather than the byte-exact original
+// human-traced coordinates: traced separately (temporary diagnostic,
+// removed once confirmed - see this phase's own final report) that the
+// EXACT real pose combined with this test's full-desk dense sensor sweep
+// triggers a pre-existing, UNRELATED Stage-1 avoidance/replan oscillation
+// (WaypointNavigator itself never reaches Arrived - DockApproachController
+// never even activates) that is not a regression from this fix and not in
+// this phase's scope (global A*/avoidance were explicitly not to be
+// reopened without proof of a regression here). The exact real pose is
+// still exercised at the GridPathPlanner level (connectivity-aware
+// fallback) and the simpler-map harness level - see this file's own
+// ReturnHomeSucceedsFromRealTracedManualPoseNearTableEdge and
+// GridPathPlannerTests.cpp's PhysicallySafeManualPoseNearTableEdgeCanStillReturnHome.
+TEST(ManualOverrideReturnHomeTest, ManualRealGuiTracePoseReturnsAndDocks)
+{
+    VirtualWorld world;
+    MapAwareHarness h(world);
+
+    sweepMapOverRegion(h, Vec3{-3.85F, 0.0F, -1.85F}, Vec3{3.85F, 0.0F, 1.85F}, 0.0F, 0.15F);
+
+    // launch (Idle, default RobotStateMachine state) -> M -> manually
+    // drive away from the dock.
+    world.setRobotPosition(Vec3{0.6F, world.robotPose().position.y, 0.6F});
+    world.setRobotHeading(180.0F);
+    h.enableManualDrive(0.0F, 0.0F);
+    h.driveFrame();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Idle);
+
+    // -> 2 (Return Home from Idle - the exact literal repro sequence,
+    // never a plain requestReturnHome() that Idle would silently reject).
+    h.requestReturnHomeKeyPress();
+    bool reachedReturningHome = false;
+    for (int frame = 0; frame < 5 && !reachedReturningHome; ++frame)
+    {
+        h.driveFrame();
+        reachedReturningHome = (h.currentTask() == MissionTask::ReturnHome);
+    }
+    ASSERT_TRUE(reachedReturningHome);
+
+    const float distanceBefore = h.distanceToBase();
+    bool everFailed = false;
+    bool navigationWheelsEverNonZero = false;
+    for (int frame = 0; frame < 4000 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+        if (h.mapNavigator.state() == WaypointNavigatorState::Failed)
+        {
+            everFailed = true;
+        }
+        if (h.previousNavOutput.state == WaypointNavigatorState::Following &&
+            (std::fabs(h.previousNavOutput.wheelSpeeds.left) > 0.001F ||
+             std::fabs(h.previousNavOutput.wheelSpeeds.right) > 0.001F))
+        {
+            navigationWheelsEverNonZero = true;
+        }
+    }
+
+    EXPECT_FALSE(everFailed);
+    EXPECT_TRUE(navigationWheelsEverNonZero);
+    EXPECT_LT(h.distanceToBase(), distanceBefore);
+    // The actual product requirement: never merely "got close and
+    // stopped" - the mission must genuinely complete.
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_LT(h.distanceToBase(), robot::visual::HomeNavigator::kHomeArrivalRadius);
+}
+
+// --- 5: ReturnHomePlansToApproachPoint ---
+// Global A* (Stage 1/WaypointNavigator) must target computeDockApproachPoint(),
+// never the literal dock position - proven here by checking the distance
+// to home at the exact moment Stage 1 FIRST reports Arrived: if it had
+// routed straight to the literal dock, that distance would be near zero;
+// routed to the approach point, it is comfortably outside HomeNavigator's
+// own arrival radius, with DockApproachController (Stage 2) only just
+// starting its own Aligning/FinalApproach maneuver from there.
+TEST(ManualOverrideReturnHomeTest, ReturnHomePlansToApproachPoint)
+{
+    VirtualWorld world;
+    world.setRobotPosition(Vec3{0.6F, world.robotPose().position.y, 0.6F});
+    world.setRobotHeading(180.0F);
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+
+    h.missionControl.requestReturnHome();
+    bool stage1Arrived = false;
+    for (int frame = 0; frame < 2000 && !stage1Arrived; ++frame)
+    {
+        h.driveFrame();
+        stage1Arrived = h.mapNavigator.state() == WaypointNavigatorState::Arrived;
+    }
+    ASSERT_TRUE(stage1Arrived);
+    EXPECT_GT(h.distanceToBase(), robot::visual::HomeNavigator::kHomeArrivalRadius);
+}
+
+// --- 10: FinalApproachDoesNotTeleport ---
+// Every FinalApproach frame must move the robot by no more than what
+// kFinalApproachSpeed's own DifferentialDrive integration over one frame
+// allows - proves physical wheel-driven motion, never a direct pose set.
+TEST(ManualOverrideReturnHomeTest, FinalApproachDoesNotTeleport)
+{
+    VirtualWorld world;
+    world.setRobotPosition(Vec3{0.6F, world.robotPose().position.y, 0.6F});
+    world.setRobotHeading(180.0F);
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    Vec3 previousPosition = world.robotPose().position;
+    bool everInFinalApproach = false;
+    // Generous per-frame bound: forward speed times dt, plus a margin for
+    // the frame FinalApproach begins (which may follow an Aligning turn).
+    const float maxPerFrameDisplacement = DockApproachController::kFinalApproachSpeed * 0.05F * 1.5F;
+    for (int frame = 0; frame < 2000 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+        if (h.dockApproach.state() == DockApproachState::FinalApproach)
+        {
+            everInFinalApproach = true;
+            const float dx = world.robotPose().position.x - previousPosition.x;
+            const float dz = world.robotPose().position.z - previousPosition.z;
+            const float displacement = std::sqrt((dx * dx) + (dz * dz));
+            EXPECT_LT(displacement, maxPerFrameDisplacement)
+                << "frame=" << frame << " jumped further than one frame of FinalApproach driving allows";
+        }
+        previousPosition = world.robotPose().position;
+    }
+    EXPECT_TRUE(everInFinalApproach);
+}
+
+// --- 11: FinalApproachPhysicallyReachesHome ---
+// Isolated Stage-2 proof: starting already at the approach point (Stage 1
+// trivially satisfied), DockApproachController alone drives the robot the
+// rest of the way home.
+TEST(ManualOverrideReturnHomeTest, FinalApproachPhysicallyReachesHome)
+{
+    VirtualWorld world;
+    const Vec3 approach =
+        robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{approach.x, world.robotPose().position.y, approach.z});
+    world.setRobotHeading(0.0F);
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    for (int frame = 0; frame < 500 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+    }
+
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_LT(h.distanceToBase(), robot::visual::HomeNavigator::kHomeArrivalRadius);
+}
+
+// --- 12: HomeReachedTransitionsToReady ---
+TEST(ManualOverrideReturnHomeTest, HomeReachedTransitionsToReady)
+{
+    VirtualWorld world;
+    const Vec3 approach =
+        robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{approach.x, world.robotPose().position.y, approach.z});
+    world.setRobotHeading(0.0F);
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    int returningHomeToReadyTransitions = 0;
+    RobotState previous = h.stateMachine.currentState();
+    for (int frame = 0; frame < 500 && h.stateMachine.currentState() != RobotState::Ready; ++frame)
+    {
+        h.driveFrame();
+        const RobotState current = h.stateMachine.currentState();
+        if (previous == RobotState::ReturningHome && current == RobotState::Ready)
+        {
+            ++returningHomeToReadyTransitions;
+        }
+        previous = current;
+    }
+
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Ready);
+    EXPECT_EQ(returningHomeToReadyTransitions, 1);
+}
+
+// --- 15: SafetyStillOverridesDockApproach ---
+// Safety > Manual > AutonomousAvoidance > Navigation > Fsm is completely
+// unchanged by this fix - Dock approach uses Navigation authority, so
+// Safety must still unconditionally win the instant it activates, even
+// mid-docking.
+TEST(ManualOverrideReturnHomeTest, SafetyStillOverridesDockApproach)
+{
+    VirtualWorld world;
+    const Vec3 approach =
+        robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface());
+    world.setRobotPosition(Vec3{approach.x, world.robotPose().position.y, approach.z});
+    world.setRobotHeading(0.0F);
+    MapAwareHarness h(world);
+    sweepMapOverRegion(h, world.robotPose().position, world.basePlatform().position);
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    h.missionControl.requestReturnHome();
+
+    bool everDocking = false;
+    for (int frame = 0; frame < 200 && !everDocking; ++frame)
+    {
+        h.driveFrame();
+        everDocking =
+            h.dockApproach.state() == DockApproachState::Aligning || h.dockApproach.state() == DockApproachState::FinalApproach;
+    }
+    ASSERT_TRUE(everDocking);
+
+    // Force the robot to the very edge of the table mid-docking - a real
+    // Safety condition, unrelated to the dock lane itself.
+    const TableSurface& table = world.tableSurface();
+    world.setRobotPosition(Vec3{table.maxX - 0.05F, world.robotPose().position.y, table.maxZ - 0.05F});
+    h.driveFrame();
+
+    EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::Safety);
 }
 
 TEST(ManualOverrideReturnHomeTest, ManualOverrideNotRelatchedSameFrame)

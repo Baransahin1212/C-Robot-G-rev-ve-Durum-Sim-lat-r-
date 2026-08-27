@@ -160,6 +160,56 @@ TEST(WaypointNavigatorTest, FailedWhenNoPathExists)
     EXPECT_FLOAT_EQ(output.wheelSpeeds.right, 0.0F);
 }
 
+// Phase 13X blocker fix (Failed-state retry audit, real-GUI-traced): a
+// Failed attempt must be able to recover once the map genuinely learns
+// something new (ExplorationMap::revision() changes), even with the same
+// pose/goal and forceReplan=false - never require an unrelated external
+// stimulus (goal change, forced replan) just to notice a route that only
+// just became possible. The "wall" here is UNKNOWN cells (never marked
+// Free) rather than Occupied ones, matching the real scenario this fix
+// targets: a corridor genuinely not yet explored, which later exploration
+// observations open up.
+TEST(WaypointNavigatorTest, FailedRecoversWhenMapRevisionChangesWithoutForceReplanOrGoalChange)
+{
+    // Carve an UNKNOWN gap-free wall by leaving one full-width row
+    // Unknown (never calling markFree on it) - Unknown is never
+    // traversable, so this blocks every route just like a real
+    // not-yet-explored corridor would.
+    ExplorationMap wallMap(bigBounds());
+    for (int row = 0; row < wallMap.height(); ++row)
+    {
+        for (int col = 0; col < wallMap.width(); ++col)
+        {
+            if (row != 20)
+            {
+                wallMap.markFree(col, row);
+            }
+        }
+    }
+    WaypointNavigator navigator;
+
+    const Vec3 start = wallMap.cellToWorld(8, 10);
+    const Vec3 goal = wallMap.cellToWorld(8, 30);
+
+    const WaypointNavigatorOutput blocked = navigator.update(poseAt(start), wallMap, goal, true, false);
+    ASSERT_EQ(blocked.state, WaypointNavigatorState::Failed);
+
+    // Nothing changed - must remain Failed, never flip-flop or crash from
+    // repeated identical calls.
+    const WaypointNavigatorOutput stillBlocked = navigator.update(poseAt(start), wallMap, goal, true, false);
+    EXPECT_EQ(stillBlocked.state, WaypointNavigatorState::Failed);
+
+    // The map genuinely learns the row is passable (revision() changes) -
+    // same pose, same goal, forceReplan still false.
+    for (int col = 0; col < wallMap.width(); ++col)
+    {
+        wallMap.markFree(col, 20);
+    }
+    const WaypointNavigatorOutput recovered = navigator.update(poseAt(start), wallMap, goal, true, false);
+    EXPECT_EQ(recovered.state, WaypointNavigatorState::Following);
+    EXPECT_FALSE(recovered.route.empty());
+}
+
 TEST(WaypointNavigatorTest, ReachingFinalWaypointReportsArrived)
 {
     ExplorationMap map(bigBounds());

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -97,10 +98,13 @@ struct WaypointNavigatorOutput
 //   - the current route's remaining cells include one the map now reports
 //     Occupied ("path becomes invalid" / newly discovered obstacle)
 //   - NavigationProgressTracker reports stuck (the anti-360-spin fix)
-//   - the previous replan attempt itself reported Failed (retried every
-//     call while Failed, so a growing map can unblock it without any
-//     external stimulus - Return Home's goal never itself changes, so
-//     nothing else would ever re-trigger a retry)
+//   - the previous replan attempt itself reported Failed AND, since that
+//     attempt, either the map's content actually changed
+//     (ExplorationMap::revision(), a real GUI-traced fix - see this
+//     class's own .cpp docs) or the robot's pose moved meaningfully (e.g.
+//     Manual/Safety displaced it) - never merely "still Failed," which
+//     would re-run A* every single frame for as long as nothing about the
+//     situation had changed at all
 // - i.e. event/state/dirty-driven, never a per-frame unconditional re-plan
 // (this phase's own brief: "Do NOT re-run A* every frame").
 class WaypointNavigator
@@ -144,6 +148,14 @@ private:
     std::size_t waypointIndex_ = 0;
     Vec3 lastGoal_{};
     bool hasLastGoal_ = false;
+
+    // Phase 13X blocker fix (Failed-state retry audit): the map
+    // revision/pose recorded at the moment the CURRENT Failed attempt was
+    // made - see this class's own .cpp docs for why a Failed retry is
+    // gated on these rather than retried unconditionally every call.
+    std::uint64_t mapRevisionAtLastFailedAttempt_ = 0;
+    Vec3 poseAtLastFailedAttempt_{};
+    bool hasFailedAttemptContext_ = false;
 };
 
 } // namespace robot::visual

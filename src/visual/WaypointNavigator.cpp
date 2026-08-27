@@ -35,7 +35,29 @@ WaypointNavigatorOutput WaypointNavigator::update(const RobotPose& pose, const E
 
     const bool freshStart = (state_ == WaypointNavigatorState::Inactive);
     const bool goalChanged = !hasLastGoal_ || distanceWorld(goalWorld, lastGoal_) > kGoalChangeEpsilonWorldUnits;
-    bool needsReplan = freshStart || goalChanged || forceReplan || (state_ == WaypointNavigatorState::Failed);
+    bool needsReplan = freshStart || goalChanged || forceReplan;
+
+    // Phase 13X blocker fix (Failed-state retry audit, real-GUI-traced):
+    // a Failed attempt only retries when something has actually changed
+    // since it was made - the map genuinely learned something new
+    // (ExplorationMap::revision(), bumped only on a real cell change,
+    // never every frame), or the robot's pose moved meaningfully (Manual/
+    // Safety displaced it, or Navigation's own last partial route did) -
+    // never merely "still Failed," which silently re-ran A* every single
+    // rendered frame for as long as nothing about the situation had
+    // changed at all (contradicts this class's own "Do NOT re-run A*
+    // every frame" brief, and was the exact behavior a reproduced real
+    // GUI trace showed staying Failed indefinitely with no way to
+    // recover once the underlying planner issue was fixed).
+    if (!needsReplan && state_ == WaypointNavigatorState::Failed)
+    {
+        const bool mapChangedSinceFailure =
+            !hasFailedAttemptContext_ || map.revision() != mapRevisionAtLastFailedAttempt_;
+        const bool poseChangedSinceFailure = !hasFailedAttemptContext_ ||
+                                              distanceWorld(pose.position, poseAtLastFailedAttempt_) >
+                                                  kGoalChangeEpsilonWorldUnits;
+        needsReplan = mapChangedSinceFailure || poseChangedSinceFailure;
+    }
 
     if (!needsReplan && state_ == WaypointNavigatorState::Following)
     {
@@ -104,6 +126,7 @@ void WaypointNavigator::reset() noexcept
     route_.clear();
     waypointIndex_ = 0;
     hasLastGoal_ = false;
+    hasFailedAttemptContext_ = false;
     localSteering_.reset();
     progressTracker_.reset();
 }
@@ -131,11 +154,19 @@ void WaypointNavigator::planRoute(const RobotPose& pose, const ExplorationMap& m
     {
         state_ = WaypointNavigatorState::Failed;
         route_.clear();
+        // Record the context THIS failed attempt was made under, so the
+        // next update() call only retries once something actually changes
+        // (see this class's own header docs and the needsReplan gating
+        // above) - never left stale from an earlier, different failure.
+        mapRevisionAtLastFailedAttempt_ = map.revision();
+        poseAtLastFailedAttempt_ = pose.position;
+        hasFailedAttemptContext_ = true;
         return;
     }
 
     route_ = result.waypoints;
     state_ = WaypointNavigatorState::Following;
+    hasFailedAttemptContext_ = false;
 }
 
 namespace

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "robot/visual/VirtualWorld.hpp"
@@ -155,6 +156,20 @@ public:
     // policy (Phase 13V brief, "do NOT write every frame").
     bool consumeDirty() noexcept;
 
+    // Phase 13X blocker fix (Failed-state retry audit): monotonically
+    // increasing counter, bumped exactly once per actual cell change (the
+    // same "did this call really change anything" condition
+    // markFree()/markOccupied()/setCells() already use for `dirty_` -
+    // never a change-COUNT, and never reset by consumeDirty() or anything
+    // else, unlike `dirty_` itself). Lets a caller (WaypointNavigator)
+    // cheaply answer "has the map changed at all since I last looked,"
+    // without consuming/racing against main3d.cpp's own independent
+    // dirty-driven save-timer consumer of `dirty_`. See
+    // WaypointNavigator.cpp's own docs on why a stuck Failed plan must
+    // only retry on a genuine map/pose/goal change, never blindly every
+    // frame.
+    std::uint64_t revision() const noexcept;
+
 private:
     std::size_t indexOf(int col, int row) const noexcept;
 
@@ -163,6 +178,7 @@ private:
     int height_ = 0;
     std::vector<MapCell> cells_;
     bool dirty_ = false;
+    std::uint64_t revision_ = 0;
 };
 
 } // namespace robot::visual

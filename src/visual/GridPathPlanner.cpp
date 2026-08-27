@@ -418,6 +418,74 @@ PathPlanResult GridPathPlanner::planPath(const Vec3& startWorld, const Vec3& goa
         }
     }
 
+    // Phase 13X connectivity-aware goal-snapping fix (real-GUI-traced
+    // defect): the distance-only snap above (`findNearestTraversableCell`)
+    // proves a cell is traversable, never that it is reachable from
+    // `startWorld` - on a real, sensor-explored map (sparse/outline-shaped
+    // Occupied cells, unlike a synthetic solid-footprint test map) the
+    // nearest traversable cell to a goal can sit in its own small pocket,
+    // sealed off from the rest of the reachable table by clearance
+    // inflation from nearby real obstacle observations, even though the
+    // TRUE (fully/idealized) desk geometry has no such seal - traced and
+    // confirmed via the real persisted exploration map from a reproduced
+    // "manual drive away from dock, then Return Home never moves" GUI bug.
+    // When A* exhausts `open` without ever reaching `goalCell`, `closed`
+    // is exactly the set of cells genuinely reachable from `startCell`
+    // under this planner's own connectivity rules (8-connected,
+    // corner-cutting prevented - the identical rules the search itself
+    // just used, never a separately-maintained reachability definition) -
+    // reused here to retarget the plan at whichever REACHABLE cell sits
+    // nearest the original requested goal point, instead of failing
+    // outright. This never weakens clearance/Unknown policy and never
+    // searches unboundedly far past what A* already explored; it only
+    // stops planning from silently giving up when a genuinely reachable,
+    // "as close as currently possible" route exists.
+    //
+    // Scoped to `goalSnapped` ONLY - never applied when the literal
+    // requested goal cell was itself already traversable and simply
+    // unreachable (a genuine wall/Unknown-region/extraBlockedCells
+    // disconnection). That "no path" contract is real and load-bearing
+    // (NoPathReturnsFailure, UnknownBlockedForReturnHome,
+    // ExtraBlockedCellsCanMakeGoalUnreachable, and every caller that reacts
+    // to WaypointNavigatorState::Failed - e.g. frontier blacklisting -
+    // depend on planPath() actually failing when a directly-requested goal
+    // is truly disconnected, never silently substituting a nearby stand-in
+    // instead). This fallback only ever second-guesses the PLANNER'S OWN
+    // distance-only substitute choice for a goal it had already decided
+    // could not be used exactly as requested.
+    if (!found && goalSnapped)
+    {
+        int bestReachableIndex = -1;
+        float bestDistanceToGoal = std::numeric_limits<float>::infinity();
+        for (std::size_t index = 0; index < cellCount; ++index)
+        {
+            if (!closed[index])
+            {
+                continue;
+            }
+            const GridCoord candidate{static_cast<int>(index % static_cast<std::size_t>(width_)),
+                                       static_cast<int>(index / static_cast<std::size_t>(width_))};
+            const float d = distanceWorld(map_.cellToWorld(candidate.col, candidate.row), goalWorld);
+            if (d < bestDistanceToGoal)
+            {
+                bestDistanceToGoal = d;
+                bestReachableIndex = static_cast<int>(index);
+            }
+        }
+
+        if (bestReachableIndex == -1 || bestReachableIndex == static_cast<int>(indexOf(startCell)))
+        {
+            // Nothing reachable beyond the start cell itself - a genuine
+            // failure, not merely a disconnected-goal case (see class
+            // docs on the start-cell exemption never implying the start
+            // has any traversable neighbor of its own).
+            return result;
+        }
+
+        found = true;
+        goalCell = GridCoord{bestReachableIndex % width_, bestReachableIndex / width_};
+    }
+
     if (!found)
     {
         return result;
@@ -444,7 +512,7 @@ PathPlanResult GridPathPlanner::planPath(const Vec3& startWorld, const Vec3& goa
     result.pathCostWorldUnits = cost;
 
     result.waypoints = simplifyPath(map_, *this, reversePath);
-    if (goalSnapped)
+    if (goalSnapped || goalCell != requestedGoalCell)
     {
         result.waypoints.push_back(goalWorld);
     }

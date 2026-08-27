@@ -96,6 +96,7 @@ void ExplorationMap::markFree(int col, int row) noexcept
     {
         cells_[index] = MapCell::Free;
         dirty_ = true;
+        ++revision_;
     }
 }
 
@@ -110,6 +111,7 @@ void ExplorationMap::markOccupied(int col, int row) noexcept
     {
         cells_[index] = MapCell::Occupied;
         dirty_ = true;
+        ++revision_;
     }
 }
 
@@ -149,6 +151,7 @@ bool ExplorationMap::setCells(const std::vector<MapCell>& cells)
     // this does not itself need an immediate re-save (mirrors
     // CoverageTrail::loadPoints()'s own reasoning).
     dirty_ = false;
+    ++revision_;
     return true;
 }
 
@@ -157,6 +160,11 @@ bool ExplorationMap::consumeDirty() noexcept
     const bool wasDirty = dirty_;
     dirty_ = false;
     return wasDirty;
+}
+
+std::uint64_t ExplorationMap::revision() const noexcept
+{
+    return revision_;
 }
 
 } // namespace robot::visual

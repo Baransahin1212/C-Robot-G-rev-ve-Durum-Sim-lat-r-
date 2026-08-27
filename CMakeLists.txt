@@ -552,6 +552,9 @@ add_library(robot_visual_simulation STATIC
     src/visual/WaypointNavigator.cpp
     src/visual/WaypointArrivalEventSource.cpp
     src/visual/ExplorationCompletionEventSource.cpp
+    src/visual/DockApproachController.cpp
+    src/visual/DockApproachArrivalEventSource.cpp
+    src/visual/DockLaneObstacleFilter.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -1356,6 +1359,22 @@ target_link_libraries(WaypointNavigatorTests PRIVATE
 
 gtest_discover_tests(WaypointNavigatorTests)
 
+# --- DockApproachControllerTests: Phase 13X final-approach fix - the
+# deterministic dock approach point/entrance heading derivation, and the
+# Stage-2 precision-docking state machine (NavigatingToApproach -> Aligning
+# -> FinalApproach -> Arrived) in isolation. Links robot_visual_simulation -
+# never robot_visual/raylib - genuinely headless.
+add_executable(DockApproachControllerTests
+    tests/visual/DockApproachControllerTests.cpp
+)
+
+target_link_libraries(DockApproachControllerTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(DockApproachControllerTests)
+
 # --- MapAwareNavigationIntegrationTests: Phase 13X - closed-loop tests
 # through the real production stack (mirrors ExplorationIntegrationTests.cpp's
 # own ExplorationHarness, extended with WaypointNavigator/FrontierExplorer/
@@ -1407,6 +1426,7 @@ if (MSVC)
         ExplorationMapTests ExplorationMapperTests CoverageTrailTests
         ExplorationMapStorageTests ExplorationIntegrationTests
         GridPathPlannerTests FrontierExplorerTests WaypointNavigatorTests
+        DockApproachControllerTests
         MapAwareNavigationIntegrationTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)

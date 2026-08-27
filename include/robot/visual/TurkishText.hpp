@@ -4,6 +4,7 @@
 
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
+#include "robot/visual/DockApproachController.hpp"
 #include "robot/visual/HomeNavigator.hpp"
 #include "robot/visual/MissionTask.hpp"
 #include "robot/visual/ReactiveObstacleAvoidance.hpp"
@@ -137,6 +138,25 @@ constexpr std::string_view turkishText(WaypointNavigatorState value) noexcept
         case WaypointNavigatorState::Following: return "Rota İzleniyor";
         case WaypointNavigatorState::Arrived: return "Ulaşıldı";
         case WaypointNavigatorState::Failed: return "Rota Bulunamadı";
+    }
+    return "Bilinmiyor";
+}
+
+// Phase 13X final-approach fix: Stage 2 precision-docking state - shown on
+// the HUD in place of WaypointNavigatorState's own text once Stage 1 hands
+// off (see main3d.cpp's own telemetry assembly), so the HUD never
+// misleadingly reads "Ulaşıldı" (Arrived) while the robot is still visibly
+// aligning/driving the last short stretch into the dock.
+constexpr std::string_view turkishText(DockApproachState value) noexcept
+{
+    switch (value)
+    {
+        case DockApproachState::Inactive: return "Kapalı";
+        case DockApproachState::NavigatingToApproach: return "Rota İzleniyor";
+        case DockApproachState::Aligning: return "Yöneliyor";
+        case DockApproachState::FinalApproach: return "Yanaşıyor";
+        case DockApproachState::Arrived: return "Eve Ulaştı";
+        case DockApproachState::Failed: return "Yanaşma Başarısız";
     }
     return "Bilinmiyor";
 }

@@ -14,6 +14,9 @@
 #include "robot/RobotState.hpp"
 #include "robot/RobotStateMachine.hpp"
 #include "robot/visual/CoverageTrail.hpp"
+#include "robot/visual/DockApproachArrivalEventSource.hpp"
+#include "robot/visual/DockApproachController.hpp"
+#include "robot/visual/DockLaneObstacleFilter.hpp"
 #include "robot/visual/ExecutableDirectory.hpp"
 #include "robot/visual/ExplorationCompletionEventSource.hpp"
 #include "robot/visual/ExplorationMap.hpp"
@@ -37,7 +40,6 @@
 #include "robot/visual/VirtualRobotHardware.hpp"
 #include "robot/visual/VirtualWorld.hpp"
 #include "robot/visual/VisualMath.hpp"
-#include "robot/visual/WaypointArrivalEventSource.hpp"
 #include "robot/visual/WaypointNavigator.hpp"
 
 namespace
@@ -317,6 +319,15 @@ int main()
     robot::visual::VirtualRobotHardware hardware(world);
     robot::HardwareEventSource hardwareEventSource(hardware);
 
+    // Phase 13X final-approach fix: sits directly in front of
+    // hardwareEventSource in the composite chain below - see
+    // DockLaneObstacleFilter.hpp's own docs for the exact deadlock this
+    // closes (a robot correctly parked at the dock, permanently detecting
+    // its own rear housing, with no path back out of
+    // WaitingForObstacleClear). `setSuppressed()` is called once per frame,
+    // before runtime.step() - see that call site's own docs.
+    robot::visual::DockLaneObstacleFilter dockLaneFilter(hardwareEventSource);
+
     // Phase 13U: the single event source behind every explicit Mission
     // Control command (`1`/`2`/`3`, and `R` as the Return Home alias - see
     // the keyboard-input block below) - never a direct FSM mutation, and
@@ -330,26 +341,53 @@ int main()
     robot::visual::MissionControlEventSource missionControl;
 
     // Phase 13X: WaypointNavigator is the map-aware waypoint-following
-    // orchestrator that now DRIVES Return Home (and, while Haritalama is
-    // actively seeking a frontier target, exploration navigation too) -
-    // it owns its own internal HomeNavigator for per-waypoint local
-    // steering (HomeNavigator itself is UNCHANGED - still exists, still
-    // does exactly the Aligning/Driving/Arrived job it always has - see
-    // HomeNavigator.hpp), asked each frame to steer toward the CURRENT
-    // waypoint of a GridPathPlanner-produced route rather than blindly
-    // straight at a possibly-obstructed final goal. WaypointArrivalEventSource
-    // observes WaypointNavigator's OWN Arrived state (edge-triggered, once
-    // the FULL route completes) to produce HomeReached, exactly like
-    // HardwareEventSource observes VirtualRobotHardware's sensors - see
-    // WaypointNavigator.hpp/WaypointArrivalEventSource.hpp for why neither
-    // ever decides FSM transitions itself. The old plain HomeNavigator +
-    // HomeArrivalEventSource production wiring is gone from this file
-    // (both classes remain fully compiled/tested elsewhere - see
-    // docs/technical-decisions.md, Phase 13X, and HomeZoneMonitor's own
-    // earlier precedent for a component staying compiled/tested after its
-    // production wiring changes).
+    // orchestrator that DRIVES Stage 1 of Return Home (global routing
+    // through known Free space) and, while Haritalama is actively seeking
+    // a frontier target, exploration navigation too - it owns its own
+    // internal HomeNavigator for per-waypoint local steering (HomeNavigator
+    // itself is UNCHANGED - still exists, still does exactly the Aligning/
+    // Driving/Arrived job it always has - see HomeNavigator.hpp), asked
+    // each frame to steer toward the CURRENT waypoint of a GridPathPlanner-
+    // produced route rather than blindly straight at a possibly-obstructed
+    // final goal. The old plain HomeNavigator + HomeArrivalEventSource
+    // production wiring is gone from this file (both classes remain fully
+    // compiled/tested elsewhere - see docs/technical-decisions.md, Phase
+    // 13X, and HomeZoneMonitor's own earlier precedent for a component
+    // staying compiled/tested after its production wiring changes).
+    //
+    // Phase 13X final-approach fix: for Return Home specifically,
+    // WaypointNavigator's own goal is now computeDockApproachPoint() (see
+    // DockApproachController.hpp) - a point comfortably in front of the
+    // dock, never the literal dock/base position itself. Global A*
+    // planning is deliberately NOT responsible for precision docking (see
+    // that header's own class docs for the full "why" - human GUI
+    // validation found the literal-goal final segment fully exposed to
+    // ReactiveObstacleAvoidance, which correctly treats the dock's own
+    // rear housing as a hazard and produced an erratic, unreliable final
+    // approach). DockApproachController is Stage 2 - the small, dedicated
+    // "align then drive the last short validated stretch" controller that
+    // takes over once WaypointNavigator reports Arrived at the approach
+    // point (see the Return Home orchestration block, below in this
+    // function, for exactly how the two stages hand off wheel authority).
+    // WaypointArrivalEventSource (still fully compiled/tested, matching
+    // HomeNavigator/HomeArrivalEventSource's own precedent) is
+    // DELIBERATELY not wired into this file's event chain any more - its
+    // own Arrived-edge would now fire the instant WaypointNavigator merely
+    // reaches the approach point, which must NEVER by itself end a Return
+    // Home mission (it is Stage 1 finishing, not the robot actually being
+    // home). DockApproachArrivalEventSource (below) is the new, correct
+    // HomeReached source: edge-triggered on DockApproachController's OWN
+    // Arrived state, which only ever becomes true once the robot has
+    // physically entered HomeNavigator::kHomeArrivalRadius of the LITERAL
+    // base position - the existing HomeReached/Ready semantics are
+    // completely unchanged, just now driven by the right controller.
+    // Haritalama's own frontier-arrival bookkeeping never depended on
+    // WaypointArrivalEventSource's Event either - it already reads
+    // mapNavigator.state() directly (see the frontier-selection block
+    // below) - so removing it from the event chain has no effect there.
     robot::visual::WaypointNavigator mapNavigator;
-    robot::visual::WaypointArrivalEventSource waypointArrivalEventSource(mapNavigator);
+    robot::visual::DockApproachController dockApproach;
+    robot::visual::DockApproachArrivalEventSource dockApproachArrivalEventSource(dockApproach);
 
     // Phase 13X: edge-triggered ReturnHomeRequested once autonomous
     // Haritalama has no reachable frontier left - see
@@ -376,9 +414,9 @@ int main()
     // must never be lost underneath a same-frame HomeReached/completion
     // readiness; a genuine arrival is reported before a same-frame
     // completion signal in the rare case both are pending at once.
-    robot::CompositePollingEventSource innerCompletionGroup(waypointArrivalEventSource,
+    robot::CompositePollingEventSource innerCompletionGroup(dockApproachArrivalEventSource,
                                                               explorationCompletionEventSource);
-    robot::CompositePollingEventSource innerHardwareGroup(hardwareEventSource, innerCompletionGroup);
+    robot::CompositePollingEventSource innerHardwareGroup(dockLaneFilter, innerCompletionGroup);
     robot::CompositePollingEventSource compositeSource(missionControl, innerHardwareGroup);
     robot::RobotStateMachine stateMachine;
     robot::RobotController controller(hardware);
@@ -805,6 +843,35 @@ int main()
                 (hudMode == robot::visual::HudMode::Full) ? robot::visual::HudMode::Compact : robot::visual::HudMode::Full;
         }
 
+        // Phase 13X final-approach fix ("FINAL APPROACH HAZARD CONTRACT"):
+        // read as the STICKY state left by the END of the PREVIOUS frame's
+        // own dockApproach.update() call (below, after navOutput) - the
+        // same one-frame-lag sticky-read convention
+        // consumeLocalRouteBlockedReplan already established for this
+        // file, needed here specifically because dockLaneFilter must be
+        // armed/disarmed BEFORE runtime.step() below, but this frame's own
+        // fresh DockApproachController state is not known until later in
+        // the frame. While DockApproachController itself is actively
+        // Aligning/FinalApproach/Arrived, it is driving (or correctly
+        // parked in) a validated, known-safe straight lane it derived
+        // analytically (isDockApproachGeometryValid() - see
+        // DockApproachController.hpp) that deliberately passes close to
+        // the dock's own rear housing - a REAL, permanent obstacle the
+        // robot must enter near, not avoid. dockLaneFilter withholds only
+        // the ObstacleDetected EVENT from ever reaching RobotStateMachine
+        // for these frames (see DockLaneObstacleFilter.hpp's own docs for
+        // the exact deadlock this closes - WaitingForObstacleClear has no
+        // path back out for a robot that is correctly never going to move
+        // away from what it detected) - obstacle SENSING itself
+        // (hardware.obstacleDetected()), ReactiveObstacleAvoidance, and
+        // Safety are all completely unaffected, and this is the smallest
+        // dock-specific exception the contract needs, never a global
+        // suppression.
+        const bool dockApproachActive = dockApproach.state() == robot::visual::DockApproachState::Aligning ||
+                                         dockApproach.state() == robot::visual::DockApproachState::FinalApproach ||
+                                         dockApproach.state() == robot::visual::DockApproachState::Arrived;
+        dockLaneFilter.setSuppressed(dockApproachActive);
+
         // Exactly one RobotRuntime::step() per rendered frame - the render
         // loop itself is the scheduler (see RobotRuntime's own docs). If
         // VirtualRobotHardware::obstacleDetected() has newly become true,
@@ -921,7 +988,13 @@ int main()
             }
         }
 
-        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock &&
+        // `dockApproachActive` (sticky, captured at the top of this frame
+        // before runtime.step() - see that capture's own docs) also gates
+        // the ordinary obstacle-triggered avoidance TRIGGER here: never
+        // avoidance.update() itself, never Safety, never any other frame/
+        // task - ReactiveObstacleAvoidance remains fully unmodified and
+        // fully active for every other lane/task/obstacle in the scene.
+        const bool triggerAvoidance = avoidanceEnabled && !avoidanceSuppressedAfterBlock && !dockApproachActive &&
                                        stateMachine.currentState() == robot::RobotState::WaitingForObstacleClear &&
                                        hardware.obstacleDetected();
         const robot::visual::ObstacleHazardSample avoidanceHazard{
@@ -1229,10 +1302,16 @@ int main()
         previousReturningHomeActive = returningHome;
 
         const bool navigationEnabled = returningHome || (roaming && currentFrontierTarget.has_value());
+        // Phase 13X final-approach fix: Return Home's global-route goal is
+        // the dock APPROACH point, never the literal base position - see
+        // DockApproachController.hpp's own class docs, and this file's own
+        // WaypointNavigator/DockApproachController declaration comments
+        // above, for the full two-stage "why."
         const robot::visual::Vec3 navigationGoal =
-            returningHome ? world.basePlatform().position
-                          : (currentFrontierTarget.has_value() ? currentFrontierTarget->worldPosition
-                                                                 : robot::visual::Vec3{});
+            returningHome
+                ? robot::visual::computeDockApproachPoint(world.basePlatform(), world.tableSurface())
+                : (currentFrontierTarget.has_value() ? currentFrontierTarget->worldPosition
+                                                       : robot::visual::Vec3{});
         // Phase 13X blocker fix: `consumeLocalRouteBlockedReplan` (captured
         // at the TOP of this frame, before this frame's own avoidance
         // update could overwrite the pending flag - see that capture's
@@ -1357,6 +1436,19 @@ int main()
             returningHome ? returnHomeBlockedCells : std::vector<robot::visual::GridCoord>{});
         previousNavOutput = navOutput;
 
+        // Phase 13X final-approach fix: Stage 2 - only ever enabled while
+        // Return Home is the active task; `arrivedAtApproachPoint` is
+        // Stage 1's own Arrived report (WaypointNavigator's goal is
+        // computeDockApproachPoint(), never the literal base position - see
+        // this file's own docs above) - DockApproachController never
+        // recomputes that fact itself, so it can never disagree with Stage
+        // 1 about whether the global route finished. See this class's own
+        // header docs for the full NavigatingToApproach -> Aligning ->
+        // FinalApproach -> Arrived state machine.
+        const robot::visual::DockApproachOutput dockOutput =
+            dockApproach.update(world.robotPose(), world.basePlatform(), world.tableSurface(), returningHome,
+                                 returningHome && navOutput.state == robot::visual::WaypointNavigatorState::Arrived);
+
         // Apply drive authority (Safety > Manual > AutonomousAvoidance >
         // Navigation > Fsm - see VirtualRobotHardware::driveAuthority()).
         // Safety is synced first and unconditionally, exactly like the
@@ -1403,8 +1495,24 @@ int main()
         // reports zero wheel speeds itself; the FSM-mapped speeds for
         // ReturnToBase are already zero, and plain Fsm MoveForward simply
         // takes back over for Roam once no frontier target is held).
-        const bool navigationDriving = navOutput.state == robot::visual::WaypointNavigatorState::Following;
-        if (navigationDriving)
+        //
+        // Phase 13X final-approach fix: DockApproachController's own
+        // `driving` (Aligning/FinalApproach) takes over the SAME
+        // Navigation-tier override the instant Stage 1 hands off - never a
+        // new/separate DriveAuthority tier (Dock approach uses Navigation
+        // authority, per this fix's own brief). At most one of
+        // navOutput/dockOutput is ever actually driving at a time by
+        // construction (WaypointNavigator reports zero speeds once
+        // Arrived; DockApproachController reports zero until Stage 1
+        // arrives), so preferring dockOutput whenever it is driving is
+        // never a real conflict.
+        const bool navigationDriving =
+            dockOutput.driving || navOutput.state == robot::visual::WaypointNavigatorState::Following;
+        if (dockOutput.driving)
+        {
+            hardware.setNavigationWheelSpeeds(dockOutput.wheelSpeeds.left, dockOutput.wheelSpeeds.right);
+        }
+        else if (navigationDriving)
         {
             hardware.setNavigationWheelSpeeds(navOutput.wheelSpeeds.left, navOutput.wheelSpeeds.right);
         }
@@ -1583,7 +1691,17 @@ int main()
         // actually returning home - during frontier exploration the
         // planned-route polyline (passed to renderFrame() below) is the
         // correct visualization instead, never this straight-line guide.
-        telemetry.homeNavigationStateText = robot::visual::turkishText(navOutput.state);
+        // Phase 13X final-approach fix: once Stage 2 has anything
+        // meaningful to show (Aligning/FinalApproach/Arrived), its own
+        // state text replaces WaypointNavigator's - otherwise the HUD would
+        // misleadingly keep reading "Ulaşıldı" (Arrived) for the entire
+        // docking maneuver, the instant Stage 1 merely reaches the
+        // approach point.
+        telemetry.homeNavigationStateText =
+            (returningHome && dockOutput.state != robot::visual::DockApproachState::Inactive &&
+             dockOutput.state != robot::visual::DockApproachState::NavigatingToApproach)
+                ? robot::visual::turkishText(dockOutput.state)
+                : robot::visual::turkishText(navOutput.state);
         telemetry.homeNavigationGuideVisible = returningHome && navigationDriving;
         if (navOutput.currentWaypointIndex < navOutput.route.size())
         {

@@ -495,6 +495,57 @@ TEST(GridPathPlannerTest, DockGoalReachable)
     EXPECT_LT(distanceWorld(result.waypoints.back(), dockGoal), ExplorationMap::kCellSizeWorldUnits * 2.0F);
 }
 
+// --- 16: PhysicallySafeManualPoseNearTableEdgeCanStillReturnHome ---
+//
+// Real-GUI-traced regression (Phase 13X connectivity-aware goal-snapping
+// fix - see GridPathPlanner.hpp's own docs on the class's goal-snapping
+// section): a human reproduced "launch -> M -> manually drive away from
+// the dock -> 2" and the robot never returned home. Root-caused via the
+// REAL persisted exploration map from that session: the robot's own pose
+// was perfectly safe and well-connected (a large reachable component), but
+// the literal Return Home goal needed snapping (it sits close to the dock
+// housing), and on the real, sparsely-observed map the nearest traversable
+// substitute cell sat in its own small pocket - sealed off from the rest
+// of the reachable table by combined planning-clearance inflation from the
+// dock housing and a nearby real obstacle-cell cluster near the dock's own
+// approach corridor. Confirmed NOT a fundamental geometry problem: the
+// identical start/goal succeeds against the idealized full-footprint
+// desk (see MonitorKeyboardMouseLayoutCanProduceValidPaths/
+// DockGoalReachable above). Reproduced here with a minimal, deterministic
+// extra Occupied-cell cluster (representing the same real corridor-sealing
+// observations) layered on top of the idealized desk, rather than
+// depending on an external captured map file.
+TEST(GridPathPlannerTest, PhysicallySafeManualPoseNearTableEdgeCanStillReturnHome)
+{
+    ExplorationMap map(production::productionBounds());
+    production::markProductionDeskFree(map);
+
+    // Extra real-sparse-observation cells sealing the dock's own approach
+    // corridor - the exact real-GUI-traced structure (see this test's own
+    // docs above).
+    for (int col = 46; col <= 49; ++col)
+    {
+        for (int row = 3; row <= 10; ++row)
+        {
+            map.markOccupied(col, row);
+        }
+    }
+
+    GridPathPlanner planner(map);
+
+    // The exact real reproduced pose: physically safe, close to the
+    // table's own +Z edge, manually driven away from the dock.
+    const Vec3 start{-1.75638F, 0.0F, 1.54448F};
+    const Vec3 goal{1.3F, 0.0F, -1.5F}; // BasePlatform::position
+
+    const PathPlanResult result = planner.planPath(start, goal);
+
+    ASSERT_TRUE(result.success);
+    ASSERT_FALSE(result.waypoints.empty());
+    // Genuine progress toward home, never a degenerate zero-length route.
+    EXPECT_LT(distanceWorld(result.waypoints.back(), goal), distanceWorld(start, goal));
+}
+
 // ============================================================
 // Path simplification
 // ============================================================
