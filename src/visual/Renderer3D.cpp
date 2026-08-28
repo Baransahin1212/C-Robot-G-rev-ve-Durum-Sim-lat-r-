@@ -121,6 +121,12 @@ constexpr int kMissionControlMarginRight = 20;
 constexpr int kMissionControlMarginY = 20;
 constexpr Color kMissionControlTaskColor = Color{255, 220, 100, 255};
 
+// Phase 13Z: New Map (`N`) transient notice text color - a warm amber,
+// distinct from both kMissionControlTaskColor's yellow (task status) and
+// kHudControlsColor's grey (static key hints), so a confirmation/refusal/
+// success notice reads as a momentary alert, not a permanent panel line.
+constexpr Color kMapResetNoticeColor = Color{255, 150, 60, 255};
+
 // Exploration map panel (Phase 13V): bottom-right, deliberately separate
 // from the engineering HUD panel (top-left) and Mission Control panel
 // (top-right) above - all three are sized/placed independently and never
@@ -929,15 +935,61 @@ void Renderer3D::drawMissionControlPanel(const VisualTelemetry& telemetry) const
     std::snprintf(taskLine, sizeof(taskLine), "Görev: %.*s", static_cast<int>(telemetry.missionTaskText.size()),
                    telemetry.missionTaskText.data());
 
-    const HudLine lines[] = {
-        {"GÖREV KONTROLÜ", 20, kHudTitleColor},
-        {taskLine, 18, kMissionControlTaskColor},
-        {"1  Haritalamayı Başlat", 16, kHudControlsColor},
-        {"2  Eve Dön", 16, kHudControlsColor},
-        {"3  Görevi Durdur", 16, kHudControlsColor},
-        {"R  Eve Dön", 16, kHudControlsColor},
-    };
-    constexpr std::size_t lineCount = sizeof(lines) / sizeof(lines[0]);
+    // Phase 13Z: New Map (`N`) notice - main3d.cpp guarantees at most one
+    // of the three telemetry fields is ever non-empty at a time; the
+    // two-line confirmation prompt is checked first purely so it can show
+    // BOTH of its lines, matching VisualTelemetry's own documented
+    // precedence. Formatted through local buffers (never
+    // std::string_view::data() passed directly as a `const char*`) to
+    // match every other telemetry-string line in this file - see
+    // stateLine/commandLine/etc. above.
+    char mapResetLine1[48];
+    char mapResetLine2[48];
+    bool hasMapResetLine1 = false;
+    bool hasMapResetLine2 = false;
+    if (!telemetry.mapResetConfirmLine1.empty())
+    {
+        std::snprintf(mapResetLine1, sizeof(mapResetLine1), "%.*s",
+                       static_cast<int>(telemetry.mapResetConfirmLine1.size()), telemetry.mapResetConfirmLine1.data());
+        hasMapResetLine1 = true;
+        if (!telemetry.mapResetConfirmLine2.empty())
+        {
+            std::snprintf(mapResetLine2, sizeof(mapResetLine2), "%.*s",
+                           static_cast<int>(telemetry.mapResetConfirmLine2.size()),
+                           telemetry.mapResetConfirmLine2.data());
+            hasMapResetLine2 = true;
+        }
+    }
+    else if (!telemetry.mapResetRejectedLine.empty())
+    {
+        std::snprintf(mapResetLine1, sizeof(mapResetLine1), "%.*s",
+                       static_cast<int>(telemetry.mapResetRejectedLine.size()), telemetry.mapResetRejectedLine.data());
+        hasMapResetLine1 = true;
+    }
+    else if (!telemetry.mapResetSuccessLine.empty())
+    {
+        std::snprintf(mapResetLine1, sizeof(mapResetLine1), "%.*s",
+                       static_cast<int>(telemetry.mapResetSuccessLine.size()), telemetry.mapResetSuccessLine.data());
+        hasMapResetLine1 = true;
+    }
+
+    HudLine lines[9];
+    std::size_t lineCount = 0;
+    lines[lineCount++] = {"GÖREV KONTROLÜ", 20, kHudTitleColor};
+    lines[lineCount++] = {taskLine, 18, kMissionControlTaskColor};
+    lines[lineCount++] = {"1  Haritalamayı Başlat", 16, kHudControlsColor};
+    lines[lineCount++] = {"2  Eve Dön", 16, kHudControlsColor};
+    lines[lineCount++] = {"3  Görevi Durdur", 16, kHudControlsColor};
+    lines[lineCount++] = {"R  Eve Dön", 16, kHudControlsColor};
+    lines[lineCount++] = {"N  Yeni Harita", 16, kHudControlsColor};
+    if (hasMapResetLine1)
+    {
+        lines[lineCount++] = {mapResetLine1, 16, kMapResetNoticeColor};
+    }
+    if (hasMapResetLine2)
+    {
+        lines[lineCount++] = {mapResetLine2, 16, kMapResetNoticeColor};
+    }
 
     int panelWidth = 0;
     int contentHeight = 0;

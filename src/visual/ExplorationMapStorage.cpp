@@ -231,4 +231,17 @@ bool ExplorationMapStorage::save(const std::string& path, const ExplorationMap& 
     return file.good();
 }
 
+bool ExplorationMapStorage::remove(const std::string& path)
+{
+    std::error_code errorCode;
+    std::filesystem::remove(path, errorCode);
+    if (errorCode)
+    {
+        std::fprintf(stderr, "ExplorationMapStorage: could not delete \"%s\" - %s.\n", path.c_str(),
+                      errorCode.message().c_str());
+        return false;
+    }
+    return true;
+}
+
 } // namespace robot::visual

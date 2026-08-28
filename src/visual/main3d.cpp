@@ -24,10 +24,12 @@
 #include "robot/visual/ExplorationMap.hpp"
 #include "robot/visual/ExplorationMapStorage.hpp"
 #include "robot/visual/ExplorationMapper.hpp"
+#include "robot/visual/ExplorationSessionReset.hpp"
 #include "robot/visual/ForwardClearanceProbe.hpp"
 #include "robot/visual/FrontierExplorer.hpp"
 #include "robot/visual/GridPathPlanner.hpp"
 #include "robot/visual/ManualDriveInput.hpp"
+#include "robot/visual/MapResetController.hpp"
 #include "robot/visual/MissionControlEventSource.hpp"
 #include "robot/visual/MissionTask.hpp"
 #include "robot/visual/RangeObservation.hpp"
@@ -75,6 +77,13 @@ constexpr float kMapSaveIntervalSeconds = 5.0F;
 // .gitignore.
 constexpr const char* kMapStorageRelativePath = "\\runtime\\maps\\exploration_map.json";
 
+// Phase 13Z: how long the New Map (`N`) "stop the mission first" and "new
+// map created" HUD notices stay visible - both transient, presentation-
+// only, and a distinct concern from MapResetController's own
+// kConfirmationWindowSeconds (whether a SECOND press still counts as
+// confirming, not how long a one-shot notice stays on screen).
+constexpr float kMapResetNoticeDisplayDurationSeconds = 3.0F;
+
 // Phase 13X: frontier-selection retry throttle - see the frontier-target-
 // selection block's own docs below for the "not merely waiting for a
 // temporary map update" reasoning this exists for.
@@ -120,6 +129,33 @@ constexpr float kAvoidanceResumeHeadingChangeDegrees = 30.0F;
 // wedged against this exact obstacle" from "a single frame's proposed step
 // happened to graze one," never large enough to reintroduce a long stall.
 constexpr int kAvoidanceResumeCollisionStallFrames = 5;
+
+// Obstacle-deadlock fix (real-GUI-reproduced): a real GUI trace proved
+// BOTH release conditions above share one unstated assumption - SOME
+// authority is currently able to move the robot (Navigation replanning
+// around the blocked cell, or the robot colliding while attempting to).
+// When nothing can (e.g. Haritalama with no reachable frontier target -
+// map already logically Complete - so `navigationEnabled` is false, Safety
+// is inactive, and Manual is off), neither the heading-change nor the
+// collision-streak condition can ever become true: the robot sits at
+// exactly zero wheel speed forever, `avoidanceSuppressedAfterBlock` never
+// releases, and ReactiveObstacleAvoidance never gets to attempt a fresh
+// incident - a genuine, reproduced PERMANENT WaitingForObstacleClear
+// deadlock, distinct from (and not fixed by) either existing condition.
+// This third, unconditional, bounded-frame-count valve is the fix -
+// mirrors TableEdgeSafetyController's own kSafetyResumeMaxSuppressedFrames
+// last-resort valve exactly (same magnitude/reasoning: generous enough for
+// a genuine bounded avoidance/replan attempt to run its own course when
+// one IS possible, but never allowed to withhold avoidance indefinitely
+// when none is). Deterministic - a plain frame count, never randomized,
+// never reset by anything other than a fresh block or a genuine release -
+// so re-arming is fully reproducible for every run. Once this valve fires,
+// avoidance is simply un-suppressed again: ReactiveObstacleAvoidance's own
+// existing Inactive-state entry condition (triggerAvoidance true) is what
+// actually starts the next incident, choosing a fresh deterministic turn
+// direction from that frame's real hazard sample - never a special-cased
+// "forced" incident of its own.
+constexpr int kAvoidanceSuppressionMaxFrames = 120;
 
 // Phase 13X blocker fix (deadlock repair): minimum positional change
 // (world units), since TableEdgeSafetyController last reported
@@ -561,6 +597,9 @@ int main()
     // debounce for the release condition above - see
     // kAvoidanceResumeCollisionStallFrames's own docs.
     int consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+    // Obstacle-deadlock fix: unconditional last-resort frame count - see
+    // kAvoidanceSuppressionMaxFrames's own docs above for the full "why."
+    int framesSuppressedSinceAvoidanceBlock = 0;
 
     // Phase 13X blocker fix (deadlock repair): mirrors
     // avoidanceSuppressedAfterBlock's own shape, one authority tier up.
@@ -680,6 +719,17 @@ int main()
     // tamamlandı" HUD notice. Presentation-only; never influences
     // completionSignal/frontier/navigation logic itself.
     bool mapAlreadyCompleteNoticeActive = false;
+
+    // Phase 13Z: New Map (`N`) - the two-press confirmation gate (see
+    // MapResetController.hpp's own class docs) plus the two transient,
+    // mutually-exclusive HUD notice countdowns main3d.cpp itself decides
+    // when to arm - "stop the mission first" (the state gate rejected the
+    // request) and "new map created" (a reset actually happened). Both
+    // timers count DOWN to zero (0 = not currently showing);
+    // kMapResetNoticeDisplayDurationSeconds is their shared duration.
+    robot::visual::MapResetController mapResetController;
+    float mapResetRejectedNoticeSecondsRemaining = 0.0F;
+    float mapResetSuccessNoticeSecondsRemaining = 0.0F;
 
     // Reactive obstacle-avoidance enable/disable (Phase 13Q) - ON by
     // default so RobotSimulator3D demonstrates autonomous behavior
@@ -872,6 +922,78 @@ int main()
                 (hudMode == robot::visual::HudMode::Full) ? robot::visual::HudMode::Compact : robot::visual::HudMode::Full;
         }
 
+        // Phase 13Z: tick the New Map confirmation window down every
+        // frame, unconditionally (mirrors MapResetController::update()'s
+        // own per-frame contract - a no-op while no confirmation is
+        // pending), before reacting to this frame's own KEY_N below.
+        // Independently, count down whichever transient notice (if any)
+        // is currently showing.
+        mapResetController.update(GetFrameTime());
+        if (mapResetRejectedNoticeSecondsRemaining > 0.0F)
+        {
+            mapResetRejectedNoticeSecondsRemaining -= GetFrameTime();
+            if (mapResetRejectedNoticeSecondsRemaining < 0.0F)
+            {
+                mapResetRejectedNoticeSecondsRemaining = 0.0F;
+            }
+        }
+        if (mapResetSuccessNoticeSecondsRemaining > 0.0F)
+        {
+            mapResetSuccessNoticeSecondsRemaining -= GetFrameTime();
+            if (mapResetSuccessNoticeSecondsRemaining < 0.0F)
+            {
+                mapResetSuccessNoticeSecondsRemaining = 0.0F;
+            }
+        }
+
+        if (IsKeyPressed(KEY_N))
+        {
+            // Phase 13Z: New Map - MapResetController owns the two-press
+            // confirmation/state-gate decision (see that class's own
+            // docs); this handler only ever reacts to its outcome. A
+            // confirmed reset calls resetExplorationSession() (see
+            // ExplorationSessionReset.hpp) - the one place this session's
+            // map/trail/navigator/frontier/completion state is actually
+            // reset, never scattered inline here. Never an FSM event -
+            // RobotStateMachine's transition table is completely
+            // unmodified by this feature (this phase's own brief).
+            const robot::visual::MapResetRequestOutcome outcome =
+                mapResetController.requestKeyPress(stateMachine.currentState());
+            switch (outcome)
+            {
+                case robot::visual::MapResetRequestOutcome::ConfirmationRequested:
+                    mapResetRejectedNoticeSecondsRemaining = 0.0F;
+                    mapResetSuccessNoticeSecondsRemaining = 0.0F;
+                    break;
+                case robot::visual::MapResetRequestOutcome::RejectedActiveMission:
+                    mapResetRejectedNoticeSecondsRemaining = kMapResetNoticeDisplayDurationSeconds;
+                    break;
+                case robot::visual::MapResetRequestOutcome::Confirmed:
+                {
+                    robot::visual::ExplorationSessionState session{
+                        explorationMap,
+                        coverageTrail,
+                        mapNavigator,
+                        completionSignal,
+                        currentFrontierTarget,
+                        frontierBlacklist,
+                        framesSinceLastFrontierAttempt,
+                        consecutiveNoTargetFound,
+                        returnHomeBlockedCells,
+                        previousNavOutput,
+                        bestDistanceToHomeThisSession,
+                        framesSinceDistanceImproved,
+                        mapAlreadyCompleteNoticeActive,
+                        mapSaveTimer,
+                        mapWasLoadedAtStartup,
+                    };
+                    robot::visual::resetExplorationSession(mapStoragePath, mapPersistenceAvailable, session);
+                    mapResetSuccessNoticeSecondsRemaining = kMapResetNoticeDisplayDurationSeconds;
+                    break;
+                }
+            }
+        }
+
         // Phase 13X final-approach fix ("FINAL APPROACH HAZARD CONTRACT"),
         // extended for Phase 13Y's precision reverse docking and then again
         // for the dock-capture LATCH fix (real-GUI-traced): read as the
@@ -925,6 +1047,12 @@ int main()
         previousDockCapturedSticky = dockCapturedSticky;
         const bool dockHazardSuppressionActive = dockCapturedSticky;
         dockLaneFilter.setSuppressed(dockHazardSuppressionActive);
+
+        // Obstacle-deadlock fix, map-complete audit: the ONLY reason this
+        // read exists - detecting the exact WaitingForObstacleClear ->
+        // Moving edge after runtime.step() below (see the re-request block
+        // at the end of this frame) - never used for anything else.
+        const robot::RobotState stateBeforeStepForCompletionRearm = stateMachine.currentState();
 
         // Exactly one RobotRuntime::step() per rendered frame - the render
         // loop itself is the scheduler (see RobotRuntime's own docs). If
@@ -1016,11 +1144,24 @@ int main()
         // Phase 13X blocker fix), heading alone would never change and
         // the suppression would never lift, even though the robot is
         // just as genuinely stuck as the original TurnAway incident was.
-        // Both conditions are deterministic and physically grounded -
-        // never a frame-count/wall-clock timer. Safety/Manual/
-        // RobotCollision's own hard guard remain fully active and
-        // unaffected throughout - this only withholds the LOCAL reactive
-        // layer's own re-arming, never any of those.
+        // Both of THESE two conditions are deterministic and physically
+        // grounded, never a frame-count/wall-clock timer - but (obstacle-
+        // deadlock fix, real-GUI-reproduced) both also share one unstated
+        // assumption: SOME authority is currently able to move the robot
+        // at all. When nothing can (e.g. Haritalama with no reachable
+        // frontier target held - `navigationEnabled` false - and Safety/
+        // Manual both inactive), the robot sits at exactly zero wheel
+        // speed forever and NEITHER condition can ever become true - a
+        // real, reproduced PERMANENT deadlock this file's own suppression
+        // was supposed to be temporary, not indefinite. A THIRD,
+        // unconditional, bounded-frame-count valve
+        // (kAvoidanceSuppressionMaxFrames) below closes that gap - see
+        // that constant's own docs for the full reasoning (mirrors
+        // TableEdgeSafetyController's own kSafetyResumeMaxSuppressedFrames
+        // valve exactly). Safety/Manual/RobotCollision's own hard guard
+        // remain fully active and unaffected throughout - this only
+        // withholds the LOCAL reactive layer's own re-arming, never any of
+        // those.
         if (avoidanceSuppressedAfterBlock)
         {
             const float headingChangeSinceBlock = std::fabs(robot::visual::shortestSignedHeadingErrorDegrees(
@@ -1037,11 +1178,14 @@ int main()
             {
                 consecutiveCollisionsWhileAvoidanceSuppressed = 0;
             }
+            ++framesSuppressedSinceAvoidanceBlock;
             if (headingChangeSinceBlock >= kAvoidanceResumeHeadingChangeDegrees ||
-                consecutiveCollisionsWhileAvoidanceSuppressed >= kAvoidanceResumeCollisionStallFrames)
+                consecutiveCollisionsWhileAvoidanceSuppressed >= kAvoidanceResumeCollisionStallFrames ||
+                framesSuppressedSinceAvoidanceBlock >= kAvoidanceSuppressionMaxFrames)
             {
                 avoidanceSuppressedAfterBlock = false;
                 consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+                framesSuppressedSinceAvoidanceBlock = 0;
             }
         }
 
@@ -1105,6 +1249,7 @@ int main()
             avoidanceSuppressedAfterBlock = true;
             headingAtLastLocalRouteBlocked = world.robotPose().headingDegrees;
             consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+            framesSuppressedSinceAvoidanceBlock = 0;
         }
         localRouteBlockedPendingReplan = avoidance.localRouteBlockedThisUpdate();
 
@@ -1858,6 +2003,24 @@ int main()
             telemetry.frontierTargetPosition = currentFrontierTarget->worldPosition;
         }
 
+        // Phase 13Z: New Map (`N`) notice telemetry - at most one of the
+        // three is ever non-empty (see VisualTelemetry's own docs);
+        // Renderer3D never decides which applies, it only ever draws
+        // whichever field is currently non-empty.
+        if (mapResetController.confirmationPending())
+        {
+            telemetry.mapResetConfirmLine1 = "Mevcut harita silinecek.";
+            telemetry.mapResetConfirmLine2 = "Onaylamak için N'ye tekrar basın.";
+        }
+        else if (mapResetRejectedNoticeSecondsRemaining > 0.0F)
+        {
+            telemetry.mapResetRejectedLine = "Önce görevi durdurun (3)";
+        }
+        else if (mapResetSuccessNoticeSecondsRemaining > 0.0F)
+        {
+            telemetry.mapResetSuccessLine = "Yeni harita oluşturuldu";
+        }
+
         // Phase 13U: Mission Control panel telemetry - main3d computes
         // task status and base distance directly (the same simple
         // dx/dz-from-pose formula HomeNavigator itself independently uses
@@ -1887,6 +2050,59 @@ int main()
         // governs cursor capture/release via TAB independently of this.
         const bool updateCamera = cameraCaptured && !manualDriveMode;
         renderer.renderFrame(world, updateCamera, telemetry, explorationMap, coverageTrail, navOutput.route);
+
+        // Obstacle-deadlock fix, map-complete audit: RobotStateMachine's
+        // WaitingForObstacleClear case has no handler for
+        // ReturnHomeRequested (see RobotStateMachine.cpp -
+        // InvalidTransition, the event is simply dropped -
+        // RobotRuntime::step() never requeues a rejected event), and
+        // ExplorationCompletionEventSource only ever fires
+        // ReturnHomeRequested on completionSignal.complete's ONE
+        // false -> true edge for a whole session (by design). Worse,
+        // CompositePollingEventSource short-circuits (see that class's own
+        // pollEvent()): whenever a higher-priority source - here,
+        // hardwareEventSource/dockLaneFilter - has an event to report on a
+        // given frame, lower-priority sources (including
+        // ExplorationCompletionEventSource) are never even polled that
+        // frame, so their own edge-tracking is simply frozen for the
+        // frame, not lost - EXCEPT for the one case that matters here: if
+        // exploration first reaches logical completion while the robot is
+        // genuinely stuck in WaitingForObstacleClear (no competing
+        // hardware event that frame), the completion source IS polled,
+        // its edge IS genuinely consumed, and RobotStateMachine genuinely
+        // rejects it - permanently spent (`wasComplete_` latches true
+        // regardless of acceptance) - exactly the real-reported
+        // "Map=100%/Roam/WaitingForObstacleClear" screenshot state. The
+        // robot would then resume plain Roam wandering forever once the
+        // obstacle clears, never auto-returning home despite being
+        // logically Complete.
+        //
+        // Fix: detect the exact WaitingForObstacleClear -> Moving edge
+        // (the obstacle that interrupted Roam has genuinely cleared,
+        // resuming the SAME Roam mission - resumeState_ == Moving, never a
+        // Return-Home-interrupted pause, which resumes into ReturningHome
+        // instead and is correctly excluded here) while completion is
+        // still true, and explicitly call
+        // missionControl.requestReturnHome() - the SAME production API
+        // `2`/`R` already use, deliberately NOT another attempt at
+        // re-triggering completionSignal.complete's own edge (an earlier
+        // version of this fix tried exactly that and was proven, via this
+        // phase's own regression test, to silently fail: forcing the
+        // signal false then true again is ITSELF subject to the same
+        // short-circuiting - the low-priority completion source never
+        // actually observes the intermediate `false` value on the exact
+        // frame a competing ObstacleCleared event is also present, so no
+        // genuine edge is ever seen). MissionControlEventSource is the
+        // HIGHEST-priority source in the composite chain, so a request
+        // queued here is guaranteed delivery on the very next
+        // runtime.step() - never short-circuited by anything.
+        // completionSignal.complete/ExplorationCompletionEventSource
+        // themselves are completely untouched by this fix.
+        if (stateBeforeStepForCompletionRearm == robot::RobotState::WaitingForObstacleClear &&
+            stateMachine.currentState() == robot::RobotState::Moving && completionSignal.complete)
+        {
+            missionControl.requestReturnHome();
+        }
     }
 
     // Phase 13V: one final unconditional save on clean shutdown (this

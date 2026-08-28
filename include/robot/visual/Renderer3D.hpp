@@ -317,6 +317,22 @@ struct VisualTelemetry
     // exploration is complete.
     Vec3 frontierTargetPosition;
     bool frontierTargetVisible = false;
+
+    // Phase 13Z: New Map (`N`) transient HUD notices - at most one of the
+    // three is ever non-empty at once (main3d.cpp's own
+    // MapResetController/notice-timer state decides which, if any,
+    // applies each frame - see ExplorationSessionReset.hpp/
+    // MapResetController.hpp). mapResetConfirmLine1/mapResetConfirmLine2
+    // together form the two-line "press N again to confirm" prompt, shown
+    // only while a confirmation is pending; mapResetRejectedLine is the
+    // "stop the mission first" refusal; mapResetSuccessLine is the
+    // one-shot "new map created" acknowledgement. Renderer3D never
+    // decides which applies or times any of them out - it only ever draws
+    // whichever field is currently non-empty.
+    std::string_view mapResetConfirmLine1;
+    std::string_view mapResetConfirmLine2;
+    std::string_view mapResetRejectedLine;
+    std::string_view mapResetSuccessLine;
 };
 
 // Owns the Camera3D and draws one complete frame - ground, grid,

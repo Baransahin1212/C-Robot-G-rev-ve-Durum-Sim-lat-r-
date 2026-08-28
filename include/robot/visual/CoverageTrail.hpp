@@ -41,10 +41,12 @@ public:
     void update(const RobotPose& pose);
 
     // Discards every recorded point, resetting to the StartsEmpty state.
-    // Exists for completeness/tests - no production caller invokes this
-    // (see this phase's own "trail lifecycle" brief: Stop Task/Start
-    // Explore/Return Home/HomeReached/manual mode must never clear the
-    // trail).
+    // Phase 13V brief: Stop Task/Start Explore/Return Home/HomeReached/
+    // manual mode must never clear the trail - none of those call this.
+    // Phase 13Z: New Map (`N`) is the one deliberate exception - see
+    // ExplorationSessionReset.hpp's resetExplorationSession(), the first
+    // production caller of this method - a fresh mapping session must not
+    // keep showing where the OLD map's session travelled.
     void clear() noexcept;
 
     const std::vector<Vec3>& points() const noexcept;

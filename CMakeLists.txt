@@ -557,6 +557,8 @@ add_library(robot_visual_simulation STATIC
     src/visual/DockApproachController.cpp
     src/visual/DockApproachArrivalEventSource.cpp
     src/visual/DockLaneObstacleFilter.cpp
+    src/visual/MapResetController.cpp
+    src/visual/ExplorationSessionReset.cpp
 )
 
 target_link_libraries(robot_visual_simulation PUBLIC
@@ -1401,6 +1403,55 @@ target_link_libraries(MapAwareNavigationIntegrationTests PRIVATE
 
 gtest_discover_tests(MapAwareNavigationIntegrationTests)
 
+# --- MapResetControllerTests: Phase 13Z - New Map (`N`)'s two-press
+# confirmation/state-gate decision in isolation (first press only requests
+# confirmation, a second press within the window confirms, the window
+# expiring cancels, and an active mission - Moving/ReturningHome/
+# WaitingForObstacleClear - rejects the request outright, even mid-
+# confirmation). Owns no ExplorationMap/CoverageTrail/WaypointNavigator
+# state itself - see ExplorationSessionResetTests below for the actual
+# reset operation. Links only robot_core (RobotState.hpp) plus
+# robot_visual_simulation for MapResetController.cpp itself - never
+# robot_visual/raylib - genuinely headless.
+add_executable(MapResetControllerTests
+    tests/visual/MapResetControllerTests.cpp
+)
+
+target_link_libraries(MapResetControllerTests PRIVATE
+    robot_visual_simulation
+    GTest::gtest_main
+)
+
+gtest_discover_tests(MapResetControllerTests)
+
+# --- ExplorationSessionResetTests: Phase 13Z - resetExplorationSession()
+# (New Map's own reset operation): persisted-file deletion (missing file
+# treated as success, an existing file actually removed), the in-memory
+# ExplorationMap/CoverageTrail/WaypointNavigator/frontier/completion/
+# blocked-cell/notice-latch state all becoming fresh, a loaded-and-already-
+# complete map resetting without an application restart, a fresh mission
+# genuinely exploring (never immediately Complete) after reset, and robot
+# pose/RobotStateMachine state staying completely untouched (this is a MAP
+# SESSION reset, never an application factory reset). Links
+# robot_visual_simulation (WaypointNavigator/ExplorationCompletionEventSource)
+# plus robot_core (RobotStateMachine) - never robot_visual/raylib -
+# genuinely headless.
+add_executable(ExplorationSessionResetTests
+    tests/visual/ExplorationSessionResetTests.cpp
+)
+
+target_link_libraries(ExplorationSessionResetTests PRIVATE
+    robot_visual_simulation
+    robot_core
+    GTest::gtest_main
+)
+
+target_compile_definitions(ExplorationSessionResetTests PRIVATE
+    TEST_OUTPUT_DIR="${CMAKE_BINARY_DIR}/test_output/"
+)
+
+gtest_discover_tests(ExplorationSessionResetTests)
+
 # --- Warnings: scoped to our own targets only, never to FetchContent
 # dependencies (GoogleTest, nlohmann/json), so third-party warning noise
 # is never our concern to fix or silence.
@@ -1430,6 +1481,7 @@ if (MSVC)
         GridPathPlannerTests FrontierExplorerTests WaypointNavigatorTests
         DockApproachControllerTests
         MapAwareNavigationIntegrationTests
+        MapResetControllerTests ExplorationSessionResetTests
     )
         target_compile_options(${robot_target} PRIVATE /W4)
     endforeach()

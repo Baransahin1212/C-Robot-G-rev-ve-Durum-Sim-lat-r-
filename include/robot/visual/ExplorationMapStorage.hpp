@@ -62,6 +62,18 @@ public:
     // writes nothing) if the parent directory could not be created or
     // the file could not be opened for writing - never throws.
     static bool save(const std::string& path, const ExplorationMap& map, const CoverageTrail* trail = nullptr);
+
+    // Phase 13Z: deletes ONLY the persisted exploration-map file at
+    // `path` - never a directory, never anything else on disk (New Map's
+    // own brief: "Do NOT recursively delete directories. Do NOT delete
+    // logs/reports/assets/scenarios."). Returns true if the file was
+    // deleted OR did not exist to begin with - a missing file is a
+    // successful, no-op reset, mirroring MapLoadResult::MissingFile's own
+    // "no file yet is not an error" precedent elsewhere in this class.
+    // Only returns false on a genuine filesystem removal error (e.g.
+    // permissions), logged to stderr exactly like every other failure
+    // path in this class. Never throws.
+    static bool remove(const std::string& path);
 };
 
 } // namespace robot::visual

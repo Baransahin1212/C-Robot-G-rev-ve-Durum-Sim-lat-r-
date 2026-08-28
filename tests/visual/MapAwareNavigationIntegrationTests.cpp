@@ -231,6 +231,13 @@ struct MapAwareHarness
     // debounce, mirrors main3d.cpp's own identically-named state exactly.
     int consecutiveCollisionsWhileAvoidanceSuppressed = 0;
     static constexpr int kAvoidanceResumeCollisionStallFrames = 5;
+    // Obstacle-deadlock fix (real-GUI-reproduced) - mirrors main3d.cpp's
+    // own identically-named state/constant exactly (see that file's own
+    // docs on kAvoidanceSuppressionMaxFrames for the full "why": an
+    // unconditional, bounded-frame-count last-resort valve for when
+    // NOTHING can move the robot to satisfy either condition above).
+    int framesSuppressedSinceAvoidanceBlock = 0;
+    static constexpr int kAvoidanceSuppressionMaxFrames = 120;
     // Phase 13X blocker fix (deadlock repair) - mirrors main3d.cpp's own
     // identically-named state exactly (see that file's own docs).
     bool safetyRecoverySuppressedAfterBlock = false;
@@ -362,6 +369,12 @@ struct MapAwareHarness
         const bool dockHazardSuppressionActive = dockCapturedSticky;
         dockLaneFilter.setSuppressed(dockHazardSuppressionActive);
 
+        // Obstacle-deadlock fix, map-complete audit - mirrors main3d.cpp's
+        // own state-before-step capture exactly (see that file's own docs
+        // near the end-of-frame missionControl.requestReturnHome() call
+        // below for the full "why").
+        const RobotState stateBeforeStepForCompletionRearm = stateMachine.currentState();
+
         runtime.step();
 
         // Phase 13X blocker fix: read the sticky flag as left by the END
@@ -395,11 +408,14 @@ struct MapAwareHarness
             {
                 consecutiveCollisionsWhileAvoidanceSuppressed = 0;
             }
+            ++framesSuppressedSinceAvoidanceBlock;
             if (headingChangeSinceBlock >= kAvoidanceResumeHeadingChangeDegrees ||
-                consecutiveCollisionsWhileAvoidanceSuppressed >= kAvoidanceResumeCollisionStallFrames)
+                consecutiveCollisionsWhileAvoidanceSuppressed >= kAvoidanceResumeCollisionStallFrames ||
+                framesSuppressedSinceAvoidanceBlock >= kAvoidanceSuppressionMaxFrames)
             {
                 avoidanceSuppressedAfterBlock = false;
                 consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+                framesSuppressedSinceAvoidanceBlock = 0;
             }
         }
 
@@ -426,6 +442,7 @@ struct MapAwareHarness
             avoidanceSuppressedAfterBlock = true;
             headingAtLastLocalRouteBlocked = world_.robotPose().headingDegrees;
             consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+            framesSuppressedSinceAvoidanceBlock = 0;
         }
         localRouteBlockedPendingReplan = avoidance.localRouteBlockedThisUpdate();
 
@@ -726,6 +743,24 @@ struct MapAwareHarness
         const std::vector<RangeObservation> observationList(rayObservations.begin(), rayObservations.end());
         explorationMapper.update(world_.robotPose(), observationList);
         coverageTrail.update(world_.robotPose());
+
+        // Obstacle-deadlock fix, map-complete audit - mirrors main3d.cpp's
+        // own end-of-frame missionControl.requestReturnHome() call exactly
+        // (see that file's own docs for the full "why": completion's
+        // ReturnHomeRequested edge, if consumed-and-rejected while
+        // genuinely WaitingForObstacleClear, is permanently spent -
+        // re-toggling completionSignal.complete itself does not work
+        // either, since CompositePollingEventSource's own short-circuiting
+        // means the low-priority completion source never actually
+        // observes an intermediate false value on a frame a competing
+        // hardware event is also present - so this calls the SAME
+        // HIGHEST-priority missionControl API `2`/`R` already use
+        // instead, guaranteed delivery on the very next runtime.step()).
+        if (stateBeforeStepForCompletionRearm == RobotState::WaitingForObstacleClear &&
+            stateMachine.currentState() == RobotState::Moving && completionSignal.complete)
+        {
+            missionControl.requestReturnHome();
+        }
     }
 };
 
@@ -1247,6 +1282,270 @@ INSTANTIATE_TEST_SUITE_P(
     // coverage is a follow-up once ReactiveObstacleAvoidance itself gains
     // a deterministic enclosure-escape behavior.
     ::testing::Values(ReturnHomeAroundObjectCase{"Mouse", DeskObjectType::Mouse, Vec3{0.6F, 0.08F, 0.6F}, 180.0F}));
+
+// ============================================================
+// Obstacle-deadlock fix (real-GUI-reproduced): bounded avoidance-
+// suppression self-recovery
+// ============================================================
+//
+// Reproduces the exact real-GUI-reported deadlock: Haritalama (Roam) with
+// the map already logically Complete (pre-seeded full - no reachable
+// frontier is ever held, so `navigationEnabled` stays false for the whole
+// test, exactly like the real "Map = 100%/Tamamlandı" screenshot state),
+// the Keyboard obstacle directly ahead (the exact real-GUI object, and
+// this suite's own pre-existing "known limitation" docs immediately above
+// already independently flag the Keyboard/Monitor cluster's tighter
+// approach angles as where a full 360-degree TurnAway sweep can genuinely
+// exhaust without ever finding a clear heading), so WaitingForObstacleClear
+// is genuinely entered and stays entered (the obstacle is never moved or
+// disabled). `avoidanceSuppressedAfterBlock` is then engineered true
+// directly (mirrors ReactiveObstacleAvoidanceTests.cpp's own established
+// "engineer the exact TurnAway-sweep-exhausted precondition" technique -
+// see FullSweepWithoutClearanceReportsLocalRouteBlocked there - one level
+// up: THIS suppression's own release logic is what is under test here,
+// not TurnAway's sweep mechanics itself, which that file already covers
+// deterministically and headlessly).
+//
+// With NEITHER Navigation (no frontier target - map is complete) NOR
+// Safety/Manual available to move the robot, the ORIGINAL two release
+// conditions (heading change / collision streak) can never fire - the
+// first loop below proves the deadlock is genuinely real for the entire
+// window up to (but not including) kAvoidanceSuppressionMaxFrames, not
+// merely that the fix is inert. Crossing that bounded valve must then
+// deterministically un-suppress avoidance, letting it choose and drive a
+// brand new incident with no human intervention.
+TEST(AvoidanceSuppressionTest, SuppressionSelfExpiresWhenNoAuthorityCanMoveRobot)
+{
+    VirtualWorld world;
+    const Vec3 robotStart{0.0F, world.robotPose().position.y, 0.0F};
+    world.setRobotPosition(robotStart);
+    world.setRobotHeading(0.0F);
+    // Keyboard (index 1 - Monitor, Keyboard, Mouse, then the dock housing,
+    // matching VirtualWorld.cpp's own construction order) repositioned
+    // directly ahead of the chosen start pose - mirrors
+    // UnrelatedObstacleStillOverridesViaAvoidance's own established
+    // "reposition an existing obstacle" pattern, with a comfortable
+    // spawn-time clearance gap (1.0 world units) so the robot is never
+    // already in contact at frame 0.
+    ASSERT_TRUE(world.setObstaclePosition(1, Vec3{robotStart.x, robotStart.y, robotStart.z + 1.0F}));
+    ASSERT_TRUE(world.setObstacleSize(1, Vec3{0.3F, 0.3F, 0.3F}));
+
+    MapAwareHarness h(world);
+    preSeedFullMap(h); // map already logically Complete - no frontier ever
+
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    // Drive forward into the Keyboard until WaitingForObstacleClear is
+    // genuinely entered via the real production event chain (never
+    // injected directly).
+    bool reachedWaitingForObstacleClear = false;
+    for (int frame = 0; frame < 60 && !reachedWaitingForObstacleClear; ++frame)
+    {
+        h.driveFrame();
+        reachedWaitingForObstacleClear = h.stateMachine.currentState() == RobotState::WaitingForObstacleClear;
+    }
+    ASSERT_TRUE(reachedWaitingForObstacleClear);
+    ASSERT_TRUE(h.hardware.obstacleDetected());
+    // Confirms the "nothing can move the robot" precondition genuinely
+    // holds - Navigation is disabled because the map is already complete
+    // (no frontier target is ever held), exactly like the real report.
+    ASSERT_FALSE(h.currentFrontierTarget.has_value());
+
+    // The organic avoidance incident that started the instant
+    // WaitingForObstacleClear was entered (same-frame triggerAvoidance -
+    // avoidanceSuppressedAfterBlock is still false at this point) is not
+    // itself under test here - force it back to Inactive via
+    // ReactiveObstacleAvoidance's own documented "one frame of
+    // enabled=false forces Inactive immediately" contract (see
+    // update()'s own docs; the same mechanism main3d.cpp's own dock-
+    // attributable release already relies on), so the engineered
+    // precondition below starts from a clean Inactive state, exactly
+    // like a genuine post-block release would.
+    h.avoidance.update(false, false, false, h.world_.robotPose(), ObstacleHazardSample{});
+    ASSERT_FALSE(h.avoidance.active());
+
+    h.avoidanceSuppressedAfterBlock = true;
+    const float headingAtBlock = h.world_.robotPose().headingDegrees;
+    h.headingAtLastLocalRouteBlocked = headingAtBlock;
+    h.consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+    h.framesSuppressedSinceAvoidanceBlock = 0;
+
+    for (int frame = 0; frame < MapAwareHarness::kAvoidanceSuppressionMaxFrames - 1; ++frame)
+    {
+        h.driveFrame();
+        ASSERT_TRUE(h.avoidanceSuppressedAfterBlock) << "frame " << frame;
+        ASSERT_FALSE(h.avoidance.active()) << "frame " << frame;
+        ASSERT_EQ(h.hardware.driveAuthority(), DriveAuthority::Fsm) << "frame " << frame;
+        ASSERT_FLOAT_EQ(h.hardware.wheelSpeeds().left, 0.0F) << "frame " << frame;
+        ASSERT_FLOAT_EQ(h.hardware.wheelSpeeds().right, 0.0F) << "frame " << frame;
+        ASSERT_NEAR(h.world_.robotPose().headingDegrees, headingAtBlock, 0.01F) << "frame " << frame;
+        ASSERT_EQ(h.stateMachine.currentState(), RobotState::WaitingForObstacleClear) << "frame " << frame;
+    }
+
+    // Act: cross the bounded timeout.
+    h.driveFrame();
+    EXPECT_FALSE(h.avoidanceSuppressedAfterBlock);
+
+    // Assert: avoidance is now free to (and does) start a brand new,
+    // deterministic incident within a few frames of the valve firing -
+    // genuine AutonomousAvoidance authority with non-zero wheels.
+    bool avoidanceReactivated = false;
+    for (int frame = 0; frame < 10 && !avoidanceReactivated; ++frame)
+    {
+        h.driveFrame();
+        avoidanceReactivated = h.avoidance.active();
+    }
+    ASSERT_TRUE(avoidanceReactivated);
+    EXPECT_EQ(h.hardware.driveAuthority(), DriveAuthority::AutonomousAvoidance);
+    const WheelSpeeds reactivatedWheels = h.hardware.wheelSpeeds();
+    EXPECT_TRUE(reactivatedWheels.left != 0.0F || reactivatedWheels.right != 0.0F);
+
+    // Drive a further bounded window and confirm the robot's heading has
+    // genuinely changed - no permanent WaitingForObstacleClear deadlock.
+    for (int frame = 0; frame < 30; ++frame)
+    {
+        h.driveFrame();
+    }
+    const float headingChange = std::fabs(
+        robot::visual::shortestSignedHeadingErrorDegrees(headingAtBlock, h.world_.robotPose().headingDegrees));
+    EXPECT_GT(headingChange, 1.0F);
+}
+
+// Map-complete audit companion to the suppression-timeout fix above:
+// RobotStateMachine's WaitingForObstacleClear case has no handler for
+// ReturnHomeRequested (see RobotStateMachine.cpp - InvalidTransition), and
+// ExplorationCompletionEventSource only ever fires that event on
+// completionSignal.complete's ONE false -> true edge for a whole session.
+// If exploration first reaches logical completion WHILE the robot happens
+// to be paused in WaitingForObstacleClear - exactly the real-reported
+// "Map=100%/Roam/WaitingForObstacleClear" screenshot state - that one-shot
+// edge is silently rejected and, without the fix, permanently spent: the
+// robot would resume plain Roam wandering forever once the obstacle
+// clears, never auto-returning home despite being logically Complete.
+// Uses the world's own DEFAULT robot start (already close to the dock -
+// see VirtualWorld.cpp's own kRobotStartZ docs) so the subsequent Return
+// Home trip stays short and the test stays fast; the obstacle is cleared
+// deterministically (mirrors disableAllObstacles()'s own established
+// pattern) once completion is confirmed true while paused, since
+// avoidance's own maneuvering is not the subject under test here (see
+// SuppressionSelfExpiresWhenNoAuthorityCanMoveRobot above for that).
+TEST(AvoidanceSuppressionTest, CompletionAutoReturnStillProgressesAfterObstacleInterruptedCompletion)
+{
+    VirtualWorld world;
+    // Every OTHER obstacle disabled - the Keyboard (index 1, repositioned
+    // just ahead of the robot's own default heading, 90 degrees = +X per
+    // this project's convention) is the ONLY possible source of
+    // obstacleDetected() for the whole test, so re-disabling it later is
+    // guaranteed to genuinely clear the sensor - never ambiguous with a
+    // second, unrelated obstacle the robot might otherwise organically
+    // wander into while avoidance runs its own normal (unsuppressed, in
+    // this test) course.
+    disableAllObstacles(world);
+    const RobotPose defaultPose = world.robotPose();
+    ASSERT_TRUE(world.setObstaclePosition(
+        1, Vec3{defaultPose.position.x + 0.3F, defaultPose.position.y, defaultPose.position.z}));
+    ASSERT_TRUE(world.setObstacleSize(1, Vec3{0.3F, 0.3F, 0.3F}));
+    world.setObstacleEnabled(1, true);
+
+    MapAwareHarness h(world);
+    preSeedFullMap(h); // map already logically Complete - no frontier ever
+
+    h.missionControl.requestStartRoam(h.stateMachine.currentState());
+    h.runtime.step();
+    h.runtime.step();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::Moving);
+
+    bool reachedWaitingForObstacleClear = false;
+    for (int frame = 0; frame < 15 && !reachedWaitingForObstacleClear; ++frame)
+    {
+        h.driveFrame();
+        reachedWaitingForObstacleClear = h.stateMachine.currentState() == RobotState::WaitingForObstacleClear;
+    }
+    ASSERT_TRUE(reachedWaitingForObstacleClear);
+
+    // Freeze the pause deterministically - mirrors
+    // SuppressionSelfExpiresWhenNoAuthorityCanMoveRobot's own established
+    // technique above - so the robot is PROVABLY still paused (never
+    // resolved and re-entered a second, different episode by
+    // coincidental timing) at the exact frame completion's edge fires
+    // below; without this, avoidance could organically resolve the
+    // keyboard and the robot could leave-then-re-enter
+    // WaitingForObstacleClear on its own, making it ambiguous whether the
+    // observed "complete && paused" moment was a genuine same-episode
+    // edge or a stale value surviving from an earlier, already-honored
+    // firing.
+    h.avoidance.update(false, false, false, h.world_.robotPose(), ObstacleHazardSample{});
+    h.avoidanceSuppressedAfterBlock = true;
+    h.headingAtLastLocalRouteBlocked = h.world_.robotPose().headingDegrees;
+    h.consecutiveCollisionsWhileAvoidanceSuppressed = 0;
+    h.framesSuppressedSinceAvoidanceBlock = 0;
+    h.completionSignal.complete = false; // guarantee a clean slate before the edge below
+
+    // The frontier-selection block still runs during the pause
+    // (MissionTask stays Roam while WaitingForObstacleClear interrupted a
+    // Roam mission - see deriveMissionTask()) - drive until completion
+    // genuinely becomes true, asserting EVERY frame that the robot is
+    // still (the SAME, frozen) WaitingForObstacleClear episode - proving
+    // the exact real-reported precondition, not merely asserting it by
+    // construction.
+    bool completedWhilePaused = false;
+    for (int frame = 0; frame < 40 && !completedWhilePaused; ++frame)
+    {
+        h.driveFrame();
+        ASSERT_EQ(h.stateMachine.currentState(), RobotState::WaitingForObstacleClear) << "frame " << frame;
+        completedWhilePaused = h.completionSignal.complete;
+    }
+    ASSERT_TRUE(completedWhilePaused);
+
+    // CompositePollingEventSource short-circuits (see that class's own
+    // pollEvent(): "if the higher-priority source has an event, return
+    // it - the lower-priority source is never even polled this frame").
+    // completionSignal.complete only became true AFTER this frame's own
+    // runtime.step() already ran (frontier-selection runs after step() -
+    // see driveFrame()'s own order), so ExplorationCompletionEventSource
+    // has not observed the edge yet. One more QUIET frame (obstacle still
+    // continuously detected - HardwareEventSource is itself edge-
+    // triggered, so a stable, unchanged detection produces no event this
+    // frame, letting the lower-priority completion source actually get
+    // polled) is what genuinely consumes-and-rejects the edge while still
+    // provably WaitingForObstacleClear - never accidentally deferred by a
+    // same-frame ObstacleCleared racing it out.
+    h.driveFrame();
+    ASSERT_EQ(h.stateMachine.currentState(), RobotState::WaitingForObstacleClear);
+
+    // Clear the obstacle deterministically - the completion event's
+    // one-shot edge, consumed-and-rejected on the quiet frame just above,
+    // is now genuinely spent; without the fix, nothing would ever re-arm
+    // it once the robot resumes Moving.
+    world.setObstacleEnabled(1, false);
+    h.driveFrame();
+    ASSERT_FALSE(h.hardware.obstacleDetected())
+        << "obstacle still detected one frame after disabling it - state="
+        << static_cast<int>(h.stateMachine.currentState());
+
+    bool everEnteredReturningHome = false;
+    bool sawReadyAfterAutoReturn = false;
+    RobotState previousState = h.stateMachine.currentState();
+    for (int frame = 0; frame < 4000 && !sawReadyAfterAutoReturn; ++frame)
+    {
+        h.driveFrame();
+        const RobotState current = h.stateMachine.currentState();
+        everEnteredReturningHome = everEnteredReturningHome || current == RobotState::ReturningHome;
+        if (previousState == RobotState::ReturningHome && current == RobotState::Ready)
+        {
+            sawReadyAfterAutoReturn = true;
+        }
+        previousState = current;
+    }
+    EXPECT_TRUE(everEnteredReturningHome) << "the completion re-arm never even entered ReturningHome";
+
+    ASSERT_TRUE(sawReadyAfterAutoReturn)
+        << "final state=" << static_cast<int>(h.stateMachine.currentState())
+        << " completionSignal.complete=" << h.completionSignal.complete;
+}
 
 // 4: RouteReplansAfterAvoidanceDisplacement / 5: RouteReplansAfterSafetyDisplacement
 //
